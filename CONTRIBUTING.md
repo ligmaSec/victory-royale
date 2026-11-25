@@ -14,7 +14,7 @@ show whether a failure follows a particular build, GPU driver, or setting.
 - **Testing on Windows?** Follow the [Windows build and launch instructions](README.md#getting-started).
   Keep the terminal output from the run. For a crash, check the newest entry
   in the title's `crashes.log` and confirm its timestamp matches your run.
-- **Have a checkout but no game files?** On Linux, `bash tests/proton-launcher.sh`
+- **Have a checkout but no game files?** On Linux, `./scripts/victory-proton.sh --test`
   exercises the launcher without Wine or a GPU. With the Rust toolchain installed,
   `cargo test --workspace --locked` runs the workspace tests. If a test fails,
   record its name and the first error.

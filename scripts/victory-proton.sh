@@ -4,12 +4,15 @@ set -euo pipefail
 
 usage() {
     cat <<'HELP'
-Usage: victory-proton.sh --build
-       victory-proton.sh [--run | --report] [--vkd3d-dir DIR] TITLE.exe [options]
+Usage: victory-proton.sh --build | --test
+       victory-proton.sh [--run | --report] [--runtime proton|pinned | --vkd3d-dir DIR] TITLE.exe [options]
 
+  --test           Run the offline launcher checks (no game, build, or GPU needed).
   --build          Build the Windows release from a source checkout with LLVM-MinGW.
   --run            Execute the title.
   --report         Execute once and save the launcher and Proton logs in one archive.
+  --runtime pinned Use the project-pinned vkd3d-proton build. Fetch and verify it on first use.
+  --runtime proton Use the configured Proton runtime (default).
   --vkd3d-dir DIR  Use the x64 d3d12.dll and d3d12core.dll from DIR for this run.
 
 With no mode, the launcher forwards the title and options to victory run.
@@ -17,7 +20,39 @@ Use TITLE.exe alone to check imports, or TITLE.exe --execute to launch.
 HELP
 }
 
+pinned_asset=vkd3d-proton-ec20719-x64.tar.gz
+
+verify_runtime_archive() {
+    local digest=64b13a6d73bb48394e0135a2048bcf423a69c08226ab410a8a8bde075f5ed4b5
+    (cd -- "$1" && printf '%s  %s\n' "$digest" "$pinned_asset" | sha256sum --check --status)
+}
+
+stage_pinned_runtime() {
+    local stage_dir=$1 cache_dir=$2
+    local cache="$cache_dir/$pinned_asset"
+    local url="https://github.com/ligmaSec/victory-royale/releases/download/runtime-vkd3d-ec20719/$pinned_asset"
+    if [[ ! -f $cache ]] || ! verify_runtime_archive "$cache_dir"; then
+        echo 'Downloading pinned vkd3d-proton (ec20719)...' >&2
+        curl --disable --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
+            --connect-timeout 15 --max-time 120 --retry 2 --output "$stage_dir/$pinned_asset" "$url"
+        if ! verify_runtime_archive "$stage_dir"; then
+            echo 'The downloaded runtime failed SHA-256 verification.' >&2
+            exit 1
+        fi
+        # Concurrent launches can publish the same verified bytes atomically.
+        mv -fT -- "$stage_dir/$pinned_asset" "$cache"
+    fi
+    tar -xzf "$cache" -C "$stage_dir" -- d3d12.dll d3d12core.dll
+    echo 'Using pinned vkd3d-proton ec20719.' >&2
+}
+
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+if [[ ${1:-} == --test ]]; then
+    if (( $# != 1 )); then usage >&2; exit 2; fi
+    suite="$script_dir/tests/proton-launcher.sh"
+    if [[ -f $script_dir/../.victory-root ]]; then suite="$script_dir/../tests/proton-launcher.sh"; fi
+    exec bash "$suite" "$script_dir/victory-proton.sh"
+fi
 if [[ ${1:-} == --build ]]; then
     if (( $# != 1 )); then usage >&2; exit 2; fi
     if [[ ! -f $script_dir/../.victory-root ]]; then
@@ -38,6 +73,7 @@ if [[ ${1:-} == --build ]]; then
 fi
 
 mode=
+runtime=
 vkd3d_dir=
 while (( $# )); do
     case $1 in
@@ -47,9 +83,17 @@ while (( $# )); do
             mode=$1
             shift
             ;;
-        --vkd3d-dir)
-            if [[ -z ${2:-} ]]; then usage >&2; exit 2; fi
-            vkd3d_dir=$2
+        --runtime|--vkd3d-dir)
+            if [[ -n $runtime || -z ${2:-} ]]; then usage >&2; exit 2; fi
+            if [[ $1 == --vkd3d-dir ]]; then
+                runtime=custom
+                vkd3d_dir=$2
+            else
+                case $2 in
+                    pinned|proton) runtime=$2 ;;
+                    *) echo 'Choose --runtime proton or --runtime pinned.' >&2; exit 2 ;;
+                esac
+            fi
             shift 2
             ;;
         --) shift; break ;;
@@ -116,13 +160,15 @@ fi
 mkdir -p -- "$DXVK_STATE_CACHE_PATH"
 # Stage an alternate runtime for this process without changing the build or Wine prefix.
 stage=
-if [[ -n $vkd3d_dir ]]; then
-    for dll in d3d12.dll d3d12core.dll; do
-        if [[ ! -f $vkd3d_dir/$dll ]]; then
-            echo "Missing $vkd3d_dir/$dll. Pass the directory containing both x64 DLLs." >&2
-            exit 1
-        fi
-    done
+if [[ ${runtime:-proton} != proton ]]; then
+    if [[ $runtime == custom ]]; then
+        for dll in d3d12.dll d3d12core.dll; do
+            if [[ ! -f $vkd3d_dir/$dll ]]; then
+                echo "Missing $vkd3d_dir/$dll. Pass the directory containing both x64 DLLs." >&2
+                exit 1
+            fi
+        done
+    fi
     mkdir -p -- "$cache_home/victory"
     stage=$(mktemp -d -- "$cache_home/victory/runtime.XXXXXXXX")
     trap 'rm -rf -- "$stage"' EXIT
@@ -134,7 +180,11 @@ if [[ -n $vkd3d_dir ]]; then
         case ${dll,,} in */d3d12.dll|*/d3d12core.dll) continue ;; esac
         ln -s -- "$dll" "$stage/"
     done
-    cp -- "$vkd3d_dir/d3d12.dll" "$vkd3d_dir/d3d12core.dll" "$stage/"
+    if [[ $runtime == pinned ]]; then
+        stage_pinned_runtime "$stage" "$cache_home/victory"
+    else
+        cp -- "$vkd3d_dir/d3d12.dll" "$vkd3d_dir/d3d12core.dll" "$stage/"
+    fi
     export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}d3d12,d3d12core=n"
 fi
 launch_binary=$binary
@@ -166,6 +216,8 @@ export WINEDEBUG=${WINEDEBUG:--all,+timestamp,+pid,+tid,+seh}
 (
     cd -- "${binary%/*}"
     sha256sum -- "${binary##*/}"
+    printf 'runtime=%s\n' "${runtime:-proton}"
+    if [[ $runtime == pinned ]]; then printf 'runtime_asset=%s\n' "$pinned_asset"; fi
     if [[ -f REVISION ]]; then
         printf 'package_revision=%s\n' "$(<REVISION)"
     elif [[ -d $script_dir/../.git || -f $script_dir/../.git ]]; then
