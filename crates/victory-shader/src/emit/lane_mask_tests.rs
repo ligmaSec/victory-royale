@@ -147,6 +147,7 @@ fn lowered(words: &[u32]) -> Result<lower::Lowered, crate::ShaderError> {
 fn build(words: &[u32]) -> HostShader {
     let lowered = lowered(words).expect("lower");
     let shader = HostShader {
+        buffer_table: false,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,

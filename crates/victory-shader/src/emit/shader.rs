@@ -101,6 +101,7 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    pub buffer_uav: bool,
     /// Root UAVs (raw buffers) read and written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
@@ -169,6 +170,7 @@ impl Shader {
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            buffer_uav: false,
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
@@ -348,6 +350,8 @@ impl Shader {
     }
 
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
+        // DXIL typed, raw and structured buffer resource kinds.
+        self.buffer_uav |= props0 & 0x1000 != 0 && matches!(props0 & 0xff, 10..=12);
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
         self.op(

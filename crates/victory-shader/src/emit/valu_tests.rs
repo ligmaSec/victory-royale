@@ -171,6 +171,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, ShaderError> {
         user_data: lowered.user_data,
         samplers: lowered.samplers,
         static_samplers: Vec::new(),
+        buffer_table: false,
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,

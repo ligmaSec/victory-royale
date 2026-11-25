@@ -86,6 +86,7 @@ fn build_with_view(words: &[u32], buffer_stride: Option<u32>) -> (HostShader, lo
     })
     .expect("lower");
     let shader = HostShader {
+        buffer_table: false,
         stage: HwStage::Cs,
         dxil: lowered.dxil.clone(),
         user_data: lowered.user_data.clone(),

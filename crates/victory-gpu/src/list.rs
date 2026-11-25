@@ -126,6 +126,10 @@ struct List {
     /// reset.
     #[cfg(windows)]
     has_work: std::sync::atomic::AtomicBool,
+    /// The first failure to record a required command. Report it from Close
+    /// and discard this recording if the title still tries to submit it.
+    #[cfg(windows)]
+    record_error: std::sync::atomic::AtomicI32,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
 }
@@ -201,6 +205,9 @@ pub(crate) fn segments(this: This) -> Vec<Segment> {
     }
     // SAFETY: the title passes one of our lists.
     let list = unsafe { &*this.cast::<List>() };
+    if list.record_error.load(std::sync::atomic::Ordering::Acquire) != S_OK {
+        return Vec::new();
+    }
     let host = list.host.lock().unwrap_or_else(|e| e.into_inner());
     let segments = list.segments.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = segments.clone();
@@ -221,6 +228,58 @@ fn host_list(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
     // SAFETY: the title passes one of our lists.
     let host = unsafe { &(*this.cast::<List>()).host };
     host.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// A title copy that can replace a GPU-selected descriptor must be prepared after
+/// the preceding dispatch has consumed that descriptor.
+#[cfg(windows)]
+fn host_for_copy(
+    this: This,
+    dst: usize,
+    len: usize,
+) -> Option<std::sync::Arc<crate::host::HostList>> {
+    let list = host_list(this)?;
+    if !list.reads_descriptors_at(dst, len) {
+        return Some(list);
+    }
+    // SAFETY: host_list found a live title list.
+    let title = unsafe { &*this.cast::<List>() };
+    let next = crate::host::host()?.acquire_list();
+    split_for_copy(title, list, next)
+}
+
+#[cfg(windows)]
+fn split_for_copy(
+    title: &List,
+    list: std::sync::Arc<crate::host::HostList>,
+    next: windows::core::Result<crate::host::HostList>,
+) -> Option<std::sync::Arc<crate::host::HostList>> {
+    let new = match next {
+        Ok(new) => std::sync::Arc::new(new),
+        Err(error) => {
+            if title
+                .record_error
+                .compare_exchange(
+                    S_OK,
+                    error.code().0,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                tracing::warn!(%error, "could not record an ordered descriptor copy");
+            }
+            return None;
+        }
+    };
+    let mut host = title.host.lock().unwrap_or_else(|e| e.into_inner());
+    let mut segments = title.segments.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = title.state.lock().unwrap_or_else(|e| e.into_inner());
+    list.close();
+    state.reapply_host(&new, &list);
+    segments.push(Segment::List(list));
+    *host = Some(new.clone());
+    Some(new)
 }
 
 pub(crate) extern "system" fn create_allocator(
@@ -314,6 +373,8 @@ fn new_list(
         #[cfg(windows)]
         has_work: std::sync::atomic::AtomicBool::new(false),
         #[cfg(windows)]
+        record_error: Default::default(),
+        #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
             state.set_pipeline(pipeline);
@@ -351,6 +412,10 @@ extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
+        // SAFETY: host_list found a live title list.
+        return unsafe { &*this.cast::<List>() }
+            .record_error
+            .load(std::sync::atomic::Ordering::Acquire);
     }
     S_OK
 }
@@ -360,6 +425,9 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     }
     // SAFETY: the title passes one of our lists.
     let list = unsafe { &*this.cast::<List>() };
+    #[cfg(windows)]
+    list.record_error
+        .store(S_OK, std::sync::atomic::Ordering::Release);
     let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
     // A submission of the list still to run (its queue waits for a fence or
     // memory wait) keeps the last pending segment's host list, upload memory,
@@ -580,9 +648,10 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if !this.is_null()
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
+        && let Some(list) = host_for_copy(this, to as usize, len as usize)
     {
         list.defer_copy(to, from, len as usize);
         mark_work(this);
@@ -617,7 +686,11 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            let len = a.min(b) as usize;
+            let Some(list) = host_for_copy(this, to as usize, len) else {
+                return;
+            };
+            list.defer_copy(to, from, len);
             mark_work(this);
         }
     }
@@ -1257,12 +1330,12 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && dst != 0
+    if dst != 0
         && src != 0
+        && let Some(list) = host_for_copy(this, dst as usize, len as usize)
     {
         let len = len as usize;
-        list.defer(move || {
+        list.defer(dst as usize, len, move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
             {
@@ -2028,6 +2101,55 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_copy_between_selected_reads(
+    dst: u64,
+    src: u64,
+    mut dispatch: impl FnMut(&crate::host::HostList, &mut crate::draw::State, u64),
+) {
+    use crate::object::slot;
+    let null = std::ptr::null();
+    let mut allocator = null;
+    let mut list = null;
+    assert_eq!(
+        create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+        S_OK
+    );
+    assert_eq!(
+        create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+        S_OK
+    );
+    let (queue, _) = crate::queue::test_queue();
+    with_state(list, |host, state| dispatch(host, state, 0));
+    mark_work(list);
+    let mut scratch = [0u8; 32];
+    copy_memory(list, scratch.as_mut_ptr() as u64, src, 32, 0);
+    assert_eq!(segments(list).len(), 1);
+    copy_memory(list, dst, src, 32, 0);
+    with_state(list, |host, state| dispatch(host, state, 8));
+    mark_work(list);
+    assert_eq!(close(list), S_OK);
+    assert_eq!(segments(list).len(), 2);
+    slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+
+    // An unavailable command allocator must invalidate this recording. The
+    // caller can reset it and submit a subsequent recording as usual.
+    assert_eq!(reset(list, allocator, null), S_OK);
+    // SAFETY: this test owns the title list until release below.
+    let title = unsafe { &*list.cast::<List>() };
+    let failure =
+        windows::core::Error::from_hresult(windows::core::HRESULT(crate::object::E_OUTOFMEMORY));
+    assert!(split_for_copy(title, host_list(list).unwrap(), Err(failure)).is_none());
+    assert_eq!(close(list), crate::object::E_OUTOFMEMORY);
+    assert!(segments(list).is_empty());
+    assert_eq!(reset(list, allocator, null), S_OK);
+    assert_eq!(close(list), S_OK);
+    assert_eq!(segments(list).len(), 1);
+    for object in [queue, list, allocator] {
+        slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+    }
+}
 
 #[cfg(all(test, windows))]
 pub(crate) fn test_slot(list: This, slot_index: usize) -> usize {

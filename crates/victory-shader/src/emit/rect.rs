@@ -405,6 +405,7 @@ mod tests {
             user_data: Vec::new(),
             samplers: Vec::new(),
             static_samplers: Vec::new(),
+            buffer_table: false,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),

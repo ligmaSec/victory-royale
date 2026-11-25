@@ -263,6 +263,7 @@ fn encode(outcome: &Result<HostShader, String>) -> Vec<u8> {
             word(&mut out, v);
         }
     }
+    word(&mut out, u32::from(s.buffer_table));
     for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
@@ -332,6 +333,11 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
             max_lod: f32::from_bits(r.word()?),
         });
     }
+    let buffer_table = match r.word()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
@@ -341,6 +347,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         user_data,
         samplers,
         static_samplers,
+        buffer_table,
         root_cbvs,
         root_srvs,
         root_uavs,
@@ -369,8 +376,9 @@ mod tests {
                 0x18f0_0000,
                 0,
             ])],
+            buffer_table: true,
             root_cbvs: vec![2],
-            root_srvs: vec![0, 3],
+            root_srvs: vec![0, 3, victory_shader::emit::BUFFER_TABLE_SRV],
             root_uavs: vec![1],
         }
     }

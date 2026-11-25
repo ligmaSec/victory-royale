@@ -117,6 +117,7 @@ fn lower_mad_mul2() -> HostShader {
         user_data: lowered.user_data,
         samplers: lowered.samplers,
         static_samplers: Vec::new(),
+        buffer_table: false,
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,

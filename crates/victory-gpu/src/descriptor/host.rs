@@ -6,6 +6,8 @@
 //! direct CPU copies inside heap memory, and again when a draw reads it
 //! through a table and finds the slot changed.
 
+mod buffer_table;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -153,6 +155,8 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     dynamic_slots: Mutex<super::DynamicSlots>,
+    buffer_table: std::sync::OnceLock<buffer_table::Projection>,
+    buffer_table_init: Mutex<()>,
     /// Leaf-only tracker of live SRV/UAV textures across title slots.
     tex_tracker: Mutex<TexTracker>,
 }
@@ -345,6 +349,8 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             refreshes: Mutex::new(HashMap::new()),
             dynamic_slots: Mutex::new(super::DynamicSlots::new(extra as usize)),
+            buffer_table: std::sync::OnceLock::new(),
+            buffer_table_init: Mutex::new(()),
             tex_tracker: Mutex::new(TexTracker::new(sampler, count)),
         };
         // A slot never written is undefined: shaders reading one (a slot
@@ -723,6 +729,50 @@ impl HostHeap {
         }
     }
 
+    pub(crate) fn bind_record_table(
+        &self,
+        list: &crate::host::HostList,
+        title_heap: crate::object::This,
+    ) -> Option<u64> {
+        // SAFETY: the heap owns the live metadata buffer for the lifetime of the recording.
+        let address = unsafe { self.projection()?.buffer().GetGPUVirtualAddress() };
+        // SAFETY: the caller is binding its live title heap. Keep it across repeated submissions.
+        let heap = unsafe { crate::object::Held::try_new(title_heap) }?;
+        list.defer_selected_heap(heap);
+        Some(address)
+    }
+
+    pub(crate) fn prepare_selected(
+        &self,
+        title: &crate::descriptor::Heap,
+        visit: impl FnMut(&Arc<crate::shadow::Shadow>, usize, usize),
+    ) -> bool {
+        let Some(table) = self.projection() else {
+            return false;
+        };
+        let complete = table.sync(self, title);
+        table.visit_reads(visit);
+        complete
+    }
+
+    fn projection(&self) -> Option<&buffer_table::Projection> {
+        if self.sampler {
+            return None;
+        }
+        if let Some(table) = self.buffer_table.get() {
+            return Some(table);
+        }
+        let _init = self
+            .buffer_table_init
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self.buffer_table.get().is_none() {
+            let table = buffer_table::Projection::new(self)?;
+            let _ = self.buffer_table.set(table);
+        }
+        self.buffer_table.get()
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
@@ -748,6 +798,11 @@ impl HostHeap {
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        if let Some(table) = self.buffer_table.get()
+            && (made[index as usize] != key || view.is_none() && made[index as usize] != 0)
+        {
+            table.changed(index);
+        }
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
@@ -863,6 +918,9 @@ impl HostHeap {
     /// Removes all tracked references to `resource` when the title releases it,
     /// clearing only the exact slots that currently held `resource`.
     pub(crate) fn forget_resource(&self, resource: usize) {
+        if let Some(table) = self.buffer_table.get() {
+            table.released();
+        }
         if self.sampler {
             return;
         }
@@ -2353,7 +2411,7 @@ mod tests {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
-    struct OwnedObject(crate::object::This);
+    pub(super) struct OwnedObject(pub(super) crate::object::This);
 
     impl Drop for OwnedObject {
         fn drop(&mut self) {
@@ -2413,7 +2471,7 @@ mod tests {
         OwnedObject(out)
     }
 
-    fn make_view_heap(count: u32) -> OwnedObject {
+    pub(super) fn make_view_heap(count: u32) -> OwnedObject {
         use windows::core::Interface;
         #[repr(C)]
         struct ViewHeap {
@@ -3353,6 +3411,113 @@ mod structured_alias_tests {
         assert!(structured_alias(raw_srv_desc(0, 16), 0).is_none());
         assert!(structured_alias(raw_srv_desc(0, 16), 6).is_none());
         assert!(structured_alias(raw_srv_desc(0, 16), 4096).is_none());
+    }
+
+    #[test]
+    fn selected_buffer_table_can_initialize_after_a_dynamic_slot_is_returned() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return;
+        };
+        let spare = heap.dynamic_capacity();
+        let full = heap.dynamic(spare).expect("reserve the whole spare range");
+        assert!(heap.projection().is_none());
+        heap.release(full, 1);
+        let table = heap
+            .projection()
+            .expect("retry with room for the null view");
+        assert!(std::ptr::eq(table, heap.projection().unwrap()));
+        assert!(heap.dynamic(1).is_none());
+        heap.release(full + 1, spare - 1);
+    }
+
+    #[test]
+    fn buffer_table_tracks_descriptor_changes_after_recording_and_on_resubmission() {
+        let Some(host) = host() else { return };
+        let owned = super::tests::make_view_heap(8);
+        let title = crate::descriptor::heap(owned.0);
+        let heap = title.host().unwrap();
+        let buffer = heap.projection().unwrap().buffer().clone();
+        let list = host.new_list().unwrap();
+        let (back, mapped) = host.readback_buffer(160).unwrap();
+        // SAFETY: owned keeps the title heap alive while the list is recorded.
+        let pinned = unsafe { crate::object::Held::try_new(owned.0) }.unwrap();
+        list.defer_host(move || {
+            let title = crate::descriptor::heap(pinned.get());
+            title.sync_direct_copies(true);
+            let heap = title.host().unwrap();
+            assert!(heap.projection().unwrap().sync(heap, title));
+        });
+        // SAFETY: a 160-byte table in GENERIC_READ, a 160-byte COPY_DEST
+        // and an open list. The test retains both until all executions finish.
+        unsafe { list.list.CopyBufferRegion(&back, 0, &buffer, 0, 160) };
+        list.close();
+        let submit = || {
+            host.execute(&[&list]);
+            // SAFETY: the completed GPU copy populated all ten records in back.
+            unsafe { mapped.cast::<[[u32; 4]; 10]>().read_unaligned() }
+        };
+        let ranges = || {
+            let mut ranges = Vec::new();
+            heap.projection()
+                .unwrap()
+                .visit_reads(|_, start, len| ranges.push((start as u64, len)));
+            ranges
+        };
+        let empty = submit();
+        assert_eq!(empty[0], [8, 0, 0, 0]);
+        let null = empty[1];
+        assert!(null[0] >= heap.count());
+        assert_eq!(&empty[2..], &[null; 8]);
+
+        let backing = [0u32; 64];
+        let base = backing.as_ptr() as u64;
+        let _registered = ShadowGuard {
+            resource: base as usize,
+            address: base,
+        };
+        crate::shadow::register(base as usize, base, 256);
+        let mut resource = [0u32; 14];
+        resource[0] = 1;
+        resource[4] = 256;
+        let mut desc = [0u32; 16];
+        desc[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+        desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        desc[4] = 1;
+        desc[6] = 7;
+        desc[7] = 12;
+        desc[10] = base as u32;
+        desc[11] = (base >> 32) as u32;
+        let at = title.start + 3 * 32;
+        create_placed_srv(std::ptr::null(), &resource, &desc, at);
+        let first = submit();
+        let alias = first[5][0];
+        assert_ne!(alias, null[0]);
+        assert_eq!(first[5], [alias, 12, 12, 7]);
+        assert_eq!(first, submit());
+        assert_eq!(ranges(), [(base + 12, 84)]);
+
+        let mut staging = [0u64; 16];
+        let raw = placed_raw_srv_handle(&mut staging, base, 256, 2, 11);
+        // SAFETY: both addresses identify disjoint live 32-byte descriptor slots.
+        unsafe { std::ptr::copy_nonoverlapping(raw as *const u8, at as *mut u8, 32) };
+        let second = submit();
+        assert_eq!(second[5], [alias, 1, 8, 44]);
+        assert_eq!(second[4], null);
+        assert_eq!(second[6], null);
+        assert_eq!(ranges(), [(base + 8, 44)]);
+        create_placed_srv(std::ptr::null(), &resource, &desc, at + 32);
+        let shared = submit();
+        assert_eq!(shared[6], [alias, 12, 12, 7]);
+        assert_eq!(ranges(), [(base + 8, 88)]);
+        let clear = [0u64; 4];
+        crate::descriptor::copy_simple(std::ptr::null(), 1, at, clear.as_ptr() as u64, 0);
+        let remaining = submit();
+        assert_eq!(remaining[5], null);
+        assert_eq!(remaining[6], [alias, 12, 12, 7]);
+        assert_eq!(ranges(), [(base + 12, 84)]);
+        crate::descriptor::copy_simple(std::ptr::null(), 1, at + 32, clear.as_ptr() as u64, 0);
+        assert_eq!(submit(), empty);
+        eprintln!("GPU readback verified late structured and raw views, alias reuse and clear");
     }
 
     #[test]

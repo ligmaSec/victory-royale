@@ -94,7 +94,7 @@ const UNTRACKED_SELECT: Why = "a select on an untracked mask";
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_with_wave32(parts, true, None, None)
+    lower_with_wave32(parts, true, None, None, false)
 }
 
 pub(crate) fn lower_with_wave32(
@@ -102,14 +102,27 @@ pub(crate) fn lower_with_wave32(
     allow_wave32: bool,
     pixel_inputs: Option<&[SigElement]>,
     view_stride: Option<ViewStride<'_>>,
+    buffer_table: bool,
 ) -> Result<Lowered, ShaderError> {
-    match lower_program(parts, false, allow_wave32, pixel_inputs, view_stride) {
+    match lower_program(
+        parts,
+        false,
+        allow_wave32,
+        pixel_inputs,
+        view_stride,
+        buffer_table,
+    ) {
         Err(ShaderError::Unsupported {
             what: UNTRACKED_SELECT,
             ..
-        }) if parts.native.stage == HwStage::Cs => {
-            lower_program(parts, true, allow_wave32, pixel_inputs, view_stride)
-        }
+        }) if parts.native.stage == HwStage::Cs => lower_program(
+            parts,
+            true,
+            allow_wave32,
+            pixel_inputs,
+            view_stride,
+            buffer_table,
+        ),
         result => result,
     }
 }
@@ -120,10 +133,19 @@ fn lower_program(
     allow_wave32: bool,
     pixel_inputs: Option<&[SigElement]>,
     view_stride: Option<ViewStride<'_>>,
+    buffer_table: bool,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, numeric_selects, allow_wave32, view_stride).run(pixel_inputs)
+        match Lower::new(
+            parts,
+            &bad,
+            numeric_selects,
+            allow_wave32,
+            view_stride,
+            buffer_table,
+        )
+        .run(pixel_inputs)
         {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
@@ -217,6 +239,7 @@ struct Lower<'a> {
     /// Original to retained element ids for mesh vertex and primitive exports.
     mesh_output_ids: Option<[Vec<Option<usize>>; 2]>,
     view_stride: Option<ViewStride<'a>>,
+    buffer_table: bool,
     bad: &'a HashMap<Value, Why>,
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
@@ -503,6 +526,7 @@ impl<'a> Lower<'a> {
         numeric_selects: bool,
         allow_wave32: bool,
         view_stride: Option<ViewStride<'a>>,
+        buffer_table: bool,
     ) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
@@ -635,6 +659,7 @@ impl<'a> Lower<'a> {
             x,
             mesh_output_ids: None,
             view_stride,
+            buffer_table,
             bad,
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
@@ -1196,6 +1221,13 @@ impl<'a> Lower<'a> {
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
+        }
+        if self.buffer_table && self.s.buffer_uav {
+            // A writable buffer can alias a GPU-selected read in this dispatch.
+            return Err(Stop::Fail(ShaderError::Unsupported {
+                offset: 0,
+                what: "a GPU-selected buffer read alongside a buffer UAV",
+            }));
         }
         self.fill_phis()?;
         self.s.prune_pixel_inputs();
@@ -3948,6 +3980,36 @@ impl<'a> Lower<'a> {
                 || un.contains("atomic")
                 || used.is_some_and(|u| u.kind == ResourceType::Uav);
             let u = if uav { 0x1000 } else { 0 };
+            if !uav
+                && used.is_none()
+                && self.dynamic_buffer(&src)
+                && matches!(
+                    ui.fields,
+                    Fields::Buffer {
+                        idxen: true,
+                        format: None,
+                        ..
+                    }
+                )
+                && matches!(
+                    un,
+                    "buffer_load_dword"
+                        | "buffer_load_dwordx2"
+                        | "buffer_load_dwordx3"
+                        | "buffer_load_dwordx4"
+                )
+            {
+                let records = self.buffer_record(&src)?[3];
+                for k in 0..count {
+                    let reg = Reg::S(code + k as u8);
+                    if k == u32::from(first) + 2 {
+                        self.write(inst, reg, records, None);
+                    } else if let Some(v) = inst.write(reg) {
+                        self.vals.insert(v, Val::Missing(OTHER));
+                    }
+                }
+                return Ok(());
+            }
             let (props, image) = match &ui.fields {
                 Fields::Image { dim, .. } => {
                     let kind = match dim {
@@ -4547,6 +4609,66 @@ impl<'a> Lower<'a> {
         let &(param, dword) = self.params.get(&shift.read(Reg::S(*code))?)?;
         let root = self.x.native.layout[param];
         (root.root == RootType::Constants).then_some((root.slot, dword))
+    }
+
+    /// A scalar descriptor load addressed through the resource heap. The
+    /// selected slot can vary at run time and has no fixed shader metadata.
+    fn dynamic_buffer(&self, src: &Source) -> bool {
+        let Source::Loaded { load, .. } = src else {
+            return false;
+        };
+        self.buffer_table
+            && self.scalar.get(load).is_some_and(|a| {
+                a.dynamic.is_some()
+                    && self
+                        .x
+                        .native
+                        .layout
+                        .get(a.param)
+                        .is_some_and(|r| r.root == RootType::ResourceHeap)
+            })
+    }
+
+    /// Read a four-dword record: bounded raw SRV index, element stride,
+    /// byte bias and element count. Header word zero holds the slot count.
+    /// Record zero is a null buffer, real records follow it.
+    fn buffer_record(&mut self, src: &Source) -> Result<[V; 4], Why> {
+        let slot = self.uniform_heap_index(src, false)?;
+        let c = self.cur;
+        let table = self.s.root_srv_handle(super::BUFFER_TABLE_SRV);
+        let undef = self.s.m.undef(self.s.t.i32);
+        let zero = self.s.m.i32(0);
+        let align = self.s.m.i32(4);
+        let first = self.s.m.i8(1);
+        let header = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[table, zero, undef, first, align],
+        );
+        let limit = self.s.m.extract(c, header, 0);
+        let limit = self.as_int(limit);
+        let valid = self.s.m.cmp(c, pred::IULT, slot, limit);
+        let one = self.s.m.i32(1);
+        let two = self.s.m.i32(2);
+        let record = self.s.m.bin(c, Bin::Add, slot, two);
+        let record = self.s.m.select(c, valid, record, one);
+        let address = self.s.m.bin(c, Bin::Shl, record, align);
+        let all = self.s.m.i8(15);
+        let words = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[table, address, undef, all, align],
+        );
+        Ok([0, 1, 2, 3].map(|i| {
+            let x = self.s.m.extract(c, words, i);
+            self.as_int(x)
+        }))
     }
 
     fn selected_buffer(&mut self, slot: u8, dword: u32) -> Result<[V; 3], Why> {
@@ -8167,6 +8289,8 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        let mut byte_count = None;
+        let mut remaining = None;
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
@@ -8190,9 +8314,21 @@ impl<'a> Lower<'a> {
             let selector = (!uav && used.is_none())
                 .then(|| self.buffer_selector(src))
                 .flatten();
-            match (index, selector) {
-                (Some(index), Some((slot, word))) => {
-                    let [alias, stride, bias] = self.selected_buffer(slot, word)?;
+            let binding = if index.is_some() && !uav && used.is_none() {
+                if let Some((slot, word)) = selector {
+                    Some(self.selected_buffer(slot, word)?)
+                } else if self.dynamic_buffer(src) {
+                    let [alias, stride, bias, records] = self.buffer_record(src)?;
+                    byte_count = Some(self.s.m.bin(c, Bin::Mul, stride, records));
+                    Some([alias, stride, bias])
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            match (index, binding) {
+                (Some(index), Some([alias, stride, bias])) => {
                     let start = self.s.m.bin(c, Bin::Mul, index, stride);
                     let offset = self.s.m.bin(c, Bin::Add, start, off);
                     let byte = self.s.m.bin(c, Bin::Add, offset, bias);
@@ -8209,8 +8345,18 @@ impl<'a> Lower<'a> {
                     let invalid = self.s.m.i32(u32::MAX - 15);
                     let in_last_block = self.s.m.cmp(c, pred::IUGE, byte, invalid);
                     let invalid_address = self.s.m.bin(c, Bin::Or, overflow, in_last_block);
+                    let invalid_address = if let Some(len) = byte_count {
+                        let outside = self.s.m.cmp(c, pred::IUGE, offset, len);
+                        let invalid = self.s.m.bin(c, Bin::Or, invalid_address, outside);
+                        let available = self.s.m.bin(c, Bin::Sub, len, offset);
+                        remaining = Some(self.s.m.select(c, invalid, zero, available));
+                        invalid
+                    } else {
+                        invalid_address
+                    };
                     let byte = self.s.m.select(c, invalid_address, invalid, byte);
-                    let h = self.s.heap_handle(c, alias, false, false, (11, 0));
+                    let per_lane = matches!(src, Source::Loaded { load, .. } if self.x.res.waterfall.loads.contains(load));
+                    let h = self.s.heap_handle(c, alias, false, per_lane, (11, 0));
                     self.s.op(
                         c,
                         "rawBufferLoad.f32",
@@ -8248,13 +8394,24 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = *data else {
             return Err("a buffer result");
         };
+        let component = |this: &mut Self, k: u32| {
+            let value = this.s.m.extract(c, r, k);
+            if let Some(bytes) = remaining {
+                let needed = this.s.m.i32((k + 1) * 4);
+                let valid = this.s.m.cmp(c, pred::IUGE, bytes, needed);
+                let zero = this.s.m.f32(0);
+                this.s.m.select(c, valid, value, zero)
+            } else {
+                value
+            }
+        };
         if d16 {
             // Two f16 channels per VGPR (an odd last high half 0).
             let k16 = self.s.m.i32(16);
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
-                    let f = self.s.m.extract(c, r, ch);
+                    let f = component(self, ch);
                     let h = self.f16_nearest(f);
                     x = Some(match x {
                         Some(hi) => {
@@ -8269,7 +8426,7 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         for k in 0..count {
-            let x = self.s.m.extract(c, r, k);
+            let x = component(self, k);
             let x = self.as_int(x);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }

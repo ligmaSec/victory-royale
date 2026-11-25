@@ -203,6 +203,9 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
+    /// The compute shader reads GPU-selected buffer metadata through the
+    /// host-owned SRV at BUFFER_TABLE_SRV.
+    pub buffer_table: bool,
     pub stage: HwStage,
     /// The DXIL container, hashed as D3D12 expects.
     pub dxil: Vec<u8>,
@@ -283,6 +286,9 @@ pub struct StructuredBinding {
 // A required lookup discovers bindings. An optional lookup recognizes a
 // binding already being specialized when lowering another access to it.
 type ViewStride<'a> = &'a dyn Fn(StructuredBinding, bool) -> Option<u32>;
+
+/// Internal root SRV used for runtime-selected buffer view records.
+pub const BUFFER_TABLE_SRV: u8 = u8::MAX;
 
 const UNKNOWN_STRUCTURED_STRIDE: &str = "a structured buffer of unknown stride";
 
@@ -446,6 +452,7 @@ pub fn emit_with_wave32(
     emit_with_options(parts, allow_wave32, None, None)
 }
 
+#[derive(Clone, Copy)]
 struct Emission<'a> {
     c: &'a Container<'a>,
     native: &'a NativeProgram,
@@ -470,10 +477,52 @@ fn emit_with_options(
     pixel_inputs: Option<&[container::SigElement]>,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<HostShader, ShaderError> {
+    // Existing shaders keep their bindings even if an indexed load could
+    // also be expressed using the host's buffer metadata.
+    let result = emit_with_threading(parts, allow_wave32, pixel_inputs, view_stride, false);
+    if matches!(
+        result,
+        Err(ShaderError::Unsupported {
+            what: UNKNOWN_STRUCTURED_STRIDE,
+            ..
+        })
+    ) && parts.native.stage == HwStage::Cs
+        && !parts
+            .native
+            .layout
+            .iter()
+            .any(|p| p.slot == BUFFER_TABLE_SRV)
+        && parts.res.scalar.iter().any(|(_, addr)| {
+            addr.dynamic.is_some()
+                && parts
+                    .native
+                    .layout
+                    .get(addr.param)
+                    .is_some_and(|p| p.root == RootType::ResourceHeap)
+        })
+        && !parts.res.descriptors.iter().any(|descriptor| {
+            let name = parts.p.blocks[descriptor.site.0].insts[descriptor.site.1].name();
+            !name.starts_with("image_") && (name.contains("store") || name.contains("atomic"))
+        })
+        && let Ok(shader) =
+            emit_with_threading(parts, allow_wave32, pixel_inputs, view_stride, true)
+    {
+        return Ok(shader);
+    }
+    result
+}
+
+fn emit_with_threading(
+    parts: Emission<'_>,
+    allow_wave32: bool,
+    pixel_inputs: Option<&[container::SigElement]>,
+    view_stride: Option<ViewStride<'_>>,
+    buffer_table: bool,
+) -> Result<HostShader, ShaderError> {
     let Emission {
         c, native, p, st, ..
     } = parts;
-    let original = emit_program(parts, allow_wave32, pixel_inputs, view_stride);
+    let original = emit_program(parts, allow_wave32, pixel_inputs, view_stride, buffer_table);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -499,6 +548,7 @@ fn emit_with_options(
         allow_wave32,
         pixel_inputs,
         view_stride,
+        buffer_table,
     )
 }
 
@@ -507,6 +557,7 @@ fn emit_program(
     allow_wave32: bool,
     pixel_inputs: Option<&[container::SigElement]>,
     view_stride: Option<ViewStride<'_>>,
+    buffer_table: bool,
 ) -> Result<HostShader, ShaderError> {
     let Emission {
         c,
@@ -610,6 +661,7 @@ fn emit_program(
         allow_wave32,
         pixel_inputs,
         view_stride,
+        buffer_table,
     )?;
     Ok(HostShader {
         stage: native.stage,
@@ -628,6 +680,7 @@ fn emit_program(
             })
             .collect(),
         samplers: l.samplers,
+        buffer_table: buffer_table && l.root_srvs.contains(&BUFFER_TABLE_SRV),
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
@@ -818,6 +871,7 @@ mod tests {
             user_data: Vec::new(),
             samplers: Vec::new(),
             static_samplers: Vec::new(),
+            buffer_table: false,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
@@ -1325,6 +1379,7 @@ mod tests {
             user_data: Vec::new(),
             samplers: Vec::new(),
             static_samplers: Vec::new(),
+            buffer_table: false,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
@@ -1336,6 +1391,7 @@ mod tests {
                 user_data: Vec::new(),
                 samplers: Vec::new(),
                 static_samplers: Vec::new(),
+                buffer_table: false,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
@@ -1697,6 +1753,7 @@ mod tests {
                 user_data: l.user_data,
                 samplers: Vec::new(),
                 static_samplers: Vec::new(),
+                buffer_table: false,
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,

@@ -652,6 +652,7 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// Actual D3D12 access state per host buffer for this recording.
     shadow_states: Mutex<std::collections::HashMap<usize, (ID3D12Resource, D3D12_RESOURCE_STATES)>>,
+    selected_compute_reads: std::sync::atomic::AtomicBool,
     /// Incremented whenever `states` inserts a new texture or transitions a
     /// texture to a different state; reset to 0 when the list is reset.
     state_gen: std::sync::atomic::AtomicU64,
@@ -735,9 +736,8 @@ fn shadow_transition(
     if before.contains(wanted) {
         return None;
     }
-    let after = if before != D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-        && wanted != D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-    {
+    let write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_COPY_DEST;
+    let after = if before.0 & write.0 == 0 && wanted.0 & write.0 == 0 {
         before | wanted
     } else {
         wanted
@@ -834,14 +834,22 @@ enum Step {
     /// intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Work that may write title memory.
-    Run(Box<dyn Fn() + Send>),
+    Run(usize, usize, Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
+    SelectedHeap(crate::object::Held),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+}
+
+fn overlaps_reader(readers: &[(usize, usize)], dst: usize, len: usize) -> bool {
+    len != 0
+        && readers
+            .iter()
+            .any(|&(begin, end)| dst < end && dst.saturating_add(len) > begin)
 }
 
 /// A texture-to-buffer readback copied from a mapped readback buffer into
@@ -860,6 +868,7 @@ struct Readback {
 /// the upload/readback buffers its GPU commands name, kept until reset.
 #[derive(Default)]
 struct Deferred {
+    selected_ranges: Vec<(usize, usize)>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     /// Post-submission readbacks from GPU textures into title buffers.
@@ -1029,6 +1038,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 shadow_states: Mutex::default(),
+                selected_compute_reads: Default::default(),
                 state_gen: std::sync::atomic::AtomicU64::new(0),
                 dirty_resources: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
@@ -1070,6 +1080,49 @@ impl Host {
         #[cfg(not(test))]
         let exec_state: &Mutex<RetireState> = &RETIRE_STATE;
         let exec_epoch = acquire_epoch_in(exec_state);
+        let mut woken = crate::fence::Woken::default();
+        {
+            #[cfg(test)]
+            let _scope = enter_retire_scope(exec_scope.clone());
+            let mut readers = Vec::new();
+            let mut start = 0;
+            for (index, list) in runs.iter().enumerate() {
+                if readers.is_empty() && !list.selected_compute_reads.load(Ordering::Relaxed) {
+                    continue;
+                }
+                if !readers.is_empty()
+                    && list.deferred().copies.iter().any(|step| match step {
+                        Step::Copy(dst, _, len) | Step::Run(dst, len, _) => {
+                            overlaps_reader(&readers, *dst, *len)
+                        }
+                        _ => false,
+                    })
+                {
+                    self.execute_batch(&runs[start..index], &mut submitted, &mut woken);
+                    readers.clear();
+                    start = index;
+                }
+                if list.selected_compute_reads.load(Ordering::Relaxed) {
+                    for &range in &list.deferred().selected_ranges {
+                        if !readers.contains(&range) {
+                            readers.push(range);
+                        }
+                    }
+                }
+            }
+            self.execute_batch(&runs[start..], &mut submitted, &mut woken);
+        }
+        drop(submitted);
+        release_epoch_in(exec_state, exec_epoch);
+        woken.run();
+    }
+
+    fn execute_batch(
+        &self,
+        runs: &[&HostList],
+        submitted: &mut u64,
+        woken: &mut crate::fence::Woken,
+    ) {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -1078,8 +1131,6 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         {
-            #[cfg(test)]
-            let _scope = enter_retire_scope(exec_scope.clone());
             for list in runs {
                 list.run_deferred(&mut batch);
                 firsts.push(lists.len());
@@ -1109,7 +1160,20 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                if groups.len() == 1 && runs.len() > 1 {
+                    let mut start = 0;
+                    for (index, list) in runs.iter().take(runs.len() - 1).enumerate() {
+                        if list.selected_compute_reads.load(Ordering::Relaxed) {
+                            let end = firsts[index + 1];
+                            self.queue.ExecuteCommandLists(&group[start..end]);
+                            start = end;
+                        }
+                    }
+                    self.queue.ExecuteCommandLists(&group[start..]);
+                } else {
+                    self.queue.ExecuteCommandLists(group);
+                }
+
                 match self.queue.Signal(&self.fence, *submitted) {
                     Ok(()) => match self.fence.SetEventOnCompletion(*submitted, self.event) {
                         Ok(()) => {
@@ -1222,16 +1286,12 @@ impl Host {
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         // Queues these writes release run their work once no lock is held:
         // it submits lists itself (this lock, the lists' `deferred`).
-        let mut woken = crate::fence::Woken::default();
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 woken.add(what.write(at as *mut u8, bytes));
             }
         }
         self.log_messages();
-        drop(submitted);
-        release_epoch_in(exec_state, exec_epoch);
-        woken.run();
     }
 
     /// Fallback completion wait when registering or waiting on `self.event`
@@ -1573,12 +1633,48 @@ impl HostList {
         times
     }
 
+    #[cfg(test)]
+    pub(crate) fn recorded_shadow_state(
+        &self,
+        buffer: &ID3D12Resource,
+    ) -> Option<D3D12_RESOURCE_STATES> {
+        self.shadow_states
+            .lock()
+            .unwrap()
+            .get(&(buffer.as_raw() as usize))
+            .map(|(_, access)| *access)
+    }
+
+    pub(crate) fn use_selected_compute_buffers(&self) {
+        let mut states = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
+        let mut barriers = Vec::new();
+        for (resource, state) in states.values_mut() {
+            if let Some(after) =
+                shadow_transition(*state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+            {
+                barriers.push(transition(resource, *state, after));
+                *state = after;
+            }
+        }
+        if !barriers.is_empty() {
+            // SAFETY: this recording owns the open list and tracks each live buffer's preceding state.
+            unsafe { self.list.ResourceBarrier(&barriers) };
+        }
+        self.selected_compute_reads.store(true, Ordering::Relaxed);
+    }
+
     /// Track resolved buffers by resource identity, including aliasing title addresses.
     pub(crate) fn use_shadow(&self, buffer: &ID3D12Resource, wanted: D3D12_RESOURCE_STATES) {
         let mut states = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
+        let initial = D3D12_RESOURCE_STATE_COMMON;
+        let initial = if self.selected_compute_reads.load(Ordering::Relaxed) {
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+        } else {
+            initial
+        };
         let (_, state) = states
             .entry(buffer.as_raw() as usize)
-            .or_insert_with(|| (buffer.clone(), D3D12_RESOURCE_STATE_COMMON));
+            .or_insert_with(|| (buffer.clone(), initial));
         let before = *state;
         if let Some(after) = shadow_transition(before, wanted) {
             // SAFETY: this open list retains the resource and tracks its previous state.
@@ -1706,6 +1802,7 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.selected_compute_reads.store(false, Ordering::Relaxed);
         self.release_kept();
         self.shadow_states
             .lock()
@@ -2243,7 +2340,7 @@ impl HostList {
 
     #[cfg(test)]
     fn defer_unmarked(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
+        self.deferred().copies.push(Step::Run(0, 0, Box::new(work)));
     }
 
     /// Whether this list already covers the requested mip and all smaller ones.
@@ -2272,10 +2369,10 @@ impl HostList {
 
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
-    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
+    pub(crate) fn defer(&self, dst: usize, len: usize, work: impl Fn() + Send + 'static) {
         self.mark_work();
         let mut deferred = self.deferred();
-        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.copies.push(Step::Run(dst, len, Box::new(work)));
         deferred.refreshed.clear();
         deferred.copy_gen += 1;
     }
@@ -2291,6 +2388,25 @@ impl HostList {
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
         self.mark_work();
         self.deferred().copies.push(Step::Texture(staging));
+    }
+
+    pub(crate) fn reads_descriptors_at(&self, dst: usize, len: usize) -> bool {
+        self.selected_compute_reads.load(Ordering::Relaxed)
+            && overlaps_reader(&self.deferred().selected_ranges, dst, len)
+    }
+
+    pub(crate) fn defer_selected_heap(&self, heap: crate::object::Held) {
+        let title = crate::descriptor::heap(heap.get());
+        let base = title.start as usize;
+        let range = (
+            base,
+            base.saturating_add(title.host().unwrap().count() as usize * 32),
+        );
+        let mut deferred = self.deferred();
+        if !deferred.selected_ranges.contains(&range) {
+            deferred.selected_ranges.push(range);
+        }
+        deferred.copies.push(Step::SelectedHeap(heap));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -2323,6 +2439,23 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
+                Step::SelectedHeap(pinned) => {
+                    if batch.selected_heaps.insert(pinned.get() as usize) {
+                        let title = crate::descriptor::heap(pinned.get());
+                        title.sync_direct_copies(true);
+                        if !title
+                            .host()
+                            .unwrap()
+                            .prepare_selected(title, |shadow, start, len| {
+                                batch.add(shadow, start, len);
+                            })
+                        {
+                            static WARNED: std::sync::Once = std::sync::Once::new();
+                            WARNED.call_once(|| tracing::warn!("selected buffer alias space exhausted; unavailable views read zero until space returns"));
+                        }
+                    }
+                    continue;
+                }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
@@ -2332,8 +2465,8 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
-                    if matches!(step, Step::Run(_)) {
+                Step::Run(_, _, work) | Step::Host(work) => {
+                    if matches!(step, Step::Run(..)) {
                         batch.title_written();
                         #[cfg(feature = "diagnostics")]
                         {
@@ -2375,6 +2508,7 @@ impl HostList {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
+    selected_heaps: std::collections::HashSet<usize>,
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     gpu_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     declared_writes: std::collections::HashSet<(usize, usize, usize)>,
@@ -2428,6 +2562,7 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+        self.selected_heaps.clear();
     }
 
     fn flush(&mut self) {

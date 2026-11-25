@@ -773,6 +773,13 @@ impl State {
                     .map(|s| s.shader.hash.as_str())
             })
             .flatten();
+        if compute
+            && p.stages
+                .iter()
+                .any(|stage| stage.translated().host.buffer_table)
+        {
+            list.use_selected_compute_buffers();
+        }
         self.bindless_textures(list, p, compute);
         for stage in &p.stages {
             let t = stage.translated();
@@ -831,6 +838,24 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
+                    if t.host.buffer_table && srv && slot == victory_shader::emit::BUFFER_TABLE_SRV
+                    {
+                        let key = self.heaps[0];
+                        if key == 0 {
+                            return false;
+                        }
+                        let table = crate::descriptor::heap(key as This)
+                            .host()
+                            .and_then(|h| h.bind_record_table(list, key as This));
+                        let Some(address) = table else {
+                            return false;
+                        };
+                        // SAFETY: the compute root signature declares this SRV and the list retains its heap.
+                        unsafe {
+                            l.SetComputeRootShaderResourceView(param, address);
+                        }
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
@@ -4010,7 +4035,7 @@ mod table_tests {
 
         // An intervening `defer` (e.g. `CopyMemoryToMemoryX` writing title
         // memory) must also bump `copy_gen` and allocate a fresh CBV snapshot.
-        list.defer(|| {});
+        list.defer(0, 0, || {});
         let made5 = state.tables(&list, &used, false, &[]);
         assert!(!state.table_failed);
         assert_eq!(state.dynamic.len(), 3);
@@ -4970,6 +4995,8 @@ mod structured_alias_tests {
         );
         eprintln!("indexed buffer readback: {got:x?}");
     }
+
+    mod selected_buffers;
 
     #[test]
     fn fullscreen_pairs_match_only_verified_vs_ps_combinations() {
