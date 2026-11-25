@@ -82,7 +82,9 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
 4. Press Enter to keep everything local, or choose a destination. Public sharing
    previews the exact text and confirms the signed-in GitHub account and PR.
    For private sharing, the filtered ZIP also contains per-window mean, median,
-   p95, longest frame time and stall counts for each build. You can open it
+   p95, longest frame time and stall counts for each build. Separate submission
+   samples record time spent on CPU preparation, buffer and texture copies,
+   GPU waits and copy-back, alongside draw and pipeline-drop counts. You can open it
    locally before sending. Choose **i** for the private upload page and select
    the printed ZIP. Until a project inbox is configured, use the private destination
    supplied by the requester. The printed `share` folder contains just the filtered

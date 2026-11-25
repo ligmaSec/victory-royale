@@ -29,6 +29,16 @@ MS = rb"([0-9]{1,9}\.[0-9]{2})"
 INTERVAL = re.compile(rb"present intervals: ([0-9]{1,4}) frames, mean " + MS + rb" ms, median " + MS
                       + rb" ms, p95 " + MS + rb" ms, longest " + MS
                       + rb" ms, ([0-9]{1,4}) over 100 ms, ([0-9]{1,4}) over 1 s$")
+# The release logger emits one sample of submission cost per reporting period.
+# Match the full message so a format change cannot shift values between columns.
+SUBMISSION_FORMAT = (b"%f fps, %f ms/frame (%f preparing: copies %f ms %f MB, textures %f ms %f MB; "
+                     b"%f on the GPU; %f copying back %f MB), %i draws/frame, dropped %i without a "
+                     b"host pipeline (%i being made) and %i indirect")
+SUBMISSION = re.compile(rb"(?<![0-9.+-])" + re.escape(SUBMISSION_FORMAT)
+                        .replace(b"%f", rb"([0-9]{1,10}\.[0-9])").replace(b"%i", rb"([0-9]{1,10})") + rb"$")
+SUBMISSION_COLUMNS = ("fps", "ms_per_frame", "preparing_ms", "buffer_copy_ms", "buffer_copy_mb",
+                      "texture_ms", "texture_mb", "gpu_wait_ms", "copy_back_ms", "copy_back_mb",
+                      "draws_per_frame", "dropped_per_frame", "pipelines_being_made", "indirect_per_frame")
 VENDORS = {b"0x1002": "AMD", b"0x10de": "NVIDIA", b"0x8086": "Intel", b"0x1414": "Microsoft"}
 EVENTS = {b"shader does not translate": "shader refusal",
           b"host compute pipeline refused": "compute pipeline refusal",
@@ -270,7 +280,7 @@ def instruction_block(heading, message, path_line=None):
     print("\n".join(lines), end="\n\n", flush=True)
 
 
-def read_metrics(stream, frame_log):
+def read_metrics(stream, frame_log, submission_log):
     """Count diagnostic messages and completed, non-overlapping present windows."""
     frames = windows = slow = stalls = 0
     elapsed = longest = 0.0
@@ -291,6 +301,10 @@ def read_metrics(stream, frame_log):
                     longest = max(longest, float(worst))
                     slow += over100
                     stalls += over1000
+        elif b" ms/frame (" in raw:
+            match = SUBMISSION.search(ANSI.sub(b"", raw).rstrip())
+            if match:
+                submission_log.writerow([value.decode("ascii") for value in match.groups()])
         elif b"host D3D12 device ready" in raw:
             match = re.search(rb"\bvendor=(0x[0-9a-f]{4})\b", ANSI.sub(b"", raw))
             if match:
@@ -311,7 +325,7 @@ def read_metrics(stream, frame_log):
     return rows
 
 
-def side_metrics(results, side, windows, frame_log):
+def side_metrics(results, side, windows, frame_log, submission_log):
     console = results / (side + ".log")
     if not console.is_file():
         return ["No console log recorded"]
@@ -325,11 +339,11 @@ def side_metrics(results, side, windows, frame_log):
                     for name in ("./steam-victory.log", "./launcher.log"):
                         if name in bundle.getnames() and bundle.getmember(name).isfile():
                             with bundle.extractfile(name) as stream:
-                                return read_metrics(stream, frame_log)
+                                return read_metrics(stream, frame_log, submission_log)
             except (OSError, EOFError, tarfile.TarError):
                 pass
     with console.open("rb") as stream:
-        return read_metrics(stream, frame_log)
+        return read_metrics(stream, frame_log, submission_log)
 
 
 def diagnostic_summary(request, results, windows, complete, destination):
@@ -341,18 +355,23 @@ def diagnostic_summary(request, results, windows, complete, destination):
         exit_path = results / (side + "-exit.txt")
         status = exit_path.read_bytes().strip() if exit_path.is_file() else b""
         code = str(int(status)) if re.fullmatch(rb"-?[0-9]{1,10}", status) else "unreported"
-        with (destination / (side + "-frames.csv")).open("x", encoding="ascii", newline="") as output:
-            frame_log = csv.writer(output)
+        frames_path = destination / (side + "-frames.csv")
+        samples_path = destination / (side + "-submissions.csv")
+        with frames_path.open("x", encoding="ascii", newline="") as frames, \
+                samples_path.open("x", encoding="ascii", newline="") as samples:
+            frame_log = csv.writer(frames)
+            submission_log = csv.writer(samples)
+            submission_log.writerow(SUBMISSION_COLUMNS)
             frame_log.writerow(["window", "intervals", "mean_ms", "median_ms", "p95_ms", "longest_ms",
                                 "over_100_ms", "over_1_s"])
-            rows += [f"Launcher exit: {code}", *side_metrics(results, side, windows, frame_log)]
+            rows += [f"Launcher exit: {code}", *side_metrics(results, side, windows, frame_log, submission_log)]
     return "\n".join(rows) + "\n"
 
 
 def share_result(pr, report, filtered):
     print(report, flush=True)
     instruction_block("SHARE YOUR RESULT",
-                      "The filtered ZIP contains the summary above and frame timings for each run. "
+                      "The filtered ZIP contains the summary above, frame timings and sampled GPU submission costs for each run. "
                       "You can also send a written summary.", f"Filtered diagnostics: {filtered}")
     if not sys.stdin.isatty():
         return
@@ -437,7 +456,8 @@ def run_request(manifest, options):
                 share.mkdir()
                 filtered = share / (destination.name + "-diagnostics.zip")
                 with zipfile.ZipFile(filtered, "x", zipfile.ZIP_DEFLATED) as out:
-                    for name in ("summary.txt", "main-frames.csv", "candidate-frames.csv"):
+                    for name in ("summary.txt", "main-frames.csv", "candidate-frames.csv",
+                                 "main-submissions.csv", "candidate-submissions.csv"):
                         # Fixed ZIP metadata avoids recording local times or file modes.
                         entry = zipfile.ZipInfo(name)
                         out.writestr(entry, (destination / name).read_bytes(), compress_type=zipfile.ZIP_DEFLATED)

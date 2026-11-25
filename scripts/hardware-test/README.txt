@@ -15,7 +15,7 @@ Logs may contain your username, local file paths, or other sensitive information
 At REPORT READY or TEST INTERRUPTED, review the on-screen summary. Press Enter
 to keep it local. You can post the summary to the PR under your GitHub account
 or choose [i] to send the filtered diagnostics ZIP privately. The ZIP contains the same summary
-and two frame-timing tables. It is the only file in the temporary share folder. Keep
+and numeric tables of frame times and sampled submission costs for both builds. It is the only file in the temporary share folder. Keep
 report.zip, which contains raw logs, on your machine. Tell the requester what
 you saw in each run.
 
