@@ -8952,7 +8952,8 @@ impl<'a> Lower<'a> {
         let mut bad = self.s.m.cmp(c, pred::SLT, x, z);
         let mut idxs = [z; 3];
         for k in 0..3 {
-            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
+            // Each 10-bit field ends with an edge flag above the nine index bits.
+            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
             let oob = self.s.m.cmp(c, pred::IUGE, i, mv);
