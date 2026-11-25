@@ -61,7 +61,7 @@ runtime on first use.
 
 | Start here | Linux/Proton | Windows (PowerShell) |
 | --- | --- | --- |
-| From the repository root, choose a published PR | `python3 scripts/hardware-test/run-test.py` | `py scripts/hardware-test/run-test.py` |
+| From the repository root, choose a test request | `python3 scripts/hardware-test/run-test.py` | `py scripts/hardware-test/run-test.py` |
 | With a kit ZIP, extract it and open a terminal in the folder containing `run-test.py` | `python3 run-test.py` | `py run-test.py` |
 
 The checkout menu uses a signed-in GitHub CLI (`gh auth login`). Type the PR number
@@ -95,8 +95,10 @@ checkout command for their OS with the PR number appended, plus the private repo
 destination. Tell testers that logs can contain usernames, local paths and other
 sensitive information, and that they can reply with a written summary. Add the
 `tester wanted` label to the PR while the request is open.
-The menu also lists the request. If the PR head changes or the kit
-expires, publish a fresh kit for the current revision.
+The picker lists open PRs labeled `tester wanted` and open PRs with a published kit.
+A kit published by the workflow on `main` can run directly. For a labeled PR without
+one, the picker links to the request, including any separate kit or manual instructions.
+If the PR head changes or the kit expires, publish a fresh kit for the current revision.
 
 For testers without a checkout, share the kit ZIP. To prepare one locally with a
 signed-in GitHub CLI, run this from a trusted checkout, replacing `PR_NUMBER` with
