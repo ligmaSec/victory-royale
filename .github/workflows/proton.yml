@@ -77,14 +77,16 @@ jobs:
             ${{ runner.temp }}/runtime-tests/victory-runtime-*/logs/*.log
           if-no-files-found: warn
           retention-days: 3
-      - name: Deliver verified main build
-        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      - name: Deliver tested build
+        if: >-
+          github.event_name == 'pull_request' ||
+          (github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch'))
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: victory-proton-x86_64-${{ github.sha }}
+          name: victory-proton-x86_64-${{ github.event_name == 'pull_request' && format('pr-{0}-', github.event.pull_request.number) || '' }}${{ github.sha }}
           path: |
             ${{ runner.temp }}/distribution/victory-proton-x86_64.tar.gz
             ${{ runner.temp }}/distribution/SHA256SUMS
           if-no-files-found: error
-          retention-days: 14
+          retention-days: ${{ github.event_name == 'pull_request' && 3 || 14 }}
           compression-level: 0

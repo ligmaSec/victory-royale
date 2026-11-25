@@ -36,9 +36,16 @@ threads, memory, DLL loading, and expected title return codes. Failed runs retai
 the synthetic case logs and summary for three days. Game rendering and
 the full UMU/Proton runtime still require a separate workstation test.
 
-Successful main builds deliver an Actions artifact named
-`victory-proton-x86_64-<commit>` for 14 days. Download it from the CI run,
-unzip the Actions download, and run the following in the extracted directory.
+Successful main builds deliver `victory-proton-x86_64-<commit>` for 14 days.
+Code PRs deliver `victory-proton-x86_64-pr-<number>-<merge-commit>` for three
+days. The latter contains the revision GitHub tested with the base branch.
+For a hardware comparison, use a build of that PR run's base commit, building
+it locally if it has no artifact. Keep each download in a separate directory
+and report each `victory/REVISION`. Windows testers can run the extracted
+`victory.exe` with the [usual Windows launch command](../README.md#getting-started).
+
+Download the artifact from the CI run, unzip the Actions download, and run
+the following in the extracted directory.
 
 ```sh
 sha256sum --check SHA256SUMS
