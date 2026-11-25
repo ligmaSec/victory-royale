@@ -151,7 +151,8 @@ An account rename also requires republication.
 **Older kits.** Open an old request with the updated checkout to keep its report
 local or post a reviewed public summary. A previously extracted runner still
 uses the delivery rules it shipped with, which may include the project key.
-Choose **Keep local** there. Use a newly published official kit for delivery to
+Reports already sent to the project key still require its original private key.
+Choose **Keep local** in an older runner. Use a newly published official kit for delivery to
 the requester. Local packager output and loose request files in a checkout support
 local review and public summaries. The current runner verifies an official ZIP
 with GitHub when opened directly. For an extracted official kit it checks the

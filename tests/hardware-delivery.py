@@ -65,7 +65,8 @@ class RequestDelivery(unittest.TestCase):
             self.assertRegex(payload["files"][keys.REGISTRATION]["content"], "^age1[a-z0-9]{58}\n$")
             if path == "gists":
                 self.assertTrue(payload["public"])
-                gid = f"{len(self.gists) + 1:032x}"
+                self.serial = getattr(self, "serial", 0) + 1
+                gid = f"{self.serial:032x}"
                 self.gists[gid] = dict(id=gid, owner=self.viewer.copy(), **payload)
             else:
                 self.assertEqual(method, "PATCH")
@@ -148,6 +149,12 @@ class RequestDelivery(unittest.TestCase):
             command("setup")
             self.assertEqual(tuple(folder.glob("*.agekey")), (identity,))
             self.assertEqual(identity.read_bytes(), before)
+        # A deleted registration can be restored using the existing sole local identity.
+        original_registration = keys.find_registration(keys.account(requester))
+        del self.gists[original_registration["gist"]]
+        command("setup")
+        self.assertEqual(keys.find_registration(keys.account(requester))["key"], original_registration["key"])
+        self.assertEqual(identity.read_bytes(), before)
         self.viewer = publisher
         binding = keys.publication(7, "publisher", 22, comment)
         filtered = self.root / "outgoing.zip"
@@ -189,6 +196,35 @@ class RequestDelivery(unittest.TestCase):
         for alternate in (published, dict(binding["registration"], key=published["key"])):
             with self.assertRaises(ValueError):
                 runner.send_encrypted_report(filtered, dict(binding, registration=alternate))
+        self.assertFalse(delivery)
+        # Replacing both fields with a different legitimate account must fail too.
+        # Exercise the extracted runner through its normal argument parsing and results menu.
+        build = {"run": 712, "revision": "a" * 40, "sha256": "b" * 64}
+        original = {"version": 1, "pr": 7, "scenario": "Observe.", "delivery": binding,
+                    "main": build, "candidate": build}
+        manifest = self.root / "request.json"
+        manifest.write_text(json.dumps(original), encoding="utf-8")
+        stamp = runner.digest(manifest)
+        changed = dict(original, delivery={"requester": keys.account(publisher), "registration": published})
+        manifest.write_text(json.dumps(changed), encoding="utf-8")
+        title = self.root / "fixture.exe"
+        title.touch()
+        def launch(side, folder, game, results, windows):
+            (results / (side + ".log")).write_text("synthetic run")
+        def menu(title, context, lines, actions, default, cancel):
+            self.assertEqual(title, "Hardware test results")
+            self.assertIn("Private delivery unavailable", " ".join(lines))
+            self.assertNotIn("i", [action[0] for action in actions])
+            return "k"
+        with mock.patch.object(sys, "argv", ["run-test", "--title", str(title), "--output-dir", str(self.root)]), \
+                mock.patch.object(runner, "ROOT", self.root), mock.patch.object(runner, "PUBLISHED_SHA256", stamp), \
+                mock.patch.object(runner, "stage_build"), mock.patch.object(runner, "launch", side_effect=launch), \
+                mock.patch.object(shutil, "which", return_value="fixture-tool"), \
+                mock.patch.object(sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(subprocess, "check_output", return_value=tester["login"]), \
+                mock.patch.object(runner.report_ui, "choose", side_effect=menu) as prompt:
+            runner.run()
+            prompt.assert_called_once()
         self.assertFalse(delivery)
         runner.send_encrypted_report(filtered, binding)
         self.assertIn("@requester", delivery["notice"])

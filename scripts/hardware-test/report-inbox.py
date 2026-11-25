@@ -25,6 +25,12 @@ def setup(owner, folder, rotate):
                 raise ValueError("Restore your backed-up key folder, or deliberately run rotate.")
         else:
             # age-keygen creates its output exclusively. Keep pending material across API failures.
+            if not current and not rotate and not pending.exists():
+                saved = list(folder.glob("age1*.agekey"))
+                if len(saved) > 1:
+                    raise ValueError("Several identities are backed up here. Use rotate to create a fresh registration.")
+                if saved:
+                    os.link(saved[0], pending)
             if not pending.exists():
                 subprocess.run([str(keygen), "-o", str(pending)], check=True, stderr=subprocess.PIPE)
             public = public_key(keygen, pending)
@@ -38,7 +44,7 @@ def setup(owner, folder, rotate):
                 row = keys.github("gists/" + current["gist"], payload, "PATCH")
             else:
                 row = keys.github("gists", dict(payload, public=True))
-            if keys.registration(owner, row["id"])["key"] != public:
+            if keys.find_registration(owner) != {"gist": row["id"], "key": public}:
                 raise ValueError("GitHub registration verification failed.")
             pending.unlink()
         print(f"Private reports are configured for @{owner['login']}.")
