@@ -11,6 +11,10 @@ fn main() {
     let Some(compiler) = env::var_os("VICTORY_BUILD_DXC").map(PathBuf::from) else {
         return;
     };
+    if compiler.as_os_str().is_empty() {
+        println!("cargo:warning=VICTORY_BUILD_DXC is empty. Skipping GPU helper shader embedding.");
+        return;
+    }
     println!("cargo:rerun-if-changed={}", compiler.display());
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     for name in ["argument_clamp", "rect_rewrite", "rect_expand"] {

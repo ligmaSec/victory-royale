@@ -19,7 +19,9 @@ building. Run the following from the checkout.
 rustup target add x86_64-pc-windows-gnullvm
 export CC_x86_64_pc_windows_gnullvm=x86_64-w64-mingw32-clang
 export AR_x86_64_pc_windows_gnullvm=llvm-ar
-export VICTORY_BUILD_DXC="$(command -v dxc)"
+if [ -z "${VICTORY_BUILD_DXC:-}" ] && dxc_path=$(command -v dxc); then
+    export VICTORY_BUILD_DXC="$dxc_path"
+fi
 cargo build --locked --release -p victory --target x86_64-pc-windows-gnullvm
 ```
 
