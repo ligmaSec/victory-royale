@@ -64,8 +64,10 @@ place of `python3`. Add `--plan` to preview the scenario and revisions.
 Published requests use a signed-in GitHub CLI. Testers with a kit ZIP can
 pass its path instead, or extract it and run `python3 run-test.py` from the
 extracted folder. The runner prompts for the game executable, verifies the
-two CI packages, launches both with fresh translation caches, and prints
-one private report path.
+two CI packages, and shows the scenario immediately before each launch.
+Both builds run with fresh translation caches. At the end, send the ZIP at
+the printed `Upload:` path privately to the requester. It stays in a unique
+system temporary folder after the runner exits.
 
 Maintainers can run the [hardware kit workflow](../.github/workflows/hardware-request.yml)
 on main and share its ZIP, or prepare it from a trusted checkout using a
