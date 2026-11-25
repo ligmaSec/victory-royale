@@ -789,7 +789,7 @@ impl Shader {
             features |= 0x8000;
         }
         if self.flags & flags::BARYCENTRICS != 0 {
-            features |= 0x2_0000;
+            features |= super::SFI0_BARYCENTRICS;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= super::SFI0_RESOURCE_HEAP;

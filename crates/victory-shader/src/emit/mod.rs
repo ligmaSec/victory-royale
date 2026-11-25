@@ -229,17 +229,33 @@ pub struct HostShader {
 pub(crate) const SFI0_RESOURCE_HEAP: u64 = 0x200_0000;
 pub(crate) const SFI0_SAMPLER_HEAP: u64 = 0x400_0000;
 
+pub(crate) const SFI0_BARYCENTRICS: u64 = 0x2_0000;
+
+/// Host requirements read from a translated or cached shader's SFI0 part.
+pub struct ShaderRequirements {
+    /// The root signature must allow direct descriptor heap indexing.
+    pub indexes_heaps: bool,
+    /// The device must support pixel shader barycentric coordinates.
+    pub barycentrics: bool,
+}
+
 impl HostShader {
-    /// Whether the shader indexes a descriptor heap directly
-    /// (`ResourceDescriptorHeap` / `SamplerDescriptorHeap`), which its root
-    /// signature must then allow. A container without readable feature
-    /// flags counts as one that does.
-    pub fn indexes_heaps(&self) -> bool {
+    /// A missing or incomplete SFI0 keeps the conservative heap flags.
+    pub fn requirements(&self) -> ShaderRequirements {
         let features = Container::parse(&self.dxil).ok().and_then(|c| {
             let data = c.part(FourCC::SFI0)?.data.get(..8)?;
             Some(u64::from_le_bytes(data.try_into().ok()?))
         });
-        features.is_none_or(|f| f & (SFI0_RESOURCE_HEAP | SFI0_SAMPLER_HEAP) != 0)
+        ShaderRequirements {
+            indexes_heaps: features
+                .is_none_or(|f| f & (SFI0_RESOURCE_HEAP | SFI0_SAMPLER_HEAP) != 0),
+            barycentrics: features.is_some_and(|f| f & SFI0_BARYCENTRICS != 0),
+        }
+    }
+
+    /// Whether the root signature must allow direct descriptor heap indexing.
+    pub fn indexes_heaps(&self) -> bool {
+        self.requirements().indexes_heaps
     }
 
     /// Size of the user-data buffer the shader declares, in dwords (a
@@ -827,6 +843,9 @@ mod tests {
         };
         let with = |features: u64| shader(&[(FourCC::SFI0, &features.to_le_bytes())]);
         assert!(!with(0x4000).indexes_heaps());
+        assert!(!with(0x4000).requirements().barycentrics);
+        assert!(with(SFI0_BARYCENTRICS).requirements().barycentrics);
+        assert!(!shader(&[]).requirements().barycentrics);
         assert!(with(0x4000 | SFI0_RESOURCE_HEAP).indexes_heaps());
         assert!(with(SFI0_SAMPLER_HEAP).indexes_heaps());
         assert!(shader(&[]).indexes_heaps());

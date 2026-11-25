@@ -41,6 +41,7 @@ const LIST_POOL_CAP: usize = 64;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    barycentrics: OnceLock<bool>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -521,6 +522,7 @@ fn create() -> windows::core::Result<Host> {
             event,
             rtvs,
             rtv_size,
+            barycentrics: OnceLock::new(),
             dsvs,
             dsv_size,
             next_dsv: AtomicU32::new(0),
@@ -887,6 +889,22 @@ struct Deferred {
 }
 
 impl Host {
+    /// Direct pixel reads of the triangle's barycentric weights.
+    pub(crate) fn barycentrics(&self) -> bool {
+        *self.barycentrics.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            // SAFETY: the query writes its own structure of the given size.
+            let result = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS3,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            };
+            result.is_ok() && options.BarycentricsSupported.as_bool()
+        })
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
