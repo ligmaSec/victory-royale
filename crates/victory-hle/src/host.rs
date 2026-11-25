@@ -44,7 +44,6 @@ impl Default for HostPolicy {
             "ole32.dll",
             "advapi32.dll",
             "iphlpapi.dll",
-            "rpcrt4.dll",
             // The title's crash handler writes minidumps with it (loaded by name).
             "dbghelp.dll",
             // Same APIs as the console's (XAudio2 ordinal 1 is XAudio2Create
@@ -124,14 +123,20 @@ mod imp {
     fn module(dll: &str) -> Option<usize> {
         let key = dll.to_ascii_lowercase();
         let cache = || MODULES.lock().unwrap_or_else(|e| e.into_inner());
-        let cached = cache().get(&key).copied();
-        if cached.is_some() {
-            return cached;
+        if let Some(m) = cache().get(&key).copied() {
+            return Some(m);
         }
         let name = CString::new(key.as_str()).ok()?;
-        // Not under the cache's lock: loading takes the OS loader lock, and
-        // title code that runs under that one (a DLL's thread attach, a TLS
-        // callback) may look a function up here.
+        // The load is deliberately outside the cache's lock. Loading a DLL
+        // that is not loaded yet takes the OS loader lock, and title code
+        // runs under that lock too (a title DLL's thread attach, the TLS
+        // callbacks that run as a thread starts), where it can need this
+        // cache: any first use of a `host!` function, or a late-bound title
+        // DLL. Holding the cache while waiting for the loader lock, with
+        // another thread holding the loader lock and waiting for the cache,
+        // hangs the process for good: it cannot even exit, since
+        // ExitProcess needs the loader lock as well.
+        //
         // System32 only: never pick up a same-named DLL from the current folder or PATH.
         // SAFETY: NUL-terminated DLL name; only allow-listed system DLLs get here.
         let handle = unsafe {
@@ -141,7 +146,9 @@ mod imp {
                 LOAD_LIBRARY_SEARCH_SYSTEM32,
             )
         } as usize;
-        // A thread that loaded it meanwhile got the same module, which stays loaded.
+        // A thread that loaded the same DLL meanwhile got the same module
+        // (the OS counts the references), and it stays loaded either way, so
+        // whichever handle the map already holds is the right one.
         (handle != 0).then(|| *cache().entry(key).or_insert(handle))
     }
 
@@ -161,8 +168,8 @@ mod imp {
         static IN_ATTACH: AtomicBool = AtomicBool::new(false);
         static STARTED: AtomicBool = AtomicBool::new(false);
 
-        /// Runs as title TLS callbacks do: under the loader lock, as a new
-        /// thread starts.
+        /// Runs where a title's TLS callbacks run: under the loader lock, as
+        /// a new thread starts.
         #[used]
         #[unsafe(link_section = ".CRT$XLY")]
         static ON_THREAD: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) = attach;
@@ -171,10 +178,10 @@ mod imp {
             const DLL_THREAD_ATTACH: u32 = 2;
             if reason == DLL_THREAD_ATTACH && ARMED.swap(false, Ordering::SeqCst) {
                 IN_ATTACH.store(true, Ordering::SeqCst);
-                // SAFETY: a plain sleep, for the other thread to start a load.
+                // SAFETY: a plain sleep, long enough for the other thread to
+                // start its load while this one holds the loader lock.
                 unsafe { Sleep(500) };
-                let found = super::super::function("kernel32.dll", "GetTickCount");
-                assert!(found.is_some());
+                assert!(super::super::function("kernel32.dll", "GetTickCount").is_some());
             }
         }
 
@@ -184,12 +191,13 @@ mod imp {
 
         /// One thread loads a DLL nothing has loaded yet, which needs the
         /// loader lock, while another thread's attach holds that lock and
-        /// looks a function up. Run in a child process: a deadlock inside the
-        /// loader keeps a process from exiting, so the parent kills it.
+        /// looks a function up. Run in a child process of the test binary: a
+        /// deadlock inside the loader keeps a process from exiting at all,
+        /// so the parent has to kill it rather than wait.
         #[test]
-        fn loading_a_host_dll_does_not_block_thread_attach() {
+        fn loading_a_host_dll_does_not_block_a_thread_attach() {
             if std::env::var_os(CHILD).is_none() {
-                let name = "host::imp::tests::loading_a_host_dll_does_not_block_thread_attach";
+                let name = "host::imp::tests::loading_a_host_dll_does_not_block_a_thread_attach";
                 let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", name])
                     .env(CHILD, "1")
@@ -208,7 +216,8 @@ mod imp {
                     std::thread::sleep(Duration::from_millis(50));
                 }
             }
-            // The attach below only needs the cache, no load of its own.
+            // Cached first, so the attach below needs the cache only and no
+            // load of its own.
             assert!(super::super::function("kernel32.dll", "GetTickCount").is_some());
             let loader = std::thread::spawn(|| {
                 STARTED.store(true, Ordering::SeqCst);
@@ -217,17 +226,19 @@ mod imp {
                 }
                 super::super::function("cabinet.dll", "FDICreate")
             });
-            // Its own attach is over: the next is the thread below.
+            // That thread's own attach is over, so the next one armed is the
+            // thread created below.
             while !STARTED.load(Ordering::SeqCst) {
                 std::hint::spin_loop();
             }
             ARMED.store(true, Ordering::SeqCst);
-            let (security, start) = (std::ptr::null(), Some(idle as _));
-            // SAFETY: a thread that returns at once.
+            let (security, start) = (null(), Some(idle as _));
+            // SAFETY: a thread entry point of ours that returns at once, with
+            // no argument and the default stack.
             let thread = unsafe { CreateThread(security, 0, start, null(), 0, null_mut()) };
             assert!(!thread.is_null());
             assert!(loader.join().unwrap().is_some());
-            // SAFETY: our own thread's handle.
+            // SAFETY: our own thread's handle, still open.
             unsafe { WaitForSingleObject(thread, INFINITE) };
         }
     }
@@ -237,17 +248,5 @@ mod imp {
 mod imp {
     pub(super) fn resolve(_dll: &str, _symbol: &victory_pe::ImportSymbol) -> Option<usize> {
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn host_policy_allows_rpcrt4() {
-        let policy = HostPolicy::default();
-        assert!(policy.allows("rpcrt4.dll"));
-        assert!(policy.allows("RPCRT4.DLL"));
     }
 }
