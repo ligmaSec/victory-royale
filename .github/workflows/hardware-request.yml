@@ -7,6 +7,10 @@ on:
         description: Pull request number
         required: true
         type: string
+      requester_comment:
+        description: "Publishing for someone else? Link their /victory hardware-test comment on this PR"
+        required: false
+        type: string
       scenario:
         description: What to do in each Series X run and when to close it
         required: true
@@ -45,10 +49,11 @@ jobs:
       - name: Match and verify both CI builds
         env:
           GH_TOKEN: ${{ github.token }}
+          REQUESTER_COMMENT: ${{ inputs.requester_comment }}
           PR: ${{ inputs.pr }}
           SCENARIO: ${{ inputs.scenario }}
         run: |
-          python3 scripts/hardware-test/prepare.py "$PR" --scenario "$SCENARIO" --review-dir "$RUNNER_TEMP/review" --output "$RUNNER_TEMP/kit.zip"
+          python3 scripts/hardware-test/prepare.py "$PR" --scenario "$SCENARIO" --published --requester-comment "$REQUESTER_COMMENT" --review-dir "$RUNNER_TEMP/review" --output "$RUNNER_TEMP/kit.zip"
           unzip -q "$RUNNER_TEMP/kit.zip" -d "$RUNNER_TEMP/kit"
       - name: Publish the test kit
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

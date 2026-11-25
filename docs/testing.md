@@ -99,16 +99,16 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
    event timeline connects shader binds, translations and pipeline results to
    those samples through elapsed times and shader numbers shared across the pair.
    You can inspect the filtered ZIP in the printed temporary `share` folder.
-6. For **Send encrypted report**, install GitHub CLI and sign in to github.com
+6. For **Send encrypted diagnostics to @requester**, install GitHub CLI and sign in to github.com
    with permission to create gists (`gh auth login --hostname github.com --scopes gist`).
    For an existing CLI login, `gh auth refresh --hostname github.com --scopes gist`
    adds the scope. The confirmation screen lists the account, recipient and every outgoing file.
    Choose **Encrypt and send** to complete delivery. The runner downloads the pinned,
    checksum-verified x86-64 age tool. [Official age release](https://github.com/FiloSottile/age/releases/tag/v1.3.2).
    GitHub stores the encrypted file in an unlisted gist owned by your account.
-   A mention on the gist notifies the maintainer. Your account, gist size and
+   A mention on the gist notifies the requester. Your account, gist size and
    upload time are visible to GitHub. Anyone with the URL can retrieve the
-   ciphertext. The maintainer's private age key is needed to read its contents.
+   ciphertext. The named requester's private age key is needed to read its contents.
    Keep the receipt if notification fails. You can delete the gist from your account.
 
 **Raw logs may contain usernames, file paths, credentials or output from the title.**
@@ -117,17 +117,65 @@ fields. Unknown messages, command lines, hostnames, wall-clock timestamps, scree
 the request's free text are excluded. If the summary misses something, describe
 it in words. See the [asset policy](asset-policy.md).
 
+## Receive private hardware reports
+
+From the repository root, with GitHub CLI signed in to github.com and authorized
+for gists, run the following once. On Windows, use `py` in place of `python3`.
+
+```sh
+python3 scripts/hardware-test/report-inbox.py setup
+```
+
+The command generates an age identity locally. It publishes only the public key
+in a public Gist under your account and verifies the Gist owner’s numeric GitHub
+ID and login. Back up the private folder it prints in encrypted storage. Running
+setup again checks the same key. On another computer, restore that folder first.
+If GitHub CLI lacks gist access, run `gh auth refresh --hostname github.com --scopes gist`.
+
+To receive a submission, open the Gist mention in your GitHub notifications.
+Run the command in the mention from the repository root. It uses your signed-in
+account’s local identities and prints the decrypted ZIP path under `~/uploads`.
+You can also copy the Gist link into this command. Open the reviewed files locally.
+
+```sh
+python3 scripts/hardware-test/report-inbox.py receive GIST_URL
+```
+
+Run `python3 scripts/hardware-test/report-inbox.py rotate` to publish a fresh key.
+Back up the folder again. Old identities stay there and can decrypt reports
+already sent. Losing the old private key loses access to those reports. Rotating
+or removing the registration disables further private sends from outstanding
+kits bound to it. Republish those kits after rotation or first-time registration.
+An account rename also requires republication.
+
+**Older kits.** Open an old request with the updated checkout to keep its report
+local or post a reviewed public summary. A previously extracted runner still
+uses the delivery rules it shipped with, which may include the project key.
+Reports already sent to the project key still require its original private key.
+Choose **Keep local** in an older runner. Use a newly published official kit for delivery to
+the requester. Local packager output and loose request files in a checkout support
+local review and public summaries. The current runner verifies an official ZIP
+with GitHub when opened directly. For an extracted official kit it checks the
+request against the copy pinned in its bundled runner.
+
 ## Requesting a hardware comparison
 
 Run the [hardware kit workflow](../.github/workflows/hardware-request.yml) on
 `main` with the PR number and a short Series X scenario. Specify where to start,
-what to observe and when to close each run. The publisher requires `main`.
+what to observe and when to close each run. If someone else asked for the test,
+have them comment on this PR with `/victory hardware-test` on its own first line
+followed by their scenario. Put that comment URL in **requester_comment** when
+dispatching. For your own request leave the field blank. The workflow then uses
+the GitHub dispatch actor. The PR author can be a third person. Publication
+records the requester and their verified key at that time. If they have no key,
+the results screen offers local review and public summary sharing. Check
+`run-test.py PR_NUMBER --plan` for the intended account before inviting testers.
 After publication, [Verify the published hardware request](../.github/workflows/hardware-request-verify.yml)
 previews the PR by number using the same picker as testers. A successful preview
 adds `tester wanted` to the PR. If verification fails, fix the reported problem
 and republish the kit before inviting testers. Once verified, send the tester the
-checkout command for their OS with the PR number appended, plus the private report
-destination. Tell testers that logs can contain usernames, local paths and other
+checkout command for their OS with the PR number appended. Check the account
+shown in the plan against the person who asked for the test. Tell testers that logs can contain usernames, local paths and other
 sensitive information, and that they can reply with a written summary. For manual tests, add the
 `tester wanted` label to the PR while the request is open.
 The picker lists open PRs labeled `tester wanted` and open PRs with a published kit.

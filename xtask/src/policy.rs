@@ -161,7 +161,10 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
             | "scripts/hardware-test/run-test.py"
             | "scripts/hardware-test/prepare.py"
             | "scripts/hardware-test/report_ui.py"
+            | "scripts/hardware-test/report_keys.py"
+            | "scripts/hardware-test/report-inbox.py"
             | "tests/hardware-test.py"
+            | "tests/hardware-delivery.py"
     ) || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()

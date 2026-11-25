@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -9,13 +10,15 @@ import sys
 import tempfile
 import zipfile
 
-REPO = "ligmaSec/victory-royale"
+import report_keys
+
+REPO = report_keys.REPO
 ROOT = Path(__file__).resolve().parent
 PACKAGE = "victory-proton-x86_64.tar.gz"
 
 
 def api(path):
-    raw = subprocess.check_output(["gh", "api", f"repos/{REPO}/{path}"])
+    raw = subprocess.check_output(["gh", "api", "--hostname", "github.com", f"repos/{REPO}/{path}"])
     return json.loads(raw)
 
 
@@ -42,7 +45,7 @@ def find_build(source, commit, prefix):
                 base = parents[0]["sha"]
             # Pin the actual bytes that the maintainer checked, not a mutable branch name.
             with tempfile.TemporaryDirectory() as folder:
-                subprocess.run(["gh", "run", "download", str(run["id"]), "-R", REPO,
+                subprocess.run(["gh", "run", "download", str(run["id"]), "-R", "github.com/" + REPO,
                                 "-n", artifact["name"], "-D", folder], check=True)
                 package = (Path(folder) / PACKAGE).read_bytes()
                 digest = hashlib.sha256(package).hexdigest()
@@ -79,16 +82,26 @@ def prepare():
     parser.add_argument("--scenario", required=True, help="what to do in each run and when to close it")
     parser.add_argument("--output", required=True, type=Path, help="new request ZIP")
     parser.add_argument("--review-dir", type=Path, help="directory containing both native review executables")
+    parser.add_argument("--published", action="store_true", help="bind the request in the official main workflow")
+    parser.add_argument("--requester-comment", default="", help="delegated request comment on this PR")
     args = parser.parse_args()
     if args.pr < 1 or not args.scenario.strip() or not args.scenario.isprintable():
         parser.error("Use a positive PR number and a single plain-text scenario.")
     pull = api(f"pulls/{args.pr}")
     if pull["base"]["ref"] != "main" or pull["base"]["repo"]["full_name"] != REPO:
         raise ValueError("The PR must target this repository's main branch.")
+    binding = None
+    if args.published:
+        binding = report_keys.publication(args.pr, os.environ["GITHUB_ACTOR"],
+                                          int(os.environ["GITHUB_ACTOR_ID"]), args.requester_comment)
     candidate, base, candidate_bytes = find_build("pull_request", pull["head"]["sha"],
                                  f"victory-proton-x86_64-pr-{args.pr}-")
     main, _, main_bytes = find_build("main", base, "victory-proton-x86_64-")
     request = {"version": 1, "pr": args.pr, "scenario": args.scenario, "main": main, "candidate": candidate}
+    if binding:
+        request["delivery"] = binding
+        request["publication_run"] = int(os.environ["GITHUB_RUN_ID"])
+    manifest = (json.dumps(request, indent=2) + "\n").encode()
     with zipfile.ZipFile(args.output, "x", zipfile.ZIP_DEFLATED) as out:
         for build, package in ((main, main_bytes), (candidate, candidate_bytes)):
             out.writestr(f"packages/{build['sha256']}.tar.gz", package, compress_type=zipfile.ZIP_STORED)
@@ -98,11 +111,16 @@ def prepare():
                 data = (args.review_dir / name).read_bytes()
                 out.writestr("review/" + name, data)
                 out.writestr("review/" + name + ".sha256", hashlib.sha256(data).hexdigest())
-        out.write(ROOT / "run-test.py", "run-test.py")
+        runner = (ROOT / "run-test.py").read_bytes()
+        if binding:
+            stamp = hashlib.sha256(manifest).hexdigest()
+            runner = runner.replace(b"PUBLISHED_SHA256 = None", f'PUBLISHED_SHA256 = "{stamp}"'.encode(), 1)
+        out.writestr("run-test.py", runner)
+        out.write(ROOT / "report_keys.py", "report_keys.py")
         out.write(ROOT / "report_ui.py", "report_ui.py")
         out.write(ROOT.parents[1] / "LICENSE", "LICENSE")
         out.write(ROOT / "README.txt", "README.txt")
-        out.writestr("request.json", json.dumps(request, indent=2) + "\n")
+        out.writestr("request.json", manifest)
     print(args.output.resolve())
 
 

@@ -27,12 +27,14 @@ discards those working copies. Your original logs stay local.
 
 Keep local and finish prints the filtered ZIP location. Post public summary
 previews the account, PR and text. Send encrypted diagnostics lists the account,
-recipient and files. Confirm Encrypt and send to deliver the ZIP. Sending
+verified requester and reviewed files. Confirm Encrypt and send to deliver the ZIP. Sending
 requires GitHub CLI signed in to github.com with gist access. The runner names
 your account before sending. It downloads a checksum-verified age tool, encrypts
 the filtered ZIP and returns an unlisted GitHub Gist receipt. GitHub sees your
 account, upload time and size. Anyone with the receipt can retrieve the encrypted
-file. The private option requires a configured project key. Offline runs still
+file. The requester receives a GitHub notification and decrypts the ZIP locally.
+When the kit has no verified requester key, or the key has changed, keep your
+diagnostics local and ask for a fresh kit. Offline runs still
 save a shareable ZIP with frame times, submission costs and shader events.
 Keep the raw report.zip local. Tell the requester what you saw on each build.
 

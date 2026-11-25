@@ -73,7 +73,13 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Hardware test kit (synthetic)
-        run: python -B tests/hardware-test.py
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VICTORY_TEST_AGE: "1"
+        run: |
+          python -B tests/hardware-test.py
+          python -B tests/hardware-delivery.py
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
@@ -116,8 +122,14 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Hardware test kit (synthetic)
-        # Exercise the same terminal entry point contributors use, without a person at the keyboard.
-        run: timeout 60s script -qec 'python3 -B tests/hardware-test.py' /dev/null </dev/null
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VICTORY_TEST_AGE: "1"
+        # Exercise the contributor's terminal entry point without keyboard input.
+        run: |
+          timeout 60s script -qec 'python3 -B tests/hardware-test.py' /dev/null </dev/null
+          python3 -B tests/hardware-delivery.py
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
