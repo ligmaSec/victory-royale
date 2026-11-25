@@ -86,6 +86,73 @@ class HardwareRequest(unittest.TestCase):
         self.assertIn("Close the window.", out.getvalue())
         self.assertIn("actions/runs/12", out.getvalue())
 
+    def test_checkout_menu(self):
+        with mock.patch.object(runner, "ROOT", self.root / "checkout"), \
+                mock.patch.object(sys, "argv", ["runner"]), \
+                mock.patch.object(sys.stdin, "isatty", return_value=True), \
+                mock.patch("builtins.input", return_value=""), \
+                mock.patch.object(runner, "run_request", side_effect=AssertionError), \
+                mock.patch.object(runner, "github_rows") as github, contextlib.redirect_stdout(io.StringIO()) as out:
+            github.side_effect = [[{"number": 7, "title": "First scene", "head": "current"}],
+                                  [10, 12], [], [{"name": "victory-series-x-pr-9"},
+                                                   {"name": "victory-series-x-pr-7"}]]
+            runner.run()
+            self.assertIn("#7  First scene", out.getvalue())
+            self.assertNotIn("#9", out.getvalue())
+            self.assertIn("hardware-request.yml/runs?branch=main&event=workflow_dispatch&status=success",
+                          github.call_args_list[1].args[0])
+            self.assertIn("runs/12/artifacts", github.call_args_list[2].args[0])
+            self.assertIn("expired == false", github.call_args_list[2].args[1])
+            github.side_effect = [[]]
+            runner.run()
+            self.assertIn("no published Series X", out.getvalue())
+
+    def test_published_request(self):
+        available = {7: ({"title": "First scene", "head": "current"}, 12, "victory-series-x-pr-7")}
+        def download(args, check):
+            self.assertEqual(args[:-1], ["gh", "run", "download", "12", "-R", runner.REPO,
+                                         "-n", "victory-series-x-pr-7", "-D"])
+            shutil.copy(self.manifest, Path(args[-1]) / "request.json")
+        parents = [{"sha": self.revision}, {"sha": "current"}]
+        with mock.patch.object(runner, "ROOT", self.root / "checkout"), \
+                mock.patch.object(sys, "argv", ["runner", "7", "--plan"]), \
+                mock.patch.object(subprocess, "run", side_effect=download), \
+                mock.patch.object(runner, "published_requests", return_value=available), \
+                mock.patch.object(runner, "github_rows", return_value=parents), \
+                mock.patch.object(runner, "launch", side_effect=AssertionError), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            runner.run()
+            self.assertIn("Close the window.", out.getvalue())
+            with mock.patch.object(sys, "argv", ["runner", "--plan"]), \
+                    mock.patch.object(sys.stdin, "isatty", return_value=True), \
+                    mock.patch("builtins.input", return_value="7"):
+                runner.run()
+            parents[1]["sha"] = "old"
+            with self.assertRaisesRegex(ValueError, "changed after"):
+                runner.run()
+            self.manifest.write_text(json.dumps(dict(self.request, pr=8)))
+            with self.assertRaisesRegex(ValueError, "different PR"):
+                runner.run()
+
+    def test_checkout_zip_and_extracted_kit_offline(self):
+        archive = self.root / "Series X kit.zip"
+        name = self.build["sha256"] + ".tar.gz"
+        with zipfile.ZipFile(archive, "w") as kit:
+            kit.write(self.manifest, "request.json")
+            kit.write(self.package, "packages/" + name)
+            kit.writestr("../ignored", "unused")
+        def check_manifest(manifest, options):
+            self.assertEqual(runner.read_request(manifest), self.request)
+            runner.stage_build(self.request, "candidate", self.root / "checked", manifest.parent / "packages")
+        with mock.patch.object(runner, "ROOT", self.root), \
+                mock.patch.object(subprocess, "run", side_effect=AssertionError), \
+                mock.patch.object(shutil, "which", side_effect=AssertionError):
+            with mock.patch.object(sys, "argv", ["runner", "--plan"]), contextlib.redirect_stdout(io.StringIO()):
+                runner.run()
+            with mock.patch.object(sys, "argv", ["runner", str(archive)]), \
+                    mock.patch.object(runner, "run_request", side_effect=check_manifest):
+                runner.run()
+
     def run_pair(self, launch):
         args = ["runner", str(self.manifest), "--title", str(self.title), "--output-dir", str(self.output)]
         with mock.patch.object(sys, "argv", args), mock.patch.object(shutil, "which", return_value="tool"), \

@@ -1,6 +1,14 @@
 VIctory hardware comparison
 
-Extract this ZIP. In the extracted folder, run:
+From the repo root, run this to choose a published Series X test:
+
+  python3 scripts/hardware-test/run-test.py
+
+If the requester gave you a PR number, add it to the command. On Windows,
+use py in place of python3. To preview a test, add --plan.
+
+If you downloaded a kit ZIP, pass its path instead of the PR number.
+You can also extract the ZIP and run from the extracted folder:
 
   Linux/Proton:  python3 run-test.py
   Windows:       py run-test.py

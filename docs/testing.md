@@ -56,11 +56,16 @@ tar -xf victory-proton-x86_64.tar.gz
 
 ## Requesting a hardware comparison
 
-Send testers one test kit and the instruction to extract it and run
-`python3 run-test.py` on Linux or `py run-test.py` on Windows. They select
-their game executable once. The runner shows the scenario, verifies both CI
-packages included in the kit, launches each with the Series X profile and a fresh translation
-cache, and prints one private report path. Testers can preview with `--plan`.
+From a checkout, run `python3 scripts/hardware-test/run-test.py` to choose
+a published Series X test. For a targeted request, send the same command
+with the PR number as its only argument. Windows users can use `py` in
+place of `python3`. Add `--plan` to preview the scenario and revisions.
+
+Published requests use a signed-in GitHub CLI. Testers with a kit ZIP can
+pass its path instead, or extract it and run `python3 run-test.py` from the
+extracted folder. The runner prompts for the game executable, verifies the
+two CI packages, launches both with fresh translation caches, and prints
+one private report path.
 
 Maintainers can run the [hardware kit workflow](../.github/workflows/hardware-request.yml)
 on main and share its ZIP, or prepare it from a trusted checkout using a
