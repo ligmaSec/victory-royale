@@ -25,7 +25,8 @@ The distribution job builds the x86-64 Windows release on Linux and checks that
 all three compiled DXIL helpers are present in the executable. It unpacks the
 archive, exercises the launcher with a fake UMU, and runs the packaged executable
 under Wine against synthetic PE fixtures. The suite checks import binding, TLS,
-threads, memory, DLL loading, and expected title return codes. Game rendering and
+threads, memory, DLL loading, and expected title return codes. Failed runs retain
+the synthetic case logs and summary for three days. Game rendering and
 the full UMU/Proton runtime still require a separate workstation test.
 
 Successful main builds deliver a private Actions artifact named

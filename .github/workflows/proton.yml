@@ -50,9 +50,12 @@ jobs:
           tar -czf victory-proton-x86_64.tar.gz victory
           sha256sum victory-proton-x86_64.tar.gz > SHA256SUMS
       - name: Exercise the archive users will download
+        id: runtime
+        env:
+          TMPDIR: ${{ runner.temp }}/runtime-tests
         run: |
           dist="$RUNNER_TEMP/distribution"
-          mkdir "$RUNNER_TEMP/unpacked"
+          mkdir -p "$TMPDIR" "$RUNNER_TEMP/unpacked"
           cd "$dist"
           sha256sum --check --strict SHA256SUMS
           tar -xf victory-proton-x86_64.tar.gz -C "$RUNNER_TEMP/unpacked"
@@ -62,6 +65,16 @@ jobs:
           bash "$GITHUB_WORKSPACE/tests/proton-launcher.sh" "$PWD/victory-proton.sh"
           PATH="/usr/bin:$PATH" xvfb-run -a bash "$GITHUB_WORKSPACE/tests/runtime/run.sh" \
             --victory "$PWD/victory.exe" --wine /usr/bin/wine
+      - name: Preserve failed synthetic cases
+        if: failure() && steps.runtime.outcome == 'failure'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runtime-diagnostics-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/runtime-tests/victory-runtime-*/summary.json
+            ${{ runner.temp }}/runtime-tests/victory-runtime-*/logs/*.log
+          if-no-files-found: warn
+          retention-days: 3
       - name: Deliver verified main build
         if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
