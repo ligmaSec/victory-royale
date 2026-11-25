@@ -793,6 +793,8 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
+        // dxil-spirv (Proton's) takes one back edge per loop header.
+        self.m.one_latch_per_loop();
         let bitcode = self.m.write();
         super::bitcode::census::note(&self.m, &bitcode);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
