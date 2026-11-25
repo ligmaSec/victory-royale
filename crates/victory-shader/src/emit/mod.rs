@@ -1985,6 +1985,18 @@ mod barycentric_tests {
         validate(&shader);
     }
 
+    #[test]
+    fn dead_barycentric_arithmetic_keeps_the_old_shader_requirements() {
+        let [exp, sources] = exp_mrt0(2);
+        let tail = [0x7E04_02F2, exp, sources, 0xBF81_0000]; // v2 = 1.0, export v2
+        let mut words = vec![v_add_f32(3, 0, 1)]; // dead v3 = I + J
+        words.extend(tail);
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        let (features, inputs) = parts(&shader);
+        assert_eq!(features & 0x2_0000, 0);
+        assert!(inputs.iter().all(|e| e.kind != 28));
+    }
+
     /// I and J only fed to `v_interp_*` stay host interpolation: no
     /// barycentrics are declared.
     #[test]

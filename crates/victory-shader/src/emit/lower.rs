@@ -90,6 +90,17 @@ enum Stop {
     Fail(ShaderError),
 }
 
+const DIRECT_BARYCENTRICS: Why = "barycentrics read directly";
+
+/// Require an optional host capability only if the normal lowering refuses
+/// a live use. Dead arithmetic stays usable with the original requirements.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LowerMode {
+    Normal,
+    NumericSelects,
+    Barycentrics,
+}
+
 const UNTRACKED_SELECT: Why = "a select on an untracked mask";
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -103,28 +114,30 @@ pub(crate) fn lower_with_wave32(
     pixel_inputs: Option<&[SigElement]>,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<Lowered, ShaderError> {
-    match lower_program(parts, false, allow_wave32, pixel_inputs, view_stride) {
+    let attempt = |mode| lower_program(parts, mode, allow_wave32, pixel_inputs, view_stride);
+    match attempt(LowerMode::Normal) {
         Err(ShaderError::Unsupported {
             what: UNTRACKED_SELECT,
             ..
-        }) if parts.native.stage == HwStage::Cs => {
-            lower_program(parts, true, allow_wave32, pixel_inputs, view_stride)
-        }
+        }) if parts.native.stage == HwStage::Cs => attempt(LowerMode::NumericSelects),
+        Err(ShaderError::Unsupported {
+            what: DIRECT_BARYCENTRICS,
+            ..
+        }) if parts.native.stage == HwStage::Ps => attempt(LowerMode::Barycentrics),
         result => result,
     }
 }
 
 fn lower_program(
     parts: &Parts,
-    numeric_selects: bool,
+    mode: LowerMode,
     allow_wave32: bool,
     pixel_inputs: Option<&[SigElement]>,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, numeric_selects, allow_wave32, view_stride).run(pixel_inputs)
-        {
+        match Lower::new(parts, &bad, mode, allow_wave32, view_stride).run(pixel_inputs) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -257,9 +270,7 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
-    /// Retry a compute shader with numeric selects only when the normal
-    /// translation needs one. Unused selects need no fixed wave size.
-    numeric_selects: bool,
+    mode: LowerMode,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -500,7 +511,7 @@ impl<'a> Lower<'a> {
     fn new(
         x: &'a Parts<'a>,
         bad: &'a HashMap<Value, Why>,
-        numeric_selects: bool,
+        mode: LowerMode,
         allow_wave32: bool,
         view_stride: Option<ViewStride<'a>>,
     ) -> Self {
@@ -536,7 +547,7 @@ impl<'a> Lower<'a> {
                     || implicit_derivatives(n)
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
-                    || numeric_selects && numeric_select(x.st, i)
+                    || mode == LowerMode::NumericSelects && numeric_select(x.st, i)
             };
             // Masks held as numbers or constant lane sets: the lane
             // tests its own bit by its console lane.
@@ -670,7 +681,7 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
-            numeric_selects,
+            mode,
             flat: None,
             no_barrier,
             fence_only_barrier,
@@ -1268,7 +1279,10 @@ impl<'a> Lower<'a> {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
                 // Most programs only interpolate with them: loaded on first
                 // use as a value (`get`).
-                Reg::V(_) if matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) => {
+                Reg::V(_)
+                    if self.mode == LowerMode::Barycentrics
+                        && matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) =>
+                {
                     continue;
                 }
                 Reg::S(n) => match io_inputs.get(&v) {
@@ -1319,7 +1333,7 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
-            Input::Barycentric { kind, index } => return self.barycentric(kind, index),
+            Input::Barycentric { .. } => return Val::Missing(DIRECT_BARYCENTRICS),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -1515,6 +1529,9 @@ impl<'a> Lower<'a> {
     /// Loads `v` if it is a barycentric input VGPR not loaded yet (see
     /// `inputs`): `None` if it is not one.
     fn lazy_barycentric(&mut self, v: Value) -> Option<Result<(), Why>> {
+        if self.mode != LowerMode::Barycentrics {
+            return None;
+        }
         let (kind, index) = self.x.io.inputs.iter().find_map(|&(w, i)| match i {
             Input::Barycentric { kind, index } if w == v => Some((kind, index)),
             _ => None,
@@ -2302,7 +2319,7 @@ impl<'a> Lower<'a> {
         if code == NULL {
             return Ok(self.s.m.bool(false));
         }
-        if !self.numeric_selects || !self.console_lanes {
+        if self.mode != LowerMode::NumericSelects || !self.console_lanes {
             return Err(UNTRACKED_SELECT);
         }
         // A scalar operation can define either dword independently. The SSA
