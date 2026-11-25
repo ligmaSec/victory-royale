@@ -38,20 +38,40 @@ fn store_uav(vdata: u32, dword_index: u32) -> [u32; 2] {
 /// on every available SM 6.6 backend (hardware GPU and WARP). Using >32 threads
 /// avoids emitting `WaveSize(32)`, so WARP (4 lanes) executes it too.
 fn run_lds_program(body: &[u32], expected: &[u32]) {
+    let shader = build_lds_program(
+        body,
+        false,
+        [64, 1, 1],
+        super::ComputeWaves::with_wave32(true),
+    );
+    #[cfg(windows)]
+    check_readback(shader, expected);
+    #[cfg(not(windows))]
+    let _ = (shader, expected);
+}
+
+fn build_lds_program(
+    body: &[u32],
+    guest_wave64: bool,
+    threads: [u32; 3],
+    waves: super::ComputeWaves,
+) -> HostShader {
     let slot = 3;
     let mut words = vec![
         0xF404_0200, // s_load_dwordx2 s[8:9], s[0:1], 0
         0xFA00_0000,
         0xBE8A_0384, // descriptor size
         0xBE8B_0380, // remaining descriptor flags
-        0x3400_0084, // v_lshlrev_b32 v0, 4, v0 (per-thread 16-byte LDS slice)
     ];
+    if !guest_wave64 {
+        words.push(0x3400_0084); // private 16-byte slice for the sub-dword tests
+    }
     words.extend_from_slice(body);
     words.push(S_ENDPGM);
 
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64: guest_wave64,
         vgprs: 16,
         layout: vec![RootParam {
             root: RootType::Descriptor,
@@ -73,8 +93,8 @@ fn run_lds_program(body: &[u32], expected: &[u32]) {
         }],
         io: StageIo::Cs(ComputeIo {
             // 4 user SGPRs (bits 5:1) + 256 dwords of LDS (bits 23:15).
-            rsrc2: (4 << 1) | (2 << 15),
-            threads: [64, 1, 1],
+            rsrc2: (4 << 1) | (2 << 15) | (u32::from(threads[1] > 1) << 11),
+            threads,
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -85,20 +105,25 @@ fn run_lds_program(body: &[u32], expected: &[u32]) {
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-    })
+    let lowered = lower::lower_with_waves(
+        &lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        },
+        waves,
+        None,
+        None,
+    )
     .expect("lower");
 
-    let mut shader = HostShader {
+    HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -107,16 +132,11 @@ fn run_lds_program(body: &[u32], expected: &[u32]) {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
-    };
-
-    #[cfg(windows)]
-    check_readback(&mut shader, expected);
-    #[cfg(not(windows))]
-    let _ = (&mut shader, expected);
+    }
 }
 
 #[cfg(windows)]
-fn check_readback(shader: &mut HostShader, expected: &[u32]) {
+fn check_readback(mut shader: HostShader, expected: &[u32]) {
     use super::host::{Dispatch, Host, Root, View};
     use super::valu_tests::{ONE_AT_A_TIME, backends};
 
@@ -136,7 +156,7 @@ fn check_readback(shader: &mut HostShader, expected: &[u32]) {
             continue;
         };
         let (root, pso) = host
-            .compute_pipeline(shader)
+            .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
         let out = host
             .dispatch(
@@ -300,4 +320,61 @@ fn lds_d16_destination_forms_on_hardware() {
     }
 
     run_lds_program(&body, &expected);
+}
+
+#[test]
+fn lds_max_across_a_split_wave64() {
+    let body = [
+        0x34100283, 0x4a001100, // flatten 8 by 8 thread IDs
+        0x34020082, // byte address of this thread's own dword
+        0x7e040280, // v2 = 0
+        0xd8340000, 0x00000201, // initialize each thread's dword to zero
+        0xd8200000, 0x00000002, // atomic_max(LDS[0], flat thread ID)
+        0xd8d80000, 0x03000002, // each thread reads the same maximum
+        0xe0701000, 0x80020301, // out[flat thread ID] = maximum
+    ];
+    let narrow = super::ComputeWaves {
+        wave32: true,
+        narrow_quads: true,
+    };
+    let native = super::ComputeWaves::with_wave32(true);
+    let build = |body: &[u32], waves| build_lds_program(body, true, [8, 8, 1], waves);
+    let wave_range = |shader: &HostShader| {
+        let container = crate::Container::parse(&shader.dxil).unwrap();
+        let psv = container.part(crate::FourCC::PSV0).unwrap().data;
+        let word = |i| u32::from_le_bytes(psv[i..i + 4].try_into().unwrap());
+        [word(20), word(24)]
+    };
+    assert_eq!(wave_range(&build(&body, native)), [64, 64]);
+    let shader = build(&body, narrow);
+    assert_eq!(wave_range(&shader), [0, u32::MAX]);
+
+    // An extra LDS mutation after the maximum needs its own synchronization.
+    let mut second_write = body.to_vec();
+    second_write.splice(8..8, body[4..6].iter().copied());
+    assert_eq!(wave_range(&build(&second_write, narrow)), [64, 64]);
+    // A per-lane seed can make colliding writes sensitive to lane order.
+    let mut lane_seed = body;
+    lane_seed[5] = 0x0000_0001; // ds_write_b32 v1, v0
+    assert_eq!(wave_range(&build(&lane_seed, narrow)), [64, 64]);
+
+    // Only the first 24 threads contribute. All 64 must reach both barriers
+    // and read the same maximum after EXEC is restored.
+    let mut masked = body.to_vec();
+    masked.insert(8, 0xbefe_0404); // s_mov_b64 exec, s[4:5]
+    masked.splice(
+        6..6,
+        [
+            0xd4c1_0006,
+            0x0001_3100, // v_cmp_lt_u32 s[6:7], v0, 24
+            0xbe84_2406, // s_and_saveexec_b64 s[4:5], s[6:7]
+        ],
+    );
+    let partial = build(&masked, narrow);
+    assert_eq!(wave_range(&partial), [0, u32::MAX]);
+    #[cfg(windows)]
+    {
+        check_readback(shader, &[63; 64]);
+        check_readback(partial, &[23; 64]);
+    }
 }

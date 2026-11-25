@@ -264,6 +264,8 @@ struct Lower<'a> {
     console_lanes: bool,
     /// Original group dimensions when four consecutive flat ids form one host quad.
     flat_quads: Option<[u32; 3]>,
+    /// The entry block needs a group rendezvous after initialization and after its atomic max.
+    sync_lds_max: bool,
     /// Retry a compute shader with numeric selects only when the normal
     /// translation needs one. Unused selects need no fixed wave size.
     numeric_selects: bool,
@@ -339,6 +341,95 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
+
+/// The store's active lanes must agree on the seed even if addresses alias.
+/// A predicated move defines that constant for lanes under the same guard.
+fn constant_lds_seed(x: &Parts, at: usize, inst: &Inst, data: &[Operand]) -> bool {
+    let [Operand::Vector { reg, .. }] = data else {
+        return false;
+    };
+    let reg = Reg::V(*reg);
+    let Some(seed) = inst.read(reg) else {
+        return false;
+    };
+    let Some((i, src)) = x.p.blocks[0].insts[..at]
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, src)| src.write(reg) == Some(seed))
+    else {
+        return false;
+    };
+    let Fields::Valu(v) = &src.fields else {
+        return false;
+    };
+    let constant = match v.src.as_slice() {
+        [Operand::Const(c)] => crate::resource::inline(*c).is_some(),
+        [Operand::Literal(_)] => true,
+        _ => false,
+    };
+    constant
+        && src.name() == "v_mov_b32"
+        && v.dpp.is_none()
+        && v.sdwa.is_none()
+        && (x.st.guards[0][i].is_none() || x.st.guards[0][i] == x.st.guards[0][at])
+}
+
+/// A single guest wave initializes LDS, reduces it with a returnless atomic
+/// maximum and then consumes the result. Both mutations must be in the entry
+/// block, which every thread visits once. Reads can be control-dependent.
+fn entry_lds_max(x: &Parts) -> bool {
+    let p = x.p;
+    if !p.blocks[0].preds.is_empty() {
+        return false;
+    }
+    let mut initialized = false;
+    let mut reduced = false;
+    let mut stored = false;
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (index, i) in block.insts.iter().enumerate() {
+            let name = i.name();
+            match &i.fields {
+                Fields::Ds {
+                    gds: false, data, ..
+                } => match name {
+                    "ds_write_b32"
+                        if b == 0 && !initialized && constant_lds_seed(x, index, i, data) =>
+                    {
+                        initialized = true
+                    }
+                    "ds_max_u32" if b == 0 && initialized && !reduced => reduced = true,
+                    "ds_read_b32" if reduced => {}
+                    _ => return false,
+                },
+                // Keep other memory dependencies out of this lowering. Inputs
+                // precede the reduction and at most one final store publishes it.
+                Fields::Buffer { lds: true, .. } | Fields::Flat { .. } | Fields::Ds { .. } => {
+                    return false;
+                }
+                // An output descriptor can be fetched after the reduction.
+                Fields::Smem { .. }
+                    if name.starts_with("s_load_dword")
+                        && !stored
+                        && reduced
+                        && x.res.descriptors.iter().any(|d| {
+                            matches!(d.source, Source::Loaded { load, .. } if load == (b, index))
+                                && p.blocks[d.site.0].insts[d.site.1].name() == "image_store"
+                        }) => {}
+                Fields::Image { .. } | Fields::Buffer { .. } | Fields::Smem { .. } => {
+                    if name.contains("store") && !stored && reduced && block.exit == Exit::End {
+                        stored = true;
+                    } else if reduced || name.contains("atomic") || name.contains("store") {
+                        return false;
+                    }
+                }
+                _ if matches!(name, "s_barrier" | "v_readfirstlane_b32") => return false,
+                _ => {}
+            }
+        }
+    }
+    reduced && stored
+}
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
@@ -528,6 +619,7 @@ impl<'a> Lower<'a> {
         });
         let mut console_lanes = false;
         let mut flat_quads = None;
+        let mut sync_lds_max = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -602,13 +694,21 @@ impl<'a> Lower<'a> {
                         && !i.name().starts_with("ds_")
                 })
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+            sync_lds_max = waves.narrow_quads
+                && x.native.wave64
+                && threads == 64
+                && s.lds_dwords > 0
+                && !console_lanes
+                && !numeric_selects
+                && entry_lds_max(x)
+                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
             if quad_samples_only {
                 flat_quads = Some(cs.threads);
                 s.threads = Some([threads, 1, 1]);
                 console_lanes = false;
             } else if one_wave32 {
                 s.wave_size = Some(32);
-            } else if console_lanes || one_wave && s.lds_dwords > 0 {
+            } else if console_lanes || one_wave && s.lds_dwords > 0 && !sync_lds_max {
                 s.wave_size = Some(wave);
             }
         }
@@ -699,6 +799,7 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             flat_quads,
+            sync_lds_max,
             numeric_selects,
             flat: None,
             no_barrier,
@@ -1212,7 +1313,14 @@ impl<'a> Lower<'a> {
             }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
+                let inst = &p.blocks[b].insts[i];
+                let synchronize = self.sync_lds_max
+                    && b == 0
+                    && matches!(inst.name(), "ds_write_b32" | "ds_max_u32");
                 self.inst(b, i)?;
+                if synchronize {
+                    self.sync_shared_memory();
+                }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
@@ -1228,8 +1336,8 @@ impl<'a> Lower<'a> {
         }
         self.fill_phis()?;
         // Lowering can also introduce whole-wave operations for implicit masks.
-        // Keep the native program when a dependency crosses a quad boundary.
-        if self.flat_quads.is_some() && self.s.m.uses_whole_wave() {
+        // Keep the native program when the split group still depends on a whole wave.
+        if (self.flat_quads.is_some() || self.sync_lds_max) && self.s.m.uses_whole_wave() {
             return Err(Stop::NeedsNativeWave);
         }
         self.s.prune_pixel_inputs();
@@ -2625,6 +2733,18 @@ impl<'a> Lower<'a> {
             111,
             &[],
         )
+    }
+
+    fn sync_shared_memory(&mut self) {
+        let mode = self.s.m.i32(9); // thread-group sync and groupshared memory fence
+        self.s.op(
+            self.cur,
+            "barrier",
+            Attr::NoDuplicate,
+            self.s.t.void,
+            80,
+            &[mode],
+        );
     }
 
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
