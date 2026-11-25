@@ -559,6 +559,93 @@ impl Host {
     }
 }
 
+/// A pass-through position from the test draw's vertex buffer.
+#[cfg(test)]
+pub(super) fn position_vs() -> HostShader {
+    use super::lower;
+    use crate::native::{HwStage, NativeProgram, StageIo, Usage, VsInput};
+    use crate::{io, ir, resource, structure};
+
+    // Pass-through VS: POSITION0 (v4..v7) -> SV_Position.
+    let vs_code: Vec<u8> = [
+        0xF800_08CFu32, // exp pos0 v4, v5, v6, v7 done
+        0x0706_0504,
+        0xF800_0200, // exp param0 off, off, off, off
+        0,
+        0xBF81_0000, // s_endpgm
+    ]
+    .iter()
+    .flat_map(|w| w.to_le_bytes())
+    .collect();
+    let vs_native = NativeProgram {
+        stage: HwStage::Vs,
+        wave64: false,
+        vgprs: 8,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io: StageIo::Vs {
+            inputs: vec![VsInput {
+                usage: Usage::Generic,
+                row: 0,
+                vgpr: 4,
+                mask: 0xF,
+            }],
+            outputs: Vec::new(),
+        },
+        code: vs_code,
+    };
+    let vs_in = vec![SigElement {
+        name: "POSITION".into(),
+        index: 0,
+        kind: 0,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0xF,
+        half: false,
+    }];
+    let vs_out = vec![SigElement {
+        name: "SV_Position".into(),
+        index: 0,
+        kind: 3,
+        comp: 9,
+        interp: 4,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0xF,
+        half: false,
+    }];
+    let vp = ir::build(&vs_native.code, false, vs_native.vgprs).expect("vs ir");
+    let vst = structure::structure(&vp).expect("vs structure");
+    let vres = resource::track(&vp, &vs_native.layout, HwStage::Vs, Some(&vst)).expect("vs res");
+    let vio = io::raise(&vp, &vs_native).expect("vs io");
+    let vlow = lower::lower(&lower::Parts {
+        native: &vs_native,
+        p: &vp,
+        st: &vst,
+        io: &vio,
+        res: &vres,
+        inputs: vs_in,
+        outputs: vs_out,
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("vs lower");
+    HostShader {
+        stage: HwStage::Vs,
+        dxil: vlow.dxil,
+        user_data: vlow.user_data,
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+    }
+}
+
 /// A vertex shader that feeds `ps`'s inputs (zeros) and a position.
 pub fn stub_vs(ps: &HostShader) -> Result<HostShader, String> {
     let inputs = sig(&ps.dxil, FourCC::ISG1)?;

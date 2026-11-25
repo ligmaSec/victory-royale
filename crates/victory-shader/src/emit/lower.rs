@@ -45,6 +45,8 @@ pub(crate) struct Lowered {
     /// Whether the program reads the pixel coverage mask.
     #[cfg(test)]
     pub has_coverage_op: bool,
+    #[cfg(test)]
+    pub has_quad_read: bool,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -1228,6 +1230,8 @@ impl<'a> Lower<'a> {
             cbuffer_handles: self.s.cbuffer_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            has_quad_read: self.s.m.has_dx_op("dx.op.quadReadLaneAt.i32", 122),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2706,8 +2710,9 @@ impl<'a> Lower<'a> {
                 || offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4;
             // Mesh: host quads are threads 4n..4n+3 of a 1D group, as the
             // console's, so quad-local swizzles read through quad operations.
-            let mesh_quad = self.s.mesh.is_some() && quad;
-            if !mesh_quad {
+            // Wave reads exclude pixel helper lanes at primitive edges.
+            let use_quad = quad && (self.s.pixel || self.s.mesh.is_some());
+            if !use_quad {
                 self.cross_lane(quad)?;
             }
             // The source sits in the address field.
@@ -2732,7 +2737,7 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            let r = if use_quad {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -4916,10 +4921,10 @@ impl<'a> Lower<'a> {
             return Err("a DPP operand");
         };
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
-        // Quad permutations and DPP8 stay in groups the pixel layout shares.
+        // A quad permutation in a pixel shader can read a helper at a triangle edge.
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
-        let mesh_quad = self.s.mesh.is_some() && quad;
-        if !mesh_quad {
+        let use_quad = quad && (self.s.pixel || self.s.mesh.is_some());
+        if !use_quad {
             self.cross_lane(quad)?;
         }
         let c = self.cur;
@@ -4997,7 +5002,7 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if use_quad {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
@@ -9214,10 +9219,8 @@ mod tests {
 
     /// A pixel shader that exports `v0` as a render-target colour, with
     /// `input_addr` enabling its input VGPRs.
-    fn lower_ps(input_addr: u32) -> Result<Lowered, crate::ShaderError> {
+    fn lower_ps(words: &[u32], input_addr: u32) -> Result<Lowered, crate::ShaderError> {
         use super::super::container::SigElement;
-        // exp mrt0 v0, v0, v0, v0 (done); s_endpgm
-        let words = [0xF800_180Fu32, 0, S_ENDPGM];
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -9236,7 +9239,7 @@ mod tests {
             name: "SV_Target".into(),
             index: 0,
             kind: 16,
-            comp: 5,
+            comp: 9,
             interp: 0,
             row: Some(0),
             col: 0,
@@ -9254,7 +9257,17 @@ mod tests {
             st: &st,
             io: &io,
             res: &res,
-            inputs: vec![],
+            inputs: if input_addr & (1 << 8) != 0 {
+                vec![SigElement {
+                    name: "SV_Position".into(),
+                    kind: 3,
+                    interp: 4,
+                    usage: 1,
+                    ..target.clone()
+                }]
+            } else {
+                vec![]
+            },
             outputs: vec![target],
             prims: vec![],
             mesh_stride: 0,
@@ -9263,13 +9276,80 @@ mod tests {
 
     #[test]
     fn pixel_sample_coverage_input_reads_dx_op_coverage() {
-        let with = lower_ps(1 << 14).unwrap();
+        let words = [0xF800_180F, 0, S_ENDPGM]; // export v0 to target 0
+        let with = lower_ps(&words, 1 << 14).unwrap();
         assert!(
             with.has_coverage_op,
             "SampleCoverage must lower to dx.op.coverage.i32 (opcode 91)"
         );
-        let without = lower_ps(0).unwrap();
+        let without = lower_ps(&words, 0).unwrap();
         assert!(!without.has_coverage_op);
+    }
+
+    #[test]
+    fn pixel_quad_permutations_read_helper_lanes() {
+        for shuffle in [
+            [0x7E00_02FA, 0xFF08_B100], // v_mov_b32 v0, v0 quad_perm:[1,0,3,2]
+            [0xD8D4_80B1, 0],           // ds_swizzle_b32 v0, v0, same permutation
+            [0xD8D4_041F, 0],           // ds_swizzle_b32 v0, v0, xor lane with 1
+        ] {
+            let pixel = [shuffle[0], shuffle[1], 0xF800_180F, 0, S_ENDPGM];
+            let ps = lower_ps(&pixel, 1 << 14).unwrap();
+            assert!(ps.has_quad_read, "{shuffle:x?}");
+            #[cfg(windows)]
+            if let Some(mut validator) = crate::emit::validator::Validator::for_test() {
+                let mut dxil = ps.dxil;
+                validator.validate(&mut dxil).unwrap();
+            }
+            let cs = lower_words(&[shuffle[0], shuffle[1], S_ENDPGM], 0).unwrap();
+            assert!(!cs.has_quad_read, "compute uses its console wave layout");
+        }
+    }
+
+    /// The left pixel reads the right pixel's x coordinate even when the
+    /// triangle covers only the left pixel. A full triangle checks both lanes.
+    #[test]
+    #[cfg(windows)]
+    fn a_pixel_quad_reads_position_across_a_triangle_edge() {
+        use crate::emit::{HostShader, host};
+
+        let vs = host::position_vs();
+        // Swap neighbours horizontally and export their SV_Position.x.
+        let pixel = [0x7E00_02FA, 0xFF08_B100, 0xF800_180F, 0, S_ENDPGM];
+        let ps = HostShader {
+            stage: HwStage::Ps,
+            dxil: lower_ps(&pixel, 1 << 8).unwrap().dxil,
+            ..host::stub_ps()
+        };
+        for warp in [false, true] {
+            let adapter = match host::Host::new(warp) {
+                Ok(adapter) => adapter,
+                Err(reason) => {
+                    eprintln!("quad readback skipped (warp={warp}): {reason}");
+                    continue;
+                }
+            };
+            let (root, pso) = adapter.pipeline(&vs, &ps).unwrap();
+            for (right, bottom, full) in [(3.0, -3.0, true), (0.5, -0.5, false)] {
+                let vertices = [
+                    -1.0, 1.0, 0.5, 1.0, right, 1.0, 0.5, 1.0, -1.0, bottom, 0.5, 1.0,
+                ];
+                let draw = host::Draw {
+                    vertices: &vertices,
+                    stride: 16,
+                    size: (2, 2),
+                    roots: vec![],
+                    textures: &[],
+                    samplers: &[],
+                    mesh_groups: 0,
+                };
+                let pixels = adapter.draw(&root, &pso, &draw).unwrap();
+                assert_eq!(pixels[0][0], 1.5, "warp={warp} full={full}");
+                if full {
+                    assert_eq!(pixels[1][0], 0.5);
+                }
+            }
+        }
     }
 
     #[test]
