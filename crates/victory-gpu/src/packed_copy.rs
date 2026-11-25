@@ -263,6 +263,36 @@ pub(crate) fn record(
     let Some((src, dst, mode)) = descriptions(to, from, logical) else {
         return false;
     };
+    copy_matching(list, to, from, (src, dst, mode), prepare)
+}
+
+/// A differently typed 16-bit view placed over a packed render target sees
+/// the guest's packed bits. Its copy footprint uses the view's physical format.
+pub(crate) fn record_alias(
+    list: &HostList,
+    to: &ID3D12Resource,
+    from: &ID3D12Resource,
+    logical: u32,
+) -> bool {
+    // SAFETY: both resources are retained by the command list.
+    let (src, dst) = unsafe { (from.GetDesc(), to.GetDesc()) };
+    if src.Format.0 as u32 != crate::resource::RGBA8_UNORM
+        || crate::resource::element(dst.Format.0 as u32) != Some((2, 1))
+        || src.SampleDesc.Count != 1
+        || dst.SampleDesc.Count != 1
+    {
+        return false;
+    }
+    copy_matching(list, to, from, (src, dst, logical), || {})
+}
+
+fn copy_matching(
+    list: &HostList,
+    to: &ID3D12Resource,
+    from: &ID3D12Resource,
+    (src, dst, mode): (D3D12_RESOURCE_DESC, D3D12_RESOURCE_DESC, u32),
+    prepare: impl FnOnce(),
+) -> bool {
     if src.Dimension != dst.Dimension
         || src.Width != dst.Width
         || src.Height != dst.Height

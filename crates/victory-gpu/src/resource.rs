@@ -1831,11 +1831,12 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         && o.desc.mip_levels == r.desc.mip_levels
         && o.desc.depth_or_array_size == r.desc.depth_or_array_size
         && o.desc.flags & DEPTH == 0
-        && target_format(
-            o.desc.format,
-            o.desc.flags,
-            (o.desc.sample_count, o.desc.sample_quality),
-        ) == o.desc.format
+        && (PACKED_16.contains(&o.desc.format)
+            || target_format(
+                o.desc.format,
+                o.desc.flags,
+                (o.desc.sample_count, o.desc.sample_quality),
+            ) == o.desc.format)
         && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
     same.then_some(other)
 }
@@ -2594,11 +2595,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn srgb_and_linear_views_of_one_texture_read_their_own_curve() {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
         use windows::Win32::Graphics::Direct3D12::*;
         use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
-        use windows::core::s;
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -2616,30 +2614,8 @@ void main() {
     reads.Store3(0, asuint(r));
 }
 "#;
-        let mut blob: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; the out
-        // pointer is ours.
-        unsafe {
-            D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
-                s!("views"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut blob,
-                None,
-            )
-            .unwrap()
-        };
-        let blob = blob.unwrap();
-        // SAFETY: the blob's own bytes.
-        let code = unsafe {
-            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
-        };
+        let bytes = crate::hlsl::compile_compute("sRGB and linear views", SOURCE).unwrap();
+        let code = bytes.as_slice();
         // SAFETY: plain object creation; the root signature is inside the
         // shader.
         let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
@@ -3712,6 +3688,47 @@ void main() {
             assert_eq!(got, expected_host_format, "flags {flags}");
             assert_eq!(view_format(out), None, "flags {flags}");
             assert_eq!(slot::<Release>(out, 0x10)(out), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packed_target_bits_are_visible_through_placed_r16_views() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let mut cmd = packed_test::GuestCmd::new();
+        for (format, bits) in [(86, 0x7c1fu16), (115, 0x0f0f)] {
+            for flags in [1, 5] {
+                let target = cmd.make_texture(3, 2, format, flags, 1, 1, 1);
+                let mut words = [0u32; 14];
+                words[0] = 3; // 2D
+                words[4] = 3;
+                words[6] = 2;
+                words[7] = 1 | (1 << 16);
+                words[8] = 57; // R16_UINT
+                words[9] = 1;
+                let placed = texture_at(resource(target).data() as u64, &words).unwrap();
+                assert_eq!(alias_of(placed), Some(target));
+                cmd.clear_rtv(target, None, &[1.0, 0.0, 1.0, 0.0], &[]);
+                cmd.execute();
+                cmd.reset();
+                let list = host.new_list().unwrap();
+                let mut dispatched = false;
+                assert!(crate::texture::alias(&list, placed, target, || {
+                    dispatched = true
+                }));
+                assert_eq!(dispatched, widened_packed_format(target).is_some());
+                assert!(crate::texture::alias(&list, placed, target, || panic!(
+                    "cached alias dispatched"
+                )));
+                list.close();
+                host.execute(&[&list]);
+                let bytes = packed_test::readback_subresource(host, placed, 0, 57, 3, 2, 256);
+                for start in [0, 256] {
+                    assert_eq!(&bytes[start..start + 6], bits.to_le_bytes().repeat(3));
+                }
+            }
         }
     }
 

@@ -122,7 +122,12 @@ static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
 /// it, or read it itself). Leaves `placed` in the copy destination state,
 /// as [`upload`] does. False if the copy cannot be made: the caller fills
 /// the texture from title memory, as before.
-pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
+pub(crate) fn alias(
+    list: &HostList,
+    placed: This,
+    source: This,
+    on_dispatch: impl FnOnce(),
+) -> bool {
     const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
@@ -132,12 +137,76 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     ) else {
         return false;
     };
-    let Some(host) = host() else { return false };
-    let through = {
+    let packed = crate::resource::widened_packed_format(source);
+    let through = if packed.is_none() {
+        let Some(buffer) = alias_buffer(placed, source, to, from) else {
+            return false;
+        };
+        Some(buffer)
+    } else {
+        None
+    };
+    let first = !list.covers_texture(placed as usize, 0);
+    // The source's first use in the list records nothing (its prelude
+    // brings it to the state); a use in another way since the last copy
+    // shows as a change of state.
+    let before = list
+        .transition(source, COPY_SOURCE)
+        .map(|(texture, before)| {
+            let state = crate::host::legal_state(texture, COPY_SOURCE);
+            let barrier = crate::host::transition(
+                texture,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(state as i32),
+            );
+            // SAFETY: an open list and a live texture.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            before
+        });
+    if !first && before.is_none() {
+        return true;
+    }
+    crate::list::ensure_state(list, placed, COPY_DEST);
+    let copied = if let Some(through) = through {
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
+        copy_alias_bits(list, to, from, &through);
+        true
+    } else if let Some(format) = packed {
+        let converted = crate::packed_copy::record_alias(list, to, from, format);
+        if converted {
+            on_dispatch();
+        }
+        converted
+    } else {
+        false
+    };
+    if copied {
+        list.use_texture(placed as usize, 0);
+    }
+    // A draw that also writes the source (a view of it handled before
+    // this one) needs it in that state again; the next read of the alias
+    // then copies once more, as it must after a write.
+    if let Some(before) = before
+        && before & TARGET_OR_UNORDERED != 0
+    {
+        crate::list::ensure_state(list, source, before);
+    }
+    copied
+}
+
+fn alias_buffer(
+    placed: This,
+    source: This,
+    to: &ID3D12Resource,
+    from: &ID3D12Resource,
+) -> Option<Arc<Through>> {
+    let host = host()?;
+    {
         let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
         let map = map.get_or_insert_with(HashMap::new);
         match map.get(&(placed as usize)) {
-            Some(through) => through.clone(),
+            Some(through) => Some(through.clone()),
             None => {
                 // SAFETY: live textures.
                 let (of_from, of_to) = unsafe { (from.GetDesc(), to.GetDesc()) };
@@ -152,7 +221,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 };
                 let parts = count(&of_from);
                 if parts == 0 || parts > ALIAS_PARTS || parts != count(&of_to) {
-                    return false;
+                    return None;
                 }
                 let mut rows = [(); 2]
                     .map(|()| vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); parts as usize]);
@@ -188,11 +257,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                             == (fb.Width, fb.Height, fb.Depth, fb.RowPitch)
                 });
                 if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
-                    return false;
+                    return None;
                 }
-                let Some(buffer) = host.default_buffer(bytes[0]) else {
-                    return false;
-                };
+                let buffer = host.default_buffer(bytes[0])?;
                 crate::host::name(&buffer, || {
                     format!(
                         "alias copy {}x{} f{} to f{}",
@@ -215,31 +282,13 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                     parts: of_written.into_iter().zip(of_read).collect(),
                 });
                 map.insert(placed as usize, through.clone());
-                through
+                Some(through)
             }
         }
-    };
-    let first = list.use_texture(placed as usize, 0);
-    // The source's first use in the list records nothing (its prelude
-    // brings it to the state); a use in another way since the last copy
-    // shows as a change of state.
-    let before = list
-        .transition(source, COPY_SOURCE)
-        .map(|(texture, before)| {
-            let state = crate::host::legal_state(texture, COPY_SOURCE);
-            let barrier = crate::host::transition(
-                texture,
-                D3D12_RESOURCE_STATES(before as i32),
-                D3D12_RESOURCE_STATES(state as i32),
-            );
-            // SAFETY: an open list and a live texture.
-            unsafe { list.list.ResourceBarrier(&[barrier]) };
-            before
-        });
-    if !first && before.is_none() {
-        return true;
     }
-    crate::list::ensure_state(list, placed, COPY_DEST);
+}
+
+fn copy_alias_bits(list: &HostList, to: &ID3D12Resource, from: &ID3D12Resource, through: &Through) {
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the location never releases.
         pResource: unsafe { std::mem::transmute_copy(texture) },
@@ -261,8 +310,6 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         D3D12_RESOURCE_STATE_COPY_SOURCE,
         D3D12_RESOURCE_STATE_COPY_DEST,
     );
-    #[cfg(feature = "diagnostics")]
-    list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
     // SAFETY: an open list and live resources; the buffer is as big as
     // the footprints and rests in the common state between copies.
     unsafe {
@@ -282,15 +329,6 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
     }
     list.keep(&through.buffer);
-    // A draw that also writes the source (a view of it handled before
-    // this one) needs it in that state again; the next read of the alias
-    // then copies once more, as it must after a write.
-    if let Some(before) = before
-        && before & TARGET_OR_UNORDERED != 0
-    {
-        crate::list::ensure_state(list, source, before);
-    }
-    true
 }
 
 /// The title released a resource.
@@ -1310,7 +1348,9 @@ void read(uint3 id : SV_DispatchThreadID) {
             l.Dispatch(1, 1, 1);
         }
         // What a draw does for a view it samples.
-        let aliased = crate::texture::alias(&list, placed, written);
+        let aliased = crate::texture::alias(&list, placed, written, || {
+            panic!("same-width copy issued a compute dispatch")
+        });
         assert!(aliased, "the written texture is copied into the view's");
         crate::list::ensure_state(&list, placed, SHADER_RESOURCE);
         // SAFETY: as above; the view's texture is now readable.

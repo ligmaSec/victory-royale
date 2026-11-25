@@ -763,29 +763,6 @@ impl State {
                 crate::descriptor::heap(key as This).sync_direct_copies(true);
             }
         }
-        let root = p.root.as_raw() as usize;
-        if self.host_roots[usize::from(compute)] != root {
-            // SAFETY: an open list and a live root signature.
-            unsafe {
-                if compute {
-                    l.SetComputeRootSignature(&p.root);
-                } else {
-                    l.SetGraphicsRootSignature(&p.root);
-                }
-            }
-            self.host_roots[usize::from(compute)] = root;
-        }
-        // By host object: a title pipeline released and another made at its
-        // address is another host pipeline (the list keeps the old one).
-        if self.host_pipeline != p.pso.as_raw() as usize {
-            // SAFETY: an open list and a live pipeline.
-            unsafe { l.SetPipelineState(&p.pso) };
-            self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
-            // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
-        }
         let pixel_hash = (!compute)
             .then(|| {
                 p.stages
@@ -821,6 +798,10 @@ impl State {
                 }
                 return false;
             }
+            // Preparing a placed packed view can dispatch a conversion. Bind the
+            // title PSO afterwards. Compute pipelines have a single shader stage,
+            // and a compute conversion leaves graphics root arguments intact.
+            self.bind_shader_objects(list, p, compute);
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
@@ -904,6 +885,44 @@ impl State {
             }
         }
         true
+    }
+
+    fn bind_shader_objects(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+        let l = &list.list;
+        let root = p.root.as_raw() as usize;
+        if self.host_roots[usize::from(compute)] != root {
+            // SAFETY: an open list and a live root signature.
+            unsafe {
+                if compute {
+                    l.SetComputeRootSignature(&p.root);
+                } else {
+                    l.SetGraphicsRootSignature(&p.root);
+                }
+            }
+            self.host_roots[usize::from(compute)] = root;
+        }
+        // By host object: a title pipeline released and another made at its
+        // address is another host pipeline (the list keeps the old one).
+        if self.host_pipeline != p.pso.as_raw() as usize {
+            // SAFETY: an open list and a live pipeline.
+            unsafe { l.SetPipelineState(&p.pso) };
+            self.host_pipeline = p.pso.as_raw() as usize;
+            list.used_pipeline(&p.name);
+            // The title may release the pipeline before it submits the list.
+            list.keep(&p.pso);
+            list.keep(&p.root);
+        }
+    }
+
+    fn prepare_view(
+        &mut self,
+        list: &HostList,
+        u: &UsedResource,
+        view: &View,
+        depth: Option<usize>,
+    ) {
+        let samples_depth = readable(list, u, view, depth, || self.invalidate_compute_binding());
+        self.depth_sampled |= samples_depth;
     }
 
     /// The host heap must precede the root signature, including when switching
@@ -1443,7 +1462,7 @@ impl State {
         if let Some(view) = host.mirror(index, handle, true)
             && !host.refresh_slot(index, list)
         {
-            self.depth_sampled |= readable(list, u, &view, self.read_only_depth(compute));
+            self.prepare_view(list, u, &view, self.read_only_depth(compute));
         }
     }
 
@@ -1678,7 +1697,7 @@ impl State {
                         if !host.refresh_slot(dyn_index, list) {
                             let handle = table + u64::from(u.table_offset_dwords) * 4;
                             if let Some(view) = crate::descriptor::view(handle) {
-                                self.depth_sampled |= readable(list, u, &view, read_only_depth);
+                                self.prepare_view(list, u, &view, read_only_depth);
                             }
                         }
                     }
@@ -1781,7 +1800,7 @@ impl State {
                             .iter()
                             .filter(|u| u.table_offset_dwords / step_dwords == k)
                         {
-                            self.depth_sampled |= readable(list, u, &view, read_only_depth);
+                            self.prepare_view(list, u, &view, read_only_depth);
                         }
                     }
                 }
@@ -2329,6 +2348,7 @@ fn readable(
     u: &UsedResource,
     view: &View,
     read_only_depth: Option<usize>,
+    on_dispatch: impl FnOnce(),
 ) -> bool {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -2361,8 +2381,9 @@ fn readable(
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
-            let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            let aliased = crate::resource::alias_of(*resource as This).is_some_and(|source| {
+                crate::texture::alias(list, *resource as This, source, on_dispatch)
+            });
             if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
