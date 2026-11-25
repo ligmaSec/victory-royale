@@ -192,8 +192,67 @@ launch_binary=$binary
 if [[ -n $stage ]]; then launch_binary=$stage/victory.exe; fi
 windows_title=${title//\//\\}
 windows_binary=${launch_binary//\//\\}
-export STEAM_COMPAT_INSTALL_PATH=${STEAM_COMPAT_INSTALL_PATH:-$(dirname -- "$binary")}
-command=(umu-run "Z:$windows_binary" run "Z:$windows_title" "$@")
+caller_install=${STEAM_COMPAT_INSTALL_PATH:-}
+export STEAM_COMPAT_INSTALL_PATH=${caller_install:-$(dirname -- "$binary")}
+
+# Prepare the default compat symlink. Failure means this library cannot host
+# it: only an Experimental runtime we discovered ourselves may skip it.
+prepare_compat_link() {
+    local install=$1 target=$2
+    mkdir -p -- "${install%/*}" || return 1
+    if [[ -e $install && ! -L $install ]]; then
+        echo "Steam compat install path already exists and is not a symlink: $install" >&2
+        return 1
+    fi
+    if [[ -L $install && $(readlink -- "$install") != "$target" ]] ||
+        [[ ! -e $install && ! -L $install ]]; then
+        ln -sfn -- "$target" "$install" || return 1
+    fi
+}
+
+# Proton Experimental does not accept the Z: paths that UMU-Proton uses.
+# Give it Unix paths and a compat install path under its Steam library.
+proton_path=${PROTONPATH:-}
+auto_experimental=0
+library=
+if [[ -z $proton_path ]]; then
+    for root in "$data_home/Steam" "$HOME/.steam/steam" "$HOME/.local/share/Steam"; do
+        if [[ -d $root/steamapps/common/Proton\ -\ Experimental ]]; then
+            proton_path=$root/steamapps/common/Proton\ -\ Experimental
+            library=$root/steamapps
+            export PROTONPATH=$proton_path
+            auto_experimental=1
+            break
+        fi
+    done
+fi
+if [[ -z $library && -n $proton_path && -f $proton_path/version ]] &&
+    grep -q 'experimental-' "$proton_path/version"; then
+    # shortcut: only a Steam layout gives us a library to put the compat path in.
+    case $proton_path in
+        */steamapps/common/*) library=${proton_path%/common/*} ;;
+    esac
+fi
+if [[ -n $library && -z $caller_install ]]; then
+    # A caller-supplied install path owns this decision: the default symlink is
+    # none of our business, so do not create, check, or repoint it.
+    install=$library/common/victory-run
+    if prepare_compat_link "$install" "$(dirname -- "$binary")"; then
+        export STEAM_COMPAT_INSTALL_PATH=$install
+    else
+        if (( ! auto_experimental )); then exit 1; fi
+        echo "warning: could not set up Steam compat install path at $install; continuing with Proton Experimental without the default compat symlink" >&2
+        # UMU chooses its own compat install path when none is supplied. Keep
+        # PROTONPATH on the detected Experimental: no Wine or Proton downgrade.
+        unset STEAM_COMPAT_INSTALL_PATH
+    fi
+fi
+if [[ -n $library ]]; then
+    export STEAM_COMPAT_LIBRARY_PATHS=${STEAM_COMPAT_LIBRARY_PATHS:-$library}
+    command=(umu-run "$launch_binary" run "$title" "$@")
+else
+    command=(umu-run "Z:$windows_binary" run "Z:$windows_title" "$@")
+fi
 if [[ $mode != --report ]]; then
     if [[ -z $stage ]]; then exec "${command[@]}"; fi
     "${command[@]}"

@@ -52,6 +52,22 @@ prefix is `${XDG_DATA_HOME:-$HOME/.local/share}/victory/proton`, and the
 default `GAMEID` is `umu-victory`. Set `WINEPREFIX`, `GAMEID` or `PROTONPATH`
 to override them. Use Windows paths in `victory.toml`.
 
+The launcher looks for Steam's `Proton - Experimental` in
+`$XDG_DATA_HOME/Steam`, `$HOME/.steam/steam` and `$HOME/.local/share/Steam`,
+and also recognises an explicit `PROTONPATH` whose `version` file contains
+`experimental-` when it sits in a `steamapps/common` layout. That runtime does
+not accept `Z:` paths, so the launcher gives UMU Unix paths and sets
+`STEAM_COMPAT_INSTALL_PATH` to a symlink under the Steam library, with
+`STEAM_COMPAT_LIBRARY_PATHS` pointing at that library. A caller-supplied
+`STEAM_COMPAT_INSTALL_PATH` is used as-is: the default symlink is neither
+created nor checked in that case. When the launcher discovers Experimental on
+its own and cannot set up that symlink (for example a read-only Steam library),
+it warns, leaves `STEAM_COMPAT_INSTALL_PATH` for UMU to choose, and still runs
+that Experimental runtime through `umu-run` with Unix paths. An explicitly set
+`PROTONPATH` instead reports the failure. This is the configuration used to
+reach the first world frame on Linux. Other layouts keep the `Z:` path
+behaviour; a non-experimental `PROTONPATH` also keeps it.
+
 The launcher creates shader-cache directories at
 `${XDG_CACHE_HOME:-$HOME/.cache}/victory/vkd3d` and
 `${XDG_CACHE_HOME:-$HOME/.cache}/victory/dxvk`, keeping generated caches out
