@@ -13,12 +13,12 @@ You can also extract the ZIP and run from the extracted folder:
   Linux/Proton:  python3 run-test.py
   Windows:       py run-test.py
 
-The runner shows the scenario and two GitHub CI builds. Select your game
-executable when prompted. Both runs use Series X and separate, fresh
-translation caches. Follow the on-screen scenario for each run. At the end,
-the terminal prints one Upload path. This fresh report.zip stays in your user
-state directory (LocalAppData on Windows). Share it privately with the
-person who requested the test. Full game logs can contain private information.
+Select your game executable when prompted. Both runs use Series X and fresh
+translation caches. Follow the WHAT TO DO instructions shown before each
+launch. After the second run, send the ZIP at the printed Upload path
+privately to the requester. The ZIP stays in a new folder under your
+system's temporary directory after the runner exits. Send it before that
+directory is cleaned.
 
 To see the plan without starting, add --plan. To supply the game directly
 instead of choosing a file, add --title "path to your game.exe". To use a
