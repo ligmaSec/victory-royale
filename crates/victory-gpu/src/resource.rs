@@ -362,6 +362,15 @@ pub(crate) struct PlacedFootprint {
     pub(crate) row_pitch: u32,
 }
 
+/// Rows of a placed footprint written by one texture copy, in storage blocks.
+pub(crate) struct CopyRows {
+    pub first_line: u64,
+    pub byte_in_row: u64,
+    pub slice_lines: u64,
+    pub lines: u64,
+    pub row_bytes: u64,
+}
+
 impl PlacedFootprint {
     /// `(lines, row_bytes, total_bytes)` spanned in a buffer: every row
     /// pitched but the last.
@@ -380,6 +389,30 @@ impl PlacedFootprint {
             .checked_mul(lines - 1)?
             .checked_add(row_bytes)?;
         Some((lines, row_bytes, total))
+    }
+
+    /// Locate the copied texels within their destination rows and depth slices.
+    pub(crate) fn copy_rows(&self, [x, y, z]: [u32; 3], extent: [u32; 3]) -> Option<CopyRows> {
+        let [width, height, depth] = extent;
+        let (bytes, bw, bh) = texture_element(self.format)?;
+        let (x, y) = (u64::from(x), u64::from(y));
+        if extent.contains(&0)
+            || !x.is_multiple_of(bw)
+            || !y.is_multiple_of(bh)
+            || x / bw + u64::from(width).div_ceil(bw) > u64::from(self.width).div_ceil(bw)
+            || y / bh + u64::from(height).div_ceil(bh) > u64::from(self.height).div_ceil(bh)
+            || z.checked_add(depth)? > self.depth
+        {
+            return None;
+        }
+        let slice_lines = u64::from(self.height).div_ceil(bh);
+        Some(CopyRows {
+            first_line: u64::from(z) * slice_lines + y / bh,
+            byte_in_row: x / bw * bytes,
+            slice_lines,
+            lines: u64::from(height).div_ceil(bh),
+            row_bytes: u64::from(width).div_ceil(bw) * bytes,
+        })
     }
 
     /// The bytes it spans in a buffer: every row pitched but the last.
@@ -2020,6 +2053,32 @@ mod tests {
     }
 
     #[test]
+    fn readback_rows_use_block_and_slice_offsets() {
+        let footprint = PlacedFootprint {
+            offset: 0,
+            format: 71,
+            width: 12,
+            height: 12,
+            depth: 4,
+            row_pitch: 32,
+        };
+        let r = footprint.copy_rows([4, 4, 1], [8, 8, 2]).unwrap();
+        assert_eq!(
+            (
+                r.first_line,
+                r.byte_in_row,
+                r.slice_lines,
+                r.lines,
+                r.row_bytes
+            ),
+            (4, 8, 3, 2, 16)
+        );
+        for origin in [[2, 4, 1], [4, 2, 1], [8, 4, 1], [4, 4, 3]] {
+            assert!(footprint.copy_rows(origin, [8, 8, 2]).is_none());
+        }
+    }
+
+    #[test]
     fn upload_footprints_follow_the_pc_rules() {
         let null = std::ptr::null();
         let mut layouts = [NO_FOOTPRINT; 2];
@@ -2720,7 +2779,7 @@ void main() {
                 null,
                 &PROPERTIES,
                 0,
-                &buffer(1024),
+                &buffer(2048),
                 0,
                 null.cast(),
                 iid,
@@ -2845,7 +2904,11 @@ void main() {
         };
         copy(list, &packed_loc, 0, 0, 0, &tex_loc, std::ptr::null());
 
-        // 4) Texture -> Buffer sub-box readback: 2x2 crop from (1, 1) to (3, 3).
+        // 4) Copy a 2x2 crop into a larger pitched footprint. Every byte
+        // outside the destination rectangle belongs to the caller.
+        let (cr_ptr, _) = buffer_bytes(dst_crop).unwrap();
+        // SAFETY: dst_crop holds 2048 writable bytes and has not been submitted.
+        unsafe { cr_ptr.write_bytes(0xa5, 2048) };
         let crop_box = [1u32, 1, 0, 3, 3, 1];
         let crop_loc = Location {
             resource: dst_crop,
@@ -2853,13 +2916,27 @@ void main() {
             footprint: PlacedFootprint {
                 offset: 0,
                 format: 28,
-                width: 2,
-                height: 2,
+                width: 4,
+                height: 4,
                 depth: 1,
                 row_pitch: 256,
             },
         };
-        copy(list, &crop_loc, 0, 0, 0, &tex_loc, &crop_box);
+        copy(list, &crop_loc, 1, 2, 0, &tex_loc, &crop_box);
+
+        // A null box copies the whole 4x4 source into this larger footprint.
+        let whole_loc = Location {
+            resource: dst_crop,
+            kind: 1,
+            footprint: PlacedFootprint {
+                offset: 1024,
+                width: 6,
+                height: 5,
+                row_pitch: 32,
+                ..full_rows
+            },
+        };
+        copy(list, &whole_loc, 1, 1, 0, &tex_loc, std::ptr::null());
 
         // 5) Console formats 118..=120 (3 B/texel) map to 4-byte PC formats
         // (45..=47): skipped cleanly without breaking Close() or touching dst.
@@ -2931,19 +3008,24 @@ void main() {
             );
         }
 
-        // Verify 2x2 sub-box crop from (1, 1)..(3, 3).
-        let (cr_ptr, _) = buffer_bytes(dst_crop).unwrap();
-        // SAFETY: dst_crop holds 1024 bytes.
-        let cr = unsafe { std::slice::from_raw_parts(cr_ptr, 1024) };
+        // The two copied rows start at (1, 2), including row padding in
+        // the comparison so a whole-footprint write cannot pass.
+        let mut expected = vec![0xa5; 2048];
         for row in 0..2 {
-            let src_at = (row + 1) * 256 + 4; // x=1, y=row+1
-            let dst_at = row * 256;
-            assert_eq!(
-                cr[dst_at..dst_at + 8],
-                up[src_at..src_at + 8],
-                "crop row {row}"
-            );
+            let src_at = (row + 1) * 256 + 4;
+            let dst_at = (row + 2) * 256 + 4;
+            expected[dst_at..dst_at + 8].copy_from_slice(&up[src_at..src_at + 8]);
         }
+        for row in 0..4 {
+            let dst_at = 1024 + (row + 1) * 32 + 4;
+            expected[dst_at..dst_at + 16].copy_from_slice(&up[row * 256..row * 256 + 16]);
+        }
+        // SAFETY: dst_crop holds 2048 bytes and GPU execution has completed.
+        let cr = unsafe { std::slice::from_raw_parts(cr_ptr, 2048) };
+        assert_eq!(
+            cr, expected,
+            "pixels and padding outside the crop must survive"
+        );
 
         // Verify skipped 118..=120 readback left its buffer untouched.
         let (d16_ptr, _) = buffer_bytes(dst_d16s8).unwrap();
