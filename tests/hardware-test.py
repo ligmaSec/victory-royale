@@ -25,12 +25,18 @@ def load(name):
     return module
 
 
+sys.path.insert(0, str(SCRIPTS))
 runner = load("run-test")
 prepare = load("prepare")
 
 
 class HardwareRequest(unittest.TestCase):
     def setUp(self):
+        # Launch tests capture their output and must never prompt the person running the suite.
+        # Interactive cases supply their own input or create a real pseudoterminal.
+        stdin = mock.patch.object(sys, "stdin", io.StringIO())
+        stdin.start()
+        self.addCleanup(stdin.stop)
         work = tempfile.TemporaryDirectory()
         self.addCleanup(work.cleanup)
         self.root = Path(work.name).resolve()
@@ -314,34 +320,182 @@ class HardwareRequest(unittest.TestCase):
             self.assertIn("shader refusal: 1", body)
             self.assertNotIn("custom", body)
 
+    def outgoing_zip(self, summary):
+        path = self.root / "filtered.zip"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("summary.txt", summary)
+            archive.writestr("main-events.csv", "private event row")
+        return path
+
     def test_public_post_requires_preview_and_uses_only_summary(self):
+        filtered = self.outgoing_zip("Previewed result")
         for tty, answers, posted in ((False, [], False), (True, [""], False),
-                                     (True, ["p", ""], False), (True, ["p", "y"], True)):
+                                     (True, ["p", "", ""], False), (True, ["p", "y"], True)):
             output = io.StringIO()
             with mock.patch.object(sys.stdin, "isatty", return_value=tty), \
                     mock.patch("builtins.input", side_effect=answers), \
                     mock.patch.object(subprocess, "check_output", return_value="test-account"), \
                     mock.patch.object(subprocess, "run") as send, contextlib.redirect_stdout(output):
-                runner.share_result(7, "Previewed result", self.root / "filtered.zip")
-            self.assertIn("Previewed result", output.getvalue())
+                runner.share_result(7, filtered, self.root)
+            if not tty or posted:
+                self.assertIn("Previewed result", output.getvalue())
             self.assertEqual(send.called, posted)
             if posted:
-                self.assertEqual(send.call_args.kwargs["input"], "Previewed result")
+                self.assertEqual(send.call_args.kwargs["input"], b"Previewed result")
                 self.assertIn("github.com/" + runner.REPO, send.call_args.args[0])
 
     def test_private_sharing_requires_a_pinned_key_login_and_explicit_choice(self):
-        safe = self.root / "filtered.zip"
+        safe = self.outgoing_zip("Preview")
         for key, login, choice, sent in ((None, True, "i", False), ("configured", False, "i", False),
                                          ("configured", True, "", False), ("configured", True, "i", True)):
             with mock.patch.object(sys.stdin, "isatty", return_value=True), mock.patch.object(runner, "REPORT_RECIPIENT", key), \
                     mock.patch.object(subprocess, "check_output", side_effect=None if login else FileNotFoundError,
-                                      return_value="fixture-account"), mock.patch("builtins.input", return_value=choice), \
+                                      return_value="fixture-account"), mock.patch("builtins.input", side_effect=[choice, "y", ""]), \
                     mock.patch.object(runner, "send_encrypted_report") as send, contextlib.redirect_stdout(io.StringIO()) as output:
-                runner.share_result(7, "Preview", safe)
+                runner.share_result(7, safe, self.root)
             self.assertEqual(send.called, sent)
             if sent:
                 send.assert_called_once_with(safe, key)
                 self.assertIn("fixture-account", output.getvalue())
+
+    def test_review_applies_exact_edits_and_ignores_unrelated_files(self):
+        filtered = self.outgoing_zip("original")
+        raw = self.root / "report.zip"
+        raw.write_bytes(b"raw canary")
+        def edit(prompt):
+            files, = filtered.parent.glob("victory-review-*/files")
+            self.assertEqual(sorted(x.name for x in files.iterdir()), ["main-events.csv", "summary.txt"])
+            (files / "main-events.csv").unlink()
+            (files / "summary.txt").write_bytes("Reviewed ☀".encode())
+            (files / "editor-backup~").write_bytes(b"private")
+            return "a"
+        for destination in ("i", "p"):
+            self.outgoing_zip("original")
+            choices = iter(["r", None, destination, "y"])
+            def choose(prompt):
+                return next(choices) or edit(prompt)
+            with mock.patch.object(sys.stdin, "isatty", return_value=True), \
+                    mock.patch("builtins.input", side_effect=choose), \
+                    mock.patch.object(subprocess, "check_output", return_value="account"), \
+                    mock.patch.object(subprocess, "run") as post, \
+                    mock.patch.object(runner, "send_encrypted_report") as send, contextlib.redirect_stdout(io.StringIO()):
+                runner.share_result(7, filtered, self.root)
+            if destination == "i":
+                send.assert_called_once_with(filtered, runner.REPORT_RECIPIENT)
+                post.assert_not_called()
+            else:
+                self.assertEqual(post.call_args.kwargs["input"], "Reviewed ☀".encode())
+                send.assert_not_called()
+            with zipfile.ZipFile(filtered) as archive:
+                self.assertEqual(archive.namelist(), ["summary.txt"])
+                self.assertEqual(archive.read("summary.txt"), "Reviewed ☀".encode())
+            self.assertEqual(raw.read_bytes(), b"raw canary")
+
+    def test_cancel_or_invalid_review_preserves_original_zip(self):
+        filtered = self.outgoing_zip("original")
+        original = filtered.read_bytes()
+        for apply in ("", "a"):
+            def edit(prompt):
+                files, = filtered.parent.glob("victory-review-*/files")
+                (files / "summary.txt").write_bytes(b"unsafe\x1b")
+                return apply
+            with mock.patch("builtins.input", side_effect=edit), contextlib.redirect_stdout(io.StringIO()):
+                if apply:
+                    with self.assertRaisesRegex(ValueError, "control characters"):
+                        runner.review_result(filtered, self.root)
+                else:
+                    runner.review_result(filtered, self.root)
+            self.assertEqual(filtered.read_bytes(), original)
+            self.assertFalse(list(filtered.parent.glob("victory-review-*")))
+
+    def test_excluding_public_summary_disables_public_post(self):
+        filtered = self.outgoing_zip("original")
+        def exclude(_path, _kit):
+            with zipfile.ZipFile(filtered, "w") as archive:
+                archive.writestr("main-events.csv", "events only")
+        with mock.patch.object(sys.stdin, "isatty", return_value=True), \
+                mock.patch("builtins.input", side_effect=["r", "p"]), \
+                mock.patch.object(subprocess, "check_output", return_value="account"), \
+                mock.patch.object(runner, "review_result", side_effect=exclude), \
+                mock.patch.object(subprocess, "run", side_effect=AssertionError), contextlib.redirect_stdout(io.StringIO()) as output:
+            runner.share_result(7, filtered, self.root)
+        self.assertNotIn("[p]", output.getvalue().rsplit("Hardware test results", 1)[-1])
+
+    def test_results_view_handles_missing_candidate_timings(self):
+        report = ("Series X hardware test | PR #43 | Linux/Proton\nComparison completed\n"
+                  f"Main | {'a' * 40}\nMean: 60.92 ms/frame (16.41 FPS)\n"
+                  f"Longest: 5918.97 ms | over 100 ms: 3 | over 1 s: 1\nCandidate | {'b' * 40}\n"
+                  "Frame timings: unavailable\n")
+        lines = runner.report_overview(report)
+        self.assertIn("16.41 FPS", "\n".join(lines))
+        self.assertIn("Candidate  Frame timings unavailable", lines)
+        self.assertIn("Both builds need timing samples", lines[-1])
+        options = [("k", "Keep local", "Save the ZIP on this machine."), ("r", "Edit files", "Edit local copies.")]
+        for width, height in [(48, 16), (80, 24), (110, 28)]:
+            page, _, _ = runner.report_ui.layout("Hardware test results", "Series X", lines, options, 1, 0,
+                                                 width, height, False)
+            self.assertIn("› Edit files", page)
+            self.assertIn("Enter Select", page)
+            self.assertIn("LOGS MAY CONTAIN", page)
+            self.assertLessEqual(len(page.splitlines()), height)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "POSIX pseudoterminal")
+    def test_folder_review_is_a_full_screen_workflow(self):
+        import fcntl
+        import pty
+        import select
+        import struct
+        import termios
+        import time
+        filtered = self.outgoing_zip("Synthetic summary")
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 98, 0, 0))
+        code = ("import runpy,sys; from pathlib import Path; from unittest.mock import patch; "
+                "module=runpy.run_path('run-test.py'); "
+                "patch('subprocess.check_output',return_value='fixture').start(); "
+                "patch('subprocess.run',side_effect=AssertionError('unexpected network or launcher')).start(); "
+                "module['share_result'](43,Path(sys.argv[1]),Path(sys.argv[2]))")
+        child = subprocess.Popen([sys.executable, "-B", "-c", code, str(filtered), str(self.root)], cwd=SCRIPTS,
+                                 stdin=slave, stdout=slave, stderr=slave, env={**os.environ, "TERM": "xterm-256color"})
+        os.close(slave)
+        def finish():
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+        self.addCleanup(finish)
+        def screen(marker):
+            data = b""
+            deadline = time.monotonic() + 6
+            while marker not in data:
+                remaining = deadline - time.monotonic()
+                self.assertGreater(remaining, 0, data[-500:])
+                if select.select([master], [], [], remaining)[0]:
+                    data += os.read(master, 65536)
+            return data
+        first = screen(b"Enter Select")
+        self.assertIn(b"\x1b[?1049h", first)
+        self.assertIn(b"Hardware test results", first)
+        os.write(master, b"\x1b[B\r")
+        self.assertIn(b"Open folder", screen(b"Working folder"))
+        files, = filtered.parent.glob("victory-review-*/files")
+        (files / "summary.txt").write_bytes(b"Edited locally")
+        (files / "main-events.csv").unlink()
+        os.write(master, b"a")
+        screen(b"Edits saved locally")
+        os.write(master, b"i")
+        screen(b"Encrypt and send")
+        os.write(master, b"\x1b")
+        screen(b"Hardware test results")
+        os.write(master, b"p")
+        screen(b"Edited locally")
+        os.write(master, b"\x1b")
+        screen(b"Hardware test results")
+        os.write(master, b"\r")
+        self.assertEqual(child.wait(timeout=5), 0)
+        with zipfile.ZipFile(filtered) as archive:
+            self.assertEqual(archive.namelist(), ["summary.txt"])
+            self.assertEqual(archive.read("summary.txt"), b"Edited locally")
 
     def test_gist_only_receives_ciphertext_and_a_failed_mention_preserves_the_receipt(self):
         filtered = self.root / "report.zip"

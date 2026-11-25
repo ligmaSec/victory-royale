@@ -79,13 +79,19 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
    specified in the scenario.
 2. The **candidate** opens next. Repeat the same steps with the same settings and window
    size. The runner gives each build its own fresh translation cache.
-3. At **REPORT READY** or **TEST INTERRUPTED**, read the summary for both builds.
-   It shows the build revisions, platform, recognized GPU vendor, launcher exits,
-   frame intervals and counts of recognized diagnostic messages. Timing covers all
-   completed reporting windows, including menus. A run without timing samples
-   says so. Tell the requester what you saw in the opening scene on each build.
-4. Press Enter to keep everything local, or choose a destination. Public sharing
-   previews the exact text and confirms the signed-in GitHub account and PR.
+3. After the runs, the **Hardware test results** screen shows each build’s timings.
+   Missing samples are shown as unavailable. These timings include menus. Tell the
+   requester what you saw in the opening scene. Use **↑/↓** to highlight an action,
+   **Enter** to select and **Esc** to go back. **PgUp/PgDn** scroll longer details.
+4. Choose **Preview summary** to read the public text. **Review and edit files**
+   opens the built-in editor when supplied. Use **↑/↓** to pick a file, **Space**
+   to include or exclude it, **Enter** to edit, **Ctrl+F** to search and **Esc** to
+   return to the file list. **Ctrl+S** applies changes locally. To use another
+   editor, choose **Edit in my own editor → Open folder**. Edit or delete
+   working copies, save, then select **Apply edits**. **Back without applying**
+   discards those edits. The folder option also works with older kits.
+5. Choose **Keep local and finish** to print the saved ZIP path. **Post public
+   summary** previews the exact text and names the signed-in account and PR.
    For private sharing, the filtered ZIP also contains per-window mean, median,
    p95, longest frame time and stall counts for each build. Separate submission
    samples record time spent on CPU preparation, buffer and texture copies,
@@ -93,11 +99,11 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
    event timeline connects shader binds, translations and pipeline results to
    those samples through elapsed times and shader numbers shared across the pair.
    You can inspect the filtered ZIP in the printed temporary `share` folder.
-5. For **Send encrypted report**, install GitHub CLI and sign in to github.com
+6. For **Send encrypted report**, install GitHub CLI and sign in to github.com
    with permission to create gists (`gh auth login --hostname github.com --scopes gist`).
    For an existing CLI login, `gh auth refresh --hostname github.com --scopes gist`
-   adds the scope. The runner shows the account and maintainer. Choose **i**
-   to encrypt the ZIP locally and send it. The runner downloads the pinned,
+   adds the scope. The confirmation screen lists the account, recipient and every outgoing file.
+   Choose **Encrypt and send** to complete delivery. The runner downloads the pinned,
    checksum-verified x86-64 age tool. [Official age release](https://github.com/FiloSottile/age/releases/tag/v1.3.2).
    GitHub stores the encrypted file in an unlisted gist owned by your account.
    A mention on the gist notifies the maintainer. Your account, gist size and
@@ -106,7 +112,7 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
    Keep the receipt if notification fails. You can delete the gist from your account.
 
 **Raw logs may contain usernames, file paths, credentials or output from the title.**
-Keep `report.zip` local. Both sharing options use a fixed set of recognized
+Keep `report.zip` local. The initial export uses a fixed set of recognized
 fields. Unknown messages, command lines, hostnames, wall-clock timestamps, screenshots and
 the request's free text are excluded. If the summary misses something, describe
 it in words. See the [asset policy](asset-policy.md).
@@ -137,6 +143,10 @@ the number of the PR.
 python3 scripts/hardware-test/prepare.py PR_NUMBER --output test-kit.zip \
   --scenario "Wait ten seconds at the menu. Enter the opening scene. Close each run at the first subtitle."
 ```
+
+Official kits bundle the native review editor for x86-64 Windows and Linux.
+When preparing a kit locally, pass `--review-dir` with both built executables
+to include the editor. Kits prepared without them use the manual folder review.
 
 The packager matches the successful PR build to its tested main parent and checks
 both artifact digests. A documentation-only push can pass CI without packaging a
