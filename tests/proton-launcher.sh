@@ -103,6 +103,10 @@ if bash "$launcher" --run --vkd3d-dir "$work/nonexistent" "$work/game with space
     exit 1
 fi
 unset EXPECTED_RUNTIME
+if bash "$launcher" --runtime pinned --vkd3d-dir "$work" "$work/game with spaces/title.exe" 2>/dev/null; then
+    exit 1
+fi
+if bash "$launcher" --runtime unknown "$work/game with spaces/title.exe" 2>/dev/null; then exit 1; fi
 mkdir -p "$work/source"
 touch "$work/source/.victory-root"
 ln -s "$work/source" "$work/data-link"
@@ -110,7 +114,7 @@ if XDG_DATA_HOME="$work/data-link" bash "$launcher" --report "$work/game with sp
     exit 1
 fi
 test ! -d "$work/source/victory/reports"
-bash "$launcher" --run "$work/game with spaces/title.exe" --execute
+bash "$launcher" --run --runtime proton "$work/game with spaces/title.exe" --execute
 tail -n +4 "$LAUNCH_RECORD" | diff -u <(echo --execute) -
 
 # An extracted distribution finds the executable beside its launcher.

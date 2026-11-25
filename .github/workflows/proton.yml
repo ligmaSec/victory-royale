@@ -42,9 +42,10 @@ jobs:
                   raise SystemExit(f"Missing embedded GPU helper: {name}")
           PYTHON
           dist="$RUNNER_TEMP/distribution"
-          mkdir -p "$dist/victory"
+          mkdir -p "$dist/victory/tests"
           install -m 755 target/x86_64-pc-windows-gnullvm/release/victory.exe scripts/victory-proton.sh "$dist/victory/"
           install -m 644 LICENSE victory.example.toml "$dist/victory/"
+          install -m 644 tests/proton-launcher.sh "$dist/victory/tests/"
           printf '%s\n' "$GITHUB_SHA" > "$dist/victory/REVISION"
           cd "$dist"
           tar -czf victory-proton-x86_64.tar.gz victory
@@ -62,7 +63,8 @@ jobs:
           cd "$RUNNER_TEMP/unpacked/victory"
           test "$(cat REVISION)" = "$GITHUB_SHA"
           ./victory-proton.sh --help
-          bash "$GITHUB_WORKSPACE/tests/proton-launcher.sh" "$PWD/victory-proton.sh"
+          ./victory-proton.sh --test
+          bash "$GITHUB_WORKSPACE/tests/proton-pinned-runtime.sh" "$PWD/victory-proton.sh"
           PATH="/usr/bin:$PATH" xvfb-run -a bash "$GITHUB_WORKSPACE/tests/runtime/run.sh" \
             --victory "$PWD/victory.exe" --wine /usr/bin/wine
       - name: Preserve failed synthetic cases

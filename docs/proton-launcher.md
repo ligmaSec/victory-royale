@@ -74,14 +74,25 @@ produces an archive once UMU has started. Logs can include personal paths and
 title output. Review them privately and use the contributor guide when
 summarizing a failure for a public issue.
 
-For a runtime comparison, rerun the same command with `--vkd3d-dir` before
-the title. Pass the x64 directory from the vkd3d-proton build being tested.
-The launcher stages the selected pair alongside a temporary copy of the
-same Victory executable and includes both DLL hashes in the report.
+To compare the same Victory build across workstations, add `--runtime pinned`.
+Use this command from a checkout, or use `./victory-proton.sh` inside a CI package.
 
 ```sh
-./scripts/victory-proton.sh --report --vkd3d-dir "/path/to/vkd3d-proton/x64" "/path/to/game/title.exe"
+./scripts/victory-proton.sh --report --runtime pinned "/path/to/game/title.exe"
 ```
+
+On first use the launcher downloads the project's x64 vkd3d-proton archive
+using `curl` over HTTPS. It checks the SHA-256 pinned in this launcher and keeps
+the verified archive under `${XDG_CACHE_HOME:-$HOME/.cache}/victory`. Subsequent
+runs can use the cached archive offline. Each run stages the two DLLs beside a
+temporary copy of the selected Victory executable. The report includes the
+runtime selection and DLL hashes. This pin is a 3.2 development build from
+upstream commit `ec20719`. The release includes provenance, notices, and source.
+[Runtime release](https://github.com/ligmaSec/victory-royale/releases/tag/runtime-vkd3d-ec20719)
+
+The default selection is `--runtime proton`. Both selections work with `--run`
+and `--report`. To test a locally built runtime, use `--vkd3d-dir DIR` and
+supply the directory containing its x64 `d3d12.dll` and `d3d12core.dll`.
 
 Set `VICTORY_TRACE_PIPELINES=1` to log the shader stages and hashes with the
 Windows thread ID when each host pipeline starts compiling. Match that ID to
@@ -95,7 +106,7 @@ can still use the same shaders. Unset the variable to restore the passes.
 
 ## Testing without game files
 
-`bash tests/proton-launcher.sh` checks argument quoting, cache paths, XDG
+`./scripts/victory-proton.sh --test` (or `./victory-proton.sh --test` in the package) checks argument quoting, cache paths, XDG
 fallbacks and exit status with a fake UMU. It requires neither Wine nor a GPU,
 and runs in Linux CI.
 

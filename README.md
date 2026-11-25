@@ -29,12 +29,15 @@ Install UMU (`umu-run`) and extract the verified Proton build from a successful
 `main` CI run. From the extracted `victory` directory, choose one command.
 
 ```sh
-./victory-proton.sh --run "/path/to/title.exe"
-./victory-proton.sh --report "/path/to/title.exe"
+./victory-proton.sh --test                                # check the launcher offline
+./victory-proton.sh --run "/path/to/title.exe"            # use your Proton runtime
+./victory-proton.sh --report --runtime pinned "/path/to/title.exe"  # compare with the project runtime
 ```
 
 `--report` launches once and prints the path to a compressed diagnostic archive
-when the process exits. Contributors running from source use
+when the process exits. Use `--report` alone to capture the default runtime.
+The pinned runtime downloads on first use and is verified before each launch.
+Contributors running from source use
 `./scripts/victory-proton.sh --build` after installing the cross-toolchain,
 then the same commands with `./scripts/victory-proton.sh`.
 [Build downloads and checksums](docs/testing.md#ci-and-build-downloads) ·
