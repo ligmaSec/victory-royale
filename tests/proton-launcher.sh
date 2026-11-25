@@ -18,6 +18,17 @@ fi
 if [[ -n ${PROTON_RECORD:-} ]]; then
     printf '%s\n' "${PROTONPATH:-}" > "$PROTON_RECORD"
 fi
+# Hold the first UMU invocation open while the other package launches.
+if [[ -n ${SECOND_BUILD:-} ]]; then
+    env -u STEAM_COMPAT_INSTALL_PATH -u STEAM_COMPAT_LIBRARY_PATHS -u PROTONPATH \
+        VICTORY_EXE="$SECOND_BUILD/victory.exe" SECOND_BUILD= \
+        bash "$TEST_LAUNCHER" --run --runtime proton "$3" --console series-x
+fi
+if [[ ${CHECK_PACKAGE_PATH:-} == 1 ]]; then
+    test "$PROTONPATH" = "$HOME/.local/share/Steam/steamapps/common/Proton - Experimental"
+    test "$1" = "$VICTORY_EXE"
+    test "$(realpath -e -- "$STEAM_COMPAT_INSTALL_PATH")" = "${VICTORY_EXE%/*}"
+fi
 if [[ -n ${EXPECTED_RUNTIME:-} ]]; then
     exe=${1#Z:}
     exe=${exe//\\/\/}
@@ -152,7 +163,11 @@ export STEAM_RECORD="$work/steam-env"
 unset PROTONPATH STEAM_COMPAT_INSTALL_PATH STEAM_COMPAT_LIBRARY_PATHS
 steam_root="$HOME/.local/share/Steam"
 experimental="$steam_root/steamapps/common/Proton - Experimental"
-mkdir -p "$experimental"
+# A partial install in the first Steam root must not mask a usable runtime.
+export XDG_DATA_HOME="$work/steam data"
+mkdir -p "$XDG_DATA_HOME/Steam/steamapps/common/Proton - Experimental" "$experimental"
+touch "$experimental/proton"
+chmod +x "$experimental/proton"
 printf '1794497090 experimental-11.0-20261112-x86_64\n' > "$experimental/version"
 bash "$launcher" "$work/game with spaces/title.exe" --execute
 mapfile -t launched_args < "$LAUNCH_RECORD"
@@ -160,23 +175,25 @@ test "${launched_args[0]}" = "$VICTORY_EXE"
 test "${launched_args[1]}" = run
 test "${launched_args[2]}" = "$work/game with spaces/title.exe"
 mapfile -t steam_env < "$STEAM_RECORD"
-test "${steam_env[0]}" = "$steam_root/steamapps/common/victory-run"
+default_install=${steam_env[0]}
+[[ $default_install == "$steam_root/steamapps/common/"* ]]
 test "${steam_env[1]}" = "$steam_root/steamapps"
 test "$(readlink -- "${steam_env[0]}")" = "$work/build with spaces"
 
-# A stale symlink is repointed at the current build.
+# Each running package keeps its own install directory. Both launches
+# auto-select Experimental and receive Unix executable and title paths.
 mkdir -p "$work/other build"
 touch "$work/other build/victory.exe"
-ln -sfn "$work/other build" "${steam_env[0]}"
-export VICTORY_EXE="$work/other build/victory.exe"
-bash "$launcher" "$work/game with spaces/title.exe"
-test "$(readlink -- "${steam_env[0]}")" = "$work/other build"
+TEST_LAUNCHER="$launcher" SECOND_BUILD="$work/other build" CHECK_PACKAGE_PATH=1 \
+    bash "$launcher" --run --runtime proton "$work/game with spaces/title.exe" --console series-x
 
-# A dangling symlink is repaired too.
-rm -rf -- "$work/other build"
-export VICTORY_EXE="$work/build with spaces/victory.exe"
+# Repair a stale or dangling link at this package's own path.
+ln -sfn -- "$work/other build" "$default_install"
 bash "$launcher" "$work/game with spaces/title.exe"
-test "$(readlink -- "${steam_env[0]}")" = "$work/build with spaces"
+test "$(readlink -- "$default_install")" = "$work/build with spaces"
+ln -sfn -- "$work/missing build" "$default_install"
+bash "$launcher" "$work/game with spaces/title.exe"
+test "$(readlink -- "$default_install")" = "$work/build with spaces"
 
 # Caller-provided compat paths are preserved.
 export STEAM_COMPAT_INSTALL_PATH="$work/custom install"
@@ -189,7 +206,6 @@ unset STEAM_COMPAT_INSTALL_PATH STEAM_COMPAT_LIBRARY_PATHS
 
 # An explicit install path bypasses the default symlink, even when an ordinary
 # directory occupies the proposed default path.
-default_install="$steam_root/steamapps/common/victory-run"
 rm -f -- "$default_install"
 mkdir -p -- "$default_install"
 printf 'caller data\n' > "$default_install/marker"
@@ -239,6 +255,7 @@ if [[ $probe_writable == no ]]; then
     readonly_common="$readonly_data/Steam/steamapps/common"
     readonly_experimental="$readonly_common/Proton - Experimental"
     mkdir -p "$readonly_experimental"
+    cp -- "$experimental/proton" "$readonly_experimental/proton"
     printf '1794497090 experimental-11.0-20261112-x86_64\n' > "$readonly_experimental/version"
     chmod 0555 "$readonly_common"
     : > "$LAUNCH_RECORD"

@@ -52,13 +52,14 @@ prefix is `${XDG_DATA_HOME:-$HOME/.local/share}/victory/proton`, and the
 default `GAMEID` is `umu-victory`. Set `WINEPREFIX`, `GAMEID` or `PROTONPATH`
 to override them. Use Windows paths in `victory.toml`.
 
-The launcher looks for Steam's `Proton - Experimental` in
-`$XDG_DATA_HOME/Steam`, `$HOME/.steam/steam` and `$HOME/.local/share/Steam`,
-and also recognises an explicit `PROTONPATH` whose `version` file contains
-`experimental-` when it sits in a `steamapps/common` layout. That runtime does
-not accept `Z:` paths, so the launcher gives UMU Unix paths and sets
-`STEAM_COMPAT_INSTALL_PATH` to a symlink under the Steam library, with
-`STEAM_COMPAT_LIBRARY_PATHS` pointing at that library. A caller-supplied
+The launcher searches `$XDG_DATA_HOME/Steam`, `$HOME/.steam/steam` and
+`$HOME/.local/share/Steam` for Proton Experimental. It uses the first install
+with an executable `steamapps/common/Proton - Experimental/proton`. An explicit
+`PROTONPATH` takes precedence. The launcher recognises Experimental at that path
+when its `version` file contains `experimental-` and it uses a `steamapps/common`
+layout. It gives UMU Unix paths and sets `STEAM_COMPAT_LIBRARY_PATHS` to the
+Steam library. Each VIctory package directory gets its own install symlink under
+that library, so two builds can run at the same time. A caller-supplied
 `STEAM_COMPAT_INSTALL_PATH` is used as-is: the default symlink is neither
 created nor checked in that case. When the launcher discovers Experimental on
 its own and cannot set up that symlink (for example a read-only Steam library),

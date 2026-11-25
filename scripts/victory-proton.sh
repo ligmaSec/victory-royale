@@ -217,8 +217,9 @@ auto_experimental=0
 library=
 if [[ -z $proton_path ]]; then
     for root in "$data_home/Steam" "$HOME/.steam/steam" "$HOME/.local/share/Steam"; do
-        if [[ -d $root/steamapps/common/Proton\ -\ Experimental ]]; then
-            proton_path=$root/steamapps/common/Proton\ -\ Experimental
+        experimental="$root/steamapps/common/Proton - Experimental"
+        if [[ -f $experimental/proton && -x $experimental/proton ]]; then
+            proton_path=$experimental
             library=$root/steamapps
             export PROTONPATH=$proton_path
             auto_experimental=1
@@ -236,8 +237,12 @@ fi
 if [[ -n $library && -z $caller_install ]]; then
     # A caller-supplied install path owns this decision: the default symlink is
     # none of our business, so do not create, check, or repoint it.
-    install=$library/common/victory-run
-    if prepare_compat_link "$install" "$(dirname -- "$binary")"; then
+    # Key the link by the canonical package directory so overlapping launches
+    # cannot redirect another package's compat install path.
+    package=$(dirname -- "$binary")
+    package_id=$(printf '%s' "$package" | sha256sum)
+    install=$library/common/victory-run-${package_id%% *}
+    if prepare_compat_link "$install" "$package"; then
         export STEAM_COMPAT_INSTALL_PATH=$install
     else
         if (( ! auto_experimental )); then exit 1; fi
