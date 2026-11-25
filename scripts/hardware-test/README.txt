@@ -22,7 +22,8 @@ also needs Bash and UMU (umu-run) and may download pinned vkd3d-proton on
 first use. Keep the game executable outside the VIctory checkout.
 
 From a repository checkout, use python3 scripts/hardware-test/run-test.py
-(or py on Windows) to choose a published test. This menu requires a
+(or py on Windows) to choose a test. Requests with a kit from main can run directly. Other
+requests labeled "tester wanted" link to the PR instructions. The menu requires a
 signed-in GitHub CLI. You can also pass the PR number, a downloaded kit ZIP
 or a request JSON. A JSON without bundled packages needs GitHub CLI to
 download the builds.

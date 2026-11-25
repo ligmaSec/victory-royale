@@ -138,9 +138,9 @@ def github_rows(endpoint, query):
     return [json.loads(line) for line in result.stdout.splitlines() if line]
 
 
-def published_requests(number):
+def hardware_requests(number):
     pulls = github_rows("pulls?state=open&base=main&per_page=100",
-                        ".[] | {number, title, head: .head.sha}")
+                        '.[] | {number, title, head: .head.sha, wanted: any(.labels[]; .name == "tester wanted")}')
     open_prs = {pr["number"]: pr for pr in pulls if number is None or pr["number"] == number}
     if not open_prs:
         return {}
@@ -160,20 +160,24 @@ def published_requests(number):
                     available[pr] = (open_prs[pr], run_id, artifact["name"])
         if len(available) == len(open_prs):
             break
+    for pr, pull in open_prs.items():
+        if pull["wanted"] and pr not in available:
+            available[pr] = (pull, None, None)
     return available
 
 
 def select_published(number, list_only, folder):
-    available = published_requests(number)
+    available = hardware_requests(number)
     if number is None:
         if not available:
-            print("There are no published Series X requests for open PRs.")
+            print("There are no open Series X hardware test requests.")
             return None
-        print("Available Series X hardware tests:")
-        for pr, (pull, _, _) in sorted(available.items()):
-            print(f"  #{pr}  {pull['title']}")
+        print("Series X hardware test requests:")
+        for pr, (pull, run_id, _) in sorted(available.items()):
+            status = "kit available" if run_id else f"see request at https://github.com/{REPO}/pull/{pr}"
+            print(f"  #{pr}  {pull['title']}  [{status}]")
         if list_only or not sys.stdin.isatty():
-            print("To run one, pass its PR number to this command.")
+            print("Pass a PR number to see its instructions or run its kit.")
             return None
         choice = input("PR number (Enter to cancel): ").strip().lstrip("#")
         if not choice:
@@ -184,6 +188,10 @@ def select_published(number, list_only, folder):
     if number not in available:
         raise ValueError(f"No published kit for open PR #{number}. Ask the requester to publish a fresh kit.")
     pull, run_id, artifact = available[number]
+    if run_id is None:
+        print(f"PR #{number} is looking for testers. See https://github.com/{REPO}/pull/{number}")
+        print("This request has no unexpired kit published from main.")
+        return None
     print(f"Downloading the Series X test for PR #{number}…", flush=True)
     subprocess.run(["gh", "run", "download", str(run_id), "-R", REPO, "-n", artifact, "-D", str(folder)],
                    check=True)
@@ -219,7 +227,7 @@ def unpack_kit(path, folder, plan):
 def run():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("request", nargs="?", help="PR number, test kit ZIP or request JSON")
-    parser.add_argument("--list", action="store_true", help="list published Series X requests")
+    parser.add_argument("--list", action="store_true", help="list Series X hardware test requests")
     parser.add_argument("--output-dir", type=Path, help="parent directory for the unique report")
     parser.add_argument("--plan", action="store_true", help="preview the selected test without launching")
     parser.add_argument("--title", type=Path, help="use this executable instead of the file chooser")
