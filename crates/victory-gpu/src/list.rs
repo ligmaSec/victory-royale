@@ -767,7 +767,9 @@ extern "system" fn copy_texture_region(
 ) {
     #[cfg(windows)]
     {
-        use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_BOX, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_TEXTURE_COPY_LOCATION,
+        };
         use windows::core::Interface;
         const FOOTPRINT: u32 = 1;
         // SAFETY: the title passes both locations (null is tolerated).
@@ -814,6 +816,43 @@ extern "system" fn copy_texture_region(
             if total == 0 || lines == 0 || row_bytes == 0 {
                 return;
             }
+            let extent = if let Some(box_ptr) = host_box {
+                // SAFETY: the title passed a complete source box.
+                let b = unsafe { *box_ptr };
+                let [Some(w), Some(h), Some(d)] = [
+                    b.right.checked_sub(b.left),
+                    b.bottom.checked_sub(b.top),
+                    b.back.checked_sub(b.front),
+                ] else {
+                    return;
+                };
+                [w, h, d]
+            } else {
+                // A missing box copies the entire source subresource. Its mip
+                // or plane can be smaller than the destination footprint.
+                let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+                // SAFETY: a live texture and device, with room for one footprint.
+                unsafe {
+                    host.device.GetCopyableFootprints(
+                        &from_tex.GetDesc(),
+                        src.footprint.offset as u32,
+                        1,
+                        0,
+                        Some(&mut layout),
+                        None,
+                        None,
+                        None,
+                    );
+                }
+                [
+                    layout.Footprint.Width,
+                    layout.Footprint.Height,
+                    layout.Footprint.Depth,
+                ]
+            };
+            let Some(region) = dst.footprint.copy_rows([x, y, z], extent) else {
+                return;
+            };
             let dst_pitch = u64::from(dst.footprint.row_pitch);
             if lines > 1 && dst_pitch < row_bytes {
                 return;
@@ -821,18 +860,17 @@ extern "system" fn copy_texture_region(
             let Some(target) = buffer_range(dst.resource, dst.footprint.offset, total) else {
                 return;
             };
-            let Ok(row_bytes_u32) = u32::try_from(row_bytes) else {
+            // Only the copied rectangle needs a host staging footprint.
+            let Ok(row_bytes_u32) = u32::try_from(region.row_bytes) else {
                 return;
             };
-            // D3D12 requires placed footprints' row pitch to be 256-byte aligned.
-            let host_pitch = dst
-                .footprint
-                .row_pitch
-                .max(row_bytes_u32)
-                .next_multiple_of(256);
+            let Some(host_pitch) = row_bytes_u32.checked_next_multiple_of(256) else {
+                return;
+            };
+            let staging_lines = u64::from(extent[2]) * region.lines;
             let Some(staging_bytes) = u64::from(host_pitch)
-                .checked_mul(lines - 1)
-                .and_then(|n| n.checked_add(row_bytes))
+                .checked_mul(staging_lines - 1)
+                .and_then(|n| n.checked_add(region.row_bytes))
             else {
                 return;
             };
@@ -846,6 +884,11 @@ extern "system" fn copy_texture_region(
             to_location.resource = buffer.as_raw().cast_const().cast();
             to_location.footprint.offset = 0;
             to_location.footprint.format = host_format;
+            [
+                to_location.footprint.width,
+                to_location.footprint.height,
+                to_location.footprint.depth,
+            ] = extent;
             to_location.footprint.row_pitch = host_pitch;
             let mut from_location = src;
             from_location.resource = from_tex.as_raw().cast_const().cast();
@@ -869,22 +912,28 @@ extern "system" fn copy_texture_region(
             unsafe {
                 list.list.CopyTextureRegion(
                     (&raw const to_location).cast(),
-                    x,
-                    y,
-                    z,
+                    0,
+                    0,
+                    0,
                     (&raw const from_location).cast(),
                     host_box,
                 )
             };
-            list.defer_readback(
-                target,
-                staging,
-                dst_pitch as usize,
-                host_pitch as usize,
-                lines as usize,
-                row_bytes as usize,
-                total as usize,
-            );
+            for slice in 0..extent[2] {
+                let line = region.first_line + u64::from(slice) * region.slice_lines;
+                // copy_rows checked the rectangle against the footprint, and
+                // both mapped buffers cover their full pitched footprints.
+                let to = line * dst_pitch + region.byte_in_row;
+                let from = u64::from(slice) * region.lines * u64::from(host_pitch);
+                list.defer_readback(
+                    target.wrapping_add(to as usize),
+                    staging.wrapping_add(from as usize),
+                    dst_pitch as usize,
+                    host_pitch as usize,
+                    region.lines as usize,
+                    region.row_bytes as usize,
+                );
+            }
             mark_work(this);
             return;
         }
