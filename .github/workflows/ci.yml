@@ -126,9 +126,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VICTORY_TEST_AGE: "1"
+        # Exercise the contributor's terminal entry point without keyboard input.
         run: |
-          python -B tests/hardware-test.py
-          python -B tests/hardware-delivery.py
+          timeout 60s script -qec 'python3 -B tests/hardware-test.py' /dev/null </dev/null
+          python3 -B tests/hardware-delivery.py
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
