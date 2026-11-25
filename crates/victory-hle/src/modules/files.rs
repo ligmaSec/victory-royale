@@ -471,14 +471,39 @@ pub extern "system" fn ReadFile(
     done
 }
 
-/// The host CRT reads large requests straight into the caller's buffer.
+/// The host CRT reads large requests straight into the caller's buffer
+/// through the kernel, whose write fails on a guarded block instead of
+/// faulting into the guard. So the bytes are read beside, a chunk at a time,
+/// announced as a host write, copied in from user mode, and the guard is put
+/// back; this is the same read-modify-write the title's own stores take.
+/// Returns the items read, as the CRT does; the bytes of a partial last item
+/// are copied too, as the CRT leaves them.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
-    let n = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
-        buffer, size, count, stream,
-    );
-    victory_gpu::kernel_wrote(buffer as usize, size.saturating_mul(count));
-    n
+    let read = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize);
+    let total = size.saturating_mul(count);
+    if buffer.is_null() || total == 0 {
+        // The CRT's own checks and answer (EINVAL, or nothing to read).
+        return read(buffer, size, count, stream);
+    }
+    const CHUNK: usize = 1 << 20;
+    let mut beside = vec![0u8; total.min(CHUNK)];
+    let mut done = 0;
+    while done < total {
+        let want = (total - done).min(CHUNK);
+        let n = read(beside.as_mut_ptr(), 1, want, stream);
+        if n > 0 {
+            victory_gpu::kernel_will_write(buffer as usize + done, n);
+            // SAFETY: the caller's buffer holds `size * count` bytes, and
+            // `done + n` is at most that.
+            unsafe { std::ptr::copy_nonoverlapping(beside.as_ptr(), buffer.add(done), n) };
+            victory_gpu::kernel_wrote(buffer as usize + done, n);
+            done += n;
+        }
+        if n < want {
+            break;
+        }
+    }
+    done / size
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
@@ -890,5 +915,40 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
+    }
+
+    /// Reads larger than a chunk are staged beside the destination, and a
+    /// partial last item still has its bytes copied in.
+    #[test]
+    fn fread_reads_beside_in_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        let bytes: Vec<u8> = (0..(5 << 19) + 1)
+            .map(|i| (i * 7 + i / 251) as u8)
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let fclose = host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32);
+        let open = || {
+            let f = _wfopen(w(&path.to_string_lossy()).as_ptr(), w("rb").as_ptr());
+            assert!(!f.is_null());
+            f
+        };
+
+        let f = open();
+        let mut out = vec![0xaau8; bytes.len() + 64];
+        let items = fread(out.as_mut_ptr(), 3, out.len() / 3, f);
+        assert_eq!(items, bytes.len() / 3);
+        assert_eq!(&out[..bytes.len()], &bytes[..]);
+        assert!(out[bytes.len()..].iter().all(|&b| b == 0xaa));
+        fclose(f);
+
+        let f = open();
+        let mut a = vec![0u8; 1000];
+        let mut b = vec![0u8; (1 << 20) + 5];
+        assert_eq!(fread(a.as_mut_ptr(), 1000, 1, f), 1);
+        assert_eq!(fread(b.as_mut_ptr(), 1, b.len(), f), b.len());
+        assert_eq!(a, bytes[..1000]);
+        assert_eq!(b, bytes[1000..1000 + b.len()]);
+        fclose(f);
     }
 }
