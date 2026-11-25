@@ -90,10 +90,14 @@ for what you can share on GitHub.
 
 Run the [hardware kit workflow](../.github/workflows/hardware-request.yml) on
 `main` with the PR number and a short Series X scenario. Specify where to start,
-what to observe and when to close each run. Once it succeeds, send the tester the
+what to observe and when to close each run. The publisher requires `main`.
+After publication, [Verify the published hardware request](../.github/workflows/hardware-request-verify.yml)
+previews the PR by number using the same picker as testers. A successful preview
+adds `tester wanted` to the PR. If verification fails, fix the reported problem
+and republish the kit before inviting testers. Once verified, send the tester the
 checkout command for their OS with the PR number appended, plus the private report
 destination. Tell testers that logs can contain usernames, local paths and other
-sensitive information, and that they can reply with a written summary. Add the
+sensitive information, and that they can reply with a written summary. For manual tests, add the
 `tester wanted` label to the PR while the request is open.
 The picker lists open PRs labeled `tester wanted` and open PRs with a published kit.
 A kit published by the workflow on `main` can run directly. For a labeled PR without

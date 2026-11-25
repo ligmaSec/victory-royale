@@ -149,6 +149,12 @@ class HardwareRequest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "different PR"):
                 runner.run()
 
+    def test_explicit_preview_requires_a_kit(self):
+        with mock.patch.object(sys, "argv", ["runner", "7", "--plan"]), \
+                mock.patch.object(runner, "select_published", return_value=None), \
+                self.assertRaisesRegex(ValueError, "no published kit to preview"):
+            runner.run()
+
     def test_checkout_zip_and_extracted_kit_offline(self):
         archive = self.root / "Series X kit.zip"
         name = self.build["sha256"] + ".tar.gz"
