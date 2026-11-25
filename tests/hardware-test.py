@@ -261,6 +261,22 @@ class HardwareRequest(unittest.TestCase):
             for value in ("private", "192.0.2.10", "secret=value"):
                 self.assertNotIn(value, body + timings + "".join(submissions))
 
+    def test_proton_uses_recognized_output_with_a_nondefault_game_id(self):
+        (self.root / "main.log").write_bytes(b"wrapper")
+        header = b"Proton header only"
+        log = b"shader does not translate: synthetic refusal"
+        for steam, launcher in ((log, header), (header, log)):
+            with tarfile.open(self.root / "main.tar.gz", "w:gz") as tar:
+                for name, contents in (("./steam-victory.log", header), ("./steam-custom.log", steam),
+                                       ("./launcher.log", launcher)):
+                    member = tarfile.TarInfo(name)
+                    member.size = len(contents)
+                    tar.addfile(member, io.BytesIO(contents))
+            with tempfile.TemporaryDirectory() as output:
+                body = runner.diagnostic_summary(self.request, self.root, False, False, Path(output))
+            self.assertIn("shader refusal: 1", body)
+            self.assertNotIn("custom", body)
+
     def test_public_post_requires_preview_and_uses_only_summary(self):
         for tty, answers, posted in ((False, [], False), (True, [""], False),
                                      (True, ["p", ""], False), (True, ["p", "y"], True)):

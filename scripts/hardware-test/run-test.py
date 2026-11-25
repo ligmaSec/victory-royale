@@ -283,6 +283,7 @@ def instruction_block(heading, message, path_line=None):
 def read_metrics(stream, frame_log, submission_log):
     """Count diagnostic messages and completed, non-overlapping present windows."""
     frames = windows = slow = stalls = 0
+    submission_seen = False
     elapsed = longest = 0.0
     counts = {}
     vendor = None
@@ -305,6 +306,7 @@ def read_metrics(stream, frame_log, submission_log):
             match = SUBMISSION.search(ANSI.sub(b"", raw).rstrip())
             if match:
                 submission_log.writerow([value.decode("ascii") for value in match.groups()])
+                submission_seen = True
         elif b"host D3D12 device ready" in raw:
             match = re.search(rb"\bvendor=(0x[0-9a-f]{4})\b", ANSI.sub(b"", raw))
             if match:
@@ -322,7 +324,7 @@ def read_metrics(stream, frame_log, submission_log):
         rows.append("Frame timings: unavailable")
     if counts:
         rows.append("Log messages: " + ", ".join(f"{name}: {counts[name]}" for name in sorted(counts)))
-    return rows
+    return rows, bool(frames or submission_seen or counts or vendor)
 
 
 def side_metrics(results, side, windows, frame_log, submission_log):
@@ -336,14 +338,21 @@ def side_metrics(results, side, windows, frame_log, submission_log):
             # use the launcher log. Read one source so mirrored lines count once.
             try:
                 with tarfile.open(archive, "r:gz") as bundle:
-                    for name in ("./steam-victory.log", "./launcher.log"):
-                        if name in bundle.getnames() and bundle.getmember(name).isfile():
-                            with bundle.extractfile(name) as stream:
-                                return read_metrics(stream, frame_log, submission_log)
+                    logs = {member.name.removeprefix("./"): member for member in bundle.getmembers()
+                            if member.isfile()}
+                    other_steam = sorted(name for name in logs if name != "steam-victory.log"
+                                         and re.fullmatch(r"steam-[^/]+\.log", name))
+                    for name in ("steam-victory.log", *other_steam, "launcher.log"):
+                        if name in logs:
+                            with bundle.extractfile(logs[name]) as stream:
+                                rows, recognized = read_metrics(stream, frame_log, submission_log)
+                            if recognized:
+                                return rows
             except (OSError, EOFError, tarfile.TarError):
                 pass
     with console.open("rb") as stream:
-        return read_metrics(stream, frame_log, submission_log)
+        rows, _ = read_metrics(stream, frame_log, submission_log)
+        return rows
 
 
 def diagnostic_summary(request, results, windows, complete, destination):
