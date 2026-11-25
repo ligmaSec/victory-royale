@@ -234,7 +234,10 @@ def run():
             manifest = select_published(None, options.list, folder)
         elif argument is not None:
             if re.fullmatch(r"#?[1-9][0-9]*", argument):
-                manifest = select_published(int(argument.lstrip("#")), False, folder)
+                pr = int(argument.lstrip("#"))
+                manifest = select_published(pr, False, folder)
+                if options.plan and manifest is None:
+                    raise ValueError(f"PR #{pr} has no published kit to preview.")
             else:
                 path = Path(argument).expanduser()
                 if not path.is_file():
