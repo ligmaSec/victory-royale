@@ -324,6 +324,29 @@ class HardwareRequest(unittest.TestCase):
             self.assertIn("shader refusal: 1", body)
             self.assertNotIn("custom", body)
 
+    def test_wave_refusals_keep_numeric_ranges_across_proton_logs(self):
+        message = b"d3d12_device_validate_shader_meta: Required WaveSize range [64, 64], but supported range is [32, 32]."
+        private = b"/home/private-device/"
+        # Two real messages, plus malformed, unrelated and suffixed lines.
+        waves = b"\n".join([private + b" " + message, message, message.replace(b"64", b"6789"),
+                            message.replace(b"shader_meta:", b"unrelated:"), message + private])
+        timing = (b"present intervals: 2 frames, mean 30.00 ms, median 30.00 ms, p95 32.00 ms, "
+                  b"longest 32.00 ms, 0 over 100 ms, 0 over 1 s")
+        (self.root / "main.log").write_bytes(timing)
+        for steam, launcher in ((waves, timing), (waves, waves + b"\n" + timing),
+                               (waves + b"\n" + timing, waves), (waves, b""), (timing, waves)):
+            with tarfile.open(self.root / "main.tar.gz", "w:gz") as tar:
+                for name, log in (("./steam-victory.log", steam), ("./launcher.log", launcher)):
+                    member = tarfile.TarInfo(name)
+                    member.size = len(log)
+                    tar.addfile(member, io.BytesIO(log))
+            with tempfile.TemporaryDirectory() as output:
+                summary = runner.diagnostic_summary(self.request, self.root, False, True, Path(output))
+                self.assertEqual(summary.count("Wave-size rejection messages"), 1)
+                self.assertIn("2 (shader 64–64 lanes, adapter 32–32)", summary)
+                self.assertIn("2 frame intervals", summary)
+                self.assertNotIn("private-device", summary)
+
     def outgoing_zip(self, summary):
         path = self.root / "filtered.zip"
         with zipfile.ZipFile(path, "w") as archive:
