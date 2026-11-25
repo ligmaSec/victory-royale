@@ -179,14 +179,18 @@ class HardwareRequest(unittest.TestCase):
                 mock.patch.object(shutil, "which", return_value="tool"), \
                 mock.patch.object(runner, "launch", side_effect=launched), contextlib.redirect_stdout(stdout):
             runner.run()
-        report, = temp.rglob("*.zip")
+        report, = temp.rglob("report.zip")
         self.assertEqual(list(temp.iterdir()), [report.parent])
         self.assertIn("REPORT READY", stdout.getvalue())
         blocks = stdout.getvalue().split("REPORT READY")
         self.assertIn("LOG PRIVACY", blocks[0].split("RUN 1 OF 2")[0])
         self.assertIn("sensitive information", " ".join(blocks[1].split()))
         self.assertIn("written summary", " ".join(blocks[1].split()))
-        self.assertEqual(stdout.getvalue().rstrip().splitlines()[-1], f"Upload: {report}")
+        self.assertIn(f"Local logs: {report}", stdout.getvalue())
+        filtered, = temp.rglob("*-diagnostics.zip")
+        self.assertIn(f"Filtered diagnostics: {filtered}", stdout.getvalue())
+        with zipfile.ZipFile(filtered) as archive:
+            self.assertEqual(set(archive.namelist()), {"summary.txt", "main-frames.csv", "candidate-frames.csv"})
         with zipfile.ZipFile(report) as archive:
             self.assertEqual(set(archive.namelist()), {"request.json", "main.log", "candidate.log"})
 
@@ -216,6 +220,68 @@ class HardwareRequest(unittest.TestCase):
         partial, = set(self.output.glob("*/report.zip")) - set(bundles)
         with zipfile.ZipFile(partial) as archive:
             self.assertEqual(set(archive.namelist()), {"request.json", "main.log"})
+
+    def test_filtered_result_keeps_only_numeric_windows_and_fixed_diagnostics(self):
+        request = dict(self.request, scenario="private scenario")
+        private = b"private_name private@example.test /home/private/ C:\\Users\\private 192.0.2.10 secret=value"
+        window = (b"present intervals: 2 frames, mean 750.00 ms, median 750.00 ms, p95 1400.00 ms, "
+                  b"longest 1400.00 ms, 1 over 100 ms, 1 over 1 s")
+        log = b"\n".join([private, b"host D3D12 device ready adapter=" + private + b" vendor=0x1002",
+                          b"shader does not translate: " + private, window, window + b" " + private])
+        for windows in (True, False):
+            destination = self.root / str(windows)
+            destination.mkdir()
+            (self.root / "main.log").write_bytes(log if windows else private)
+            (self.root / "main-exit.txt").write_text("42")
+            (self.root / "candidate-exit.txt").write_bytes(private)
+            if not windows:
+                with tarfile.open(self.root / "main.tar.gz", "w:gz") as tar:
+                    for name in ("./launcher.log", "./steam-victory.log", "./private.txt"):
+                        member = tarfile.TarInfo(name)
+                        member.size = len(log)
+                        tar.addfile(member, io.BytesIO(log))
+            body = runner.diagnostic_summary(request, self.root, windows, False, destination)
+            timings = (destination / "main-frames.csv").read_text()
+            self.assertIn("Partial comparison", body)
+            self.assertIn("GPU vendor: AMD", body)
+            self.assertIn("Mean: 750.00 ms/frame (1.33 FPS)", body)
+            self.assertIn("shader refusal: 1", body)
+            self.assertIn("Launcher exit: 42", body)
+            self.assertIn("Launcher exit: unreported", body)
+            self.assertIn("1,2,750.0,750.0,1400.0,1400.0,1,1", timings)
+            for value in ("private", "192.0.2.10", "secret=value"):
+                self.assertNotIn(value, body + timings)
+
+    def test_public_post_requires_preview_and_uses_only_summary(self):
+        for tty, answers, posted in ((False, [], False), (True, [""], False),
+                                     (True, ["p", ""], False), (True, ["p", "y"], True)):
+            output = io.StringIO()
+            with mock.patch.object(sys.stdin, "isatty", return_value=tty), \
+                    mock.patch("builtins.input", side_effect=answers), \
+                    mock.patch.object(subprocess, "check_output", return_value="test-account"), \
+                    mock.patch.object(subprocess, "run") as send, contextlib.redirect_stdout(output):
+                runner.share_result(7, "Previewed result", self.root / "filtered.zip")
+            self.assertIn("Previewed result", output.getvalue())
+            self.assertEqual(send.called, posted)
+            if posted:
+                self.assertEqual(send.call_args.kwargs["input"], "Previewed result")
+                self.assertIn("github.com/" + runner.REPO, send.call_args.args[0])
+
+    def test_private_choice_opens_only_the_project_page_and_names_the_filtered_zip(self):
+        safe = self.root / "filtered.zip"
+        for inbox in (None, "https://example.test/upload"):
+            with mock.patch.object(sys.stdin, "isatty", return_value=True), \
+                    mock.patch("builtins.input", return_value="i"), mock.patch.object(runner, "PRIVATE_INBOX", inbox), \
+                    mock.patch.object(runner.webbrowser, "open") as browser, \
+                    mock.patch.object(subprocess, "run", side_effect=AssertionError), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                runner.share_result(7, "Preview", safe)
+            self.assertIn(f"Select this filtered ZIP: {safe}", output.getvalue())
+            if inbox:
+                browser.assert_called_once_with(inbox)
+            else:
+                browser.assert_not_called()
+                self.assertIn("supplied by the requester", output.getvalue())
 
     def test_platform_commands_and_cache_paths(self):
         for windows in (False, True):

@@ -74,17 +74,24 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
    specified in the scenario.
 2. The **candidate** opens next. Repeat the same steps with the same settings and window
    size. The runner gives each build its own fresh translation cache.
-3. At **REPORT READY** or **TEST INTERRUPTED**, review the ZIP at the printed path.
-   **Logs may contain your username, local file paths, or other sensitive information.**
-   On Linux, also check the logs inside the nested `.tar.gz` files. If you are comfortable
-   sharing the contents, send the ZIP privately to the requester before the temporary
-   folder is cleaned. You can send a written summary instead. For a partial report,
-   say which run stopped.
+3. At **REPORT READY** or **TEST INTERRUPTED**, read the summary for both builds.
+   It shows the build revisions, platform, recognized GPU vendor, launcher exits,
+   frame intervals and counts of recognized diagnostic messages. Timing covers all
+   completed reporting windows, including menus. A run without timing samples
+   says so. Tell the requester what you saw in the opening scene on each build.
+4. Press Enter to keep everything local, or choose a destination. Public sharing
+   previews the exact text and confirms the signed-in GitHub account and PR.
+   For private sharing, the filtered ZIP also contains per-window mean, median,
+   p95, longest frame time and stall counts for each build. You can open it
+   locally before sending. Choose **i** for the private upload page and select
+   the printed ZIP. Until a project inbox is configured, use the private destination
+   supplied by the requester. The runner saves both files in a temporary folder.
 
-Tell the requester what you saw on each build. For example, say whether the first
-scene showed roads and vehicles or only lights and subtitles. Include your OS,
-GPU and driver. Keep full logs and archives private. See the [asset policy](asset-policy.md)
-for what you can share on GitHub.
+**Raw logs may contain usernames, file paths, credentials or output from the title.**
+Keep `report.zip` local. Both sharing options use a fixed set of recognized
+fields. Unknown messages, command lines, hostnames, timestamps, screenshots and
+the request's free text are excluded. If the summary misses something, describe
+it in words. See the [asset policy](asset-policy.md).
 
 ## Requesting a hardware comparison
 

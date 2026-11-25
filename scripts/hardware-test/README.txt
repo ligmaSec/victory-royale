@@ -12,10 +12,12 @@ candidate with the same settings and window size. Each build gets a fresh
 translation cache. Add --plan to preview the instructions and build revisions.
 
 Logs may contain your username, local file paths, or other sensitive information.
-At REPORT READY or TEST INTERRUPTED, review the logs in report.zip, including
-the .tar.gz archives on Linux. Share the ZIP privately with the requester only
-if you are comfortable with its contents. You can send a written summary instead.
-The printed path is in a temporary folder. If a run stopped, say which one.
+At REPORT READY or TEST INTERRUPTED, review the on-screen summary. Press Enter
+to keep it local. You can post the summary to the PR under your GitHub account
+or choose [i] to send the filtered diagnostics ZIP privately. The ZIP contains the same summary
+and two frame-timing tables. Its printed path is in a temporary folder. Keep
+report.zip, which contains raw logs, on your machine. Tell the requester what
+you saw in each run.
 
 Both verified CI builds are included. You need Python 3.9 or newer. Linux
 also needs Bash and UMU (umu-run) and may download pinned vkd3d-proton on
