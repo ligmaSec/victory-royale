@@ -634,6 +634,16 @@ impl State {
         let Some(p) = self.bound_pipeline(false) else {
             return false;
         };
+        self.prepare_graphics(list, indexed, mesh, &p)
+    }
+
+    fn prepare_graphics(
+        &mut self,
+        list: &HostList,
+        indexed: bool,
+        mesh: bool,
+        p: &HostPipeline,
+    ) -> bool {
         if p.compute || p.mesh != mesh {
             once!(
                 mesh,
@@ -645,7 +655,7 @@ impl State {
             once!("a rectangle pipeline drawn with another topology");
             return false;
         }
-        if !self.bind(list, &p, false) {
+        if !self.bind(list, p, false) {
             return false;
         }
         let l = &list.list;
@@ -2152,6 +2162,20 @@ impl State {
             );
             return false;
         };
+        // Clamping charges the list budget and can empty subsequent records.
+        // Only record it after the target pipeline is available.
+        let Some(p) = self.bound_pipeline(kind == DISPATCH) else {
+            *dropped = "no host pipeline";
+            #[cfg(feature = "diagnostics")]
+            {
+                self.frame_op("indirect", kind == DISPATCH, false);
+                crate::pipeline::note_why(format!(
+                    "indirect kind {kind}: {}",
+                    crate::pipeline::drop_reason(self.pipeline as This)
+                ));
+            }
+            return false;
+        };
         args.refresh_as(list, arguments, len, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
@@ -2172,38 +2196,23 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
-            DISPATCH => match self.bound_pipeline(true) {
-                Some(p) if p.compute => self.bind(list, &p, true),
-                _ => false,
-            },
+            DRAW | INDEXED | MESH => self.prepare_graphics(list, kind == INDEXED, kind == MESH, &p),
+            DISPATCH => p.compute && self.bind(list, &p, true),
             _ => false,
         };
         #[cfg(feature = "diagnostics")]
         self.frame_op("indirect", kind == DISPATCH, ran);
         if !ran {
-            let p = self.bound_pipeline(kind == DISPATCH);
-            *dropped = if p.is_none() {
-                "no host pipeline"
-            } else if kind == DISPATCH {
+            *dropped = if kind == DISPATCH {
                 "prepare/bind failed (compute)"
             } else {
                 "prepare/bind failed"
             };
             #[cfg(feature = "diagnostics")]
-            match &p {
-                // Named so the frame's table says which drops are indirect
-                // executions, and which shader keeps them from running.
-                None => crate::pipeline::note_why(format!(
-                    "indirect kind {kind}: {}",
-                    crate::pipeline::drop_reason(self.pipeline as This)
-                )),
-                Some(p) => why(&format!(
-                    "prepare failed (compute {}, mesh {})",
-                    p.compute, p.mesh
-                )),
-            }
+            why(&format!(
+                "prepare failed (compute {}, mesh {})",
+                p.compute, p.mesh
+            ));
             return false;
         }
         #[cfg(feature = "diagnostics")]
