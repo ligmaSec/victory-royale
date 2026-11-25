@@ -375,7 +375,7 @@ class HardwareRequest(unittest.TestCase):
             return "a"
         for destination in ("i", "p"):
             self.outgoing_zip("original")
-            choices = iter(["r", None, destination, "y"])
+            choices = iter(["r", None, destination, "y", "k"])
             def choose(prompt):
                 return next(choices) or edit(prompt)
             with mock.patch.object(sys.stdin, "isatty", return_value=True), \

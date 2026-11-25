@@ -13,6 +13,8 @@ import zipfile
 
 REPO = "ligmaSec/victory-royale"
 REGISTRATION = "victory-royale-hardware-report-key.txt"
+MAX_COLLECTED_CIPHER = 16 * 1024 * 1024
+RECEIPT_HEADER = "VIctory encrypted collection receipt v1\n"
 AGE_RELEASE = "v1.3.2"
 AGE_PACKAGES = {
     "linux": ("linux-amd64.tar.gz", "cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10"),

@@ -35,7 +35,10 @@ send the maintainer the comment link. When publishing on someone’s behalf, ent
 that link in the workflow’s **requester_comment** field. For your own request,
 leave it empty. Check the requester shown by `--plan` before inviting testers.
 The requester’s Gist notification includes the command to decrypt the reviewed
-ZIP in their own `~/uploads`. [Setup, rotation and report retrieval](docs/testing.md#receive-private-hardware-reports).
+ZIP in their own `~/uploads`. For automatic pickup run
+`python3 scripts/hardware-test/report-inbox.py collect --watch` on the machine with the requester key.
+Testers may opt into a public encrypted receipt after sending. Their username and posting time
+are visible on the requester’s key Gist. Keep this optional when recruiting testers. [Setup, rotation and report retrieval](docs/testing.md#receive-private-hardware-reports).
 
 When you ask for testers on a pull request, add the `tester wanted` label to
 the PR. If you cannot set labels, ask a maintainer in the same request. Say
