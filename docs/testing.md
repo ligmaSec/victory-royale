@@ -117,7 +117,9 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
    Keep the receipt if notification fails. You can delete the gist from your account.
 
 **Raw logs may contain usernames, file paths, credentials or output from the title.**
-Keep `report.zip` local. The initial export uses a fixed set of recognized
+Keep `report.zip` local. When vkd3d-proton rejects a shader wave size, the
+summary counts driver messages by required and supported lane ranges. Repeated
+creation attempts can count more than once. The initial export uses a fixed set of recognized
 fields. Unknown messages, command lines, hostnames, wall-clock timestamps, screenshots and
 the request's free text are excluded. If the summary misses something, describe
 it in words. See the [asset policy](asset-policy.md).

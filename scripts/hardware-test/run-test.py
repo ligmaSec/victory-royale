@@ -1,5 +1,6 @@
 """Find and run a Series X hardware comparison for VIctory. Python 3.9+."""
 import argparse
+from collections import Counter
 import csv
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -44,6 +45,11 @@ SUBMISSION = re.compile(rb"(?<![0-9.+-])" + re.escape(SUBMISSION_FORMAT)
 SUBMISSION_COLUMNS = ("fps", "ms_per_frame", "preparing_ms", "buffer_copy_ms", "buffer_copy_mb",
                       "texture_ms", "texture_mb", "gpu_wait_ms", "copy_back_ms", "copy_back_mb",
                       "draws_per_frame", "dropped_per_frame", "pipelines_being_made", "indirect_per_frame")
+# vkd3d-proton reports the shader and adapter ranges at pipeline creation.
+# Accept only legal lane counts, so the summary never copies driver text.
+LANES = rb"(4|8|16|32|64|128)"
+WAVE_RANGES = re.compile(rb"\bd3d12_device_validate_shader_meta: Required WaveSize range \[" + LANES + b", " + LANES
+                         + rb"\], but supported range is \[" + LANES + b", " + LANES + rb"\]\.$")
 VENDORS = {b"0x1002": "AMD", b"0x10de": "NVIDIA", b"0x8086": "Intel", b"0x1414": "Microsoft"}
 EVENTS = {b"shader does not translate": "shader refusal",
           b"host compute pipeline refused": "compute pipeline refusal",
@@ -403,12 +409,23 @@ class Timeline:
         return False
 
 
+def wave_range(raw):
+    if b"Required WaveSize range" in raw:
+        match = WAVE_RANGES.search(ANSI.sub(b"", raw).rstrip())
+        if match:
+            lo, hi, amin, amax = map(int, match.groups())
+            if lo <= hi and amin <= amax and (hi < amin or lo > amax):
+                return lo, hi, amin, amax
+    return None
+
+
 def read_metrics(stream, frame_log, submission_log, timeline):
     """Count diagnostic messages and completed, non-overlapping present windows."""
     frames = windows = slow = stalls = submissions = 0
     shader_seen = False
     elapsed = longest = 0.0
     counts = {}
+    wave_ranges = Counter()
     vendor = None
     for raw in stream:
         if b"present intervals:" in raw:
@@ -432,6 +449,9 @@ def read_metrics(stream, frame_log, submission_log, timeline):
                 submission_log.writerow([value.decode("ascii") for value in match.groups()])
                 submissions += 1
                 timeline.record(ANSI.sub(b"", raw), "submission sample", sample=submissions)
+        elif b"Required WaveSize range" in raw:
+            if limits := wave_range(raw):
+                wave_ranges[limits] += 1
         elif b"host D3D12 device ready" in raw:
             match = re.search(rb"\bvendor=(0x[0-9a-f]{4})\b", ANSI.sub(b"", raw))
             if match:
@@ -452,13 +472,28 @@ def read_metrics(stream, frame_log, submission_log, timeline):
         rows.append("Frame timings: unavailable")
     if counts:
         rows.append("Log messages: " + ", ".join(f"{name}: {counts[name]}" for name in sorted(counts)))
-    return rows, bool(frames or submissions or counts or vendor or shader_seen)
+    return rows, bool(frames or submissions or counts or vendor or shader_seen), wave_ranges
 
 
 def side_metrics(results, side, windows, frame_log, submission_log, timeline):
     console = results / (side + ".log")
     if not console.is_file():
         return ["No console log recorded"]
+    rows = []
+    recognized = False
+    waves = Counter()
+
+    def consume(stream):
+        nonlocal rows, recognized, waves
+        # Timing and driver output may be split or mirrored. Use one log per
+        # measurement and prefer the log with VIctory timings when it has both.
+        if not recognized:
+            rows, recognized, found = read_metrics(stream, frame_log, submission_log, timeline)
+            if found and (recognized or not waves):
+                waves = found
+        elif not waves:
+            waves = Counter(limits for line in stream if (limits := wave_range(line)))
+
     if not windows:
         archive = results / (side + ".tar.gz")
         if archive.is_file():
@@ -473,14 +508,17 @@ def side_metrics(results, side, windows, frame_log, submission_log, timeline):
                     for name in ("steam-victory.log", *other_steam, "launcher.log"):
                         if name in logs:
                             with bundle.extractfile(logs[name]) as stream:
-                                rows, recognized = read_metrics(stream, frame_log, submission_log, timeline)
-                            if recognized:
-                                return rows
+                                consume(stream)
+                            if recognized and waves:
+                                break
             except (OSError, EOFError, tarfile.TarError):
                 pass
-    with console.open("rb") as stream:
-        rows, _ = read_metrics(stream, frame_log, submission_log, timeline)
-        return rows
+    if not (recognized and waves):
+        with console.open("rb") as stream:
+            consume(stream)
+    for (lo, hi, amin, amax), count in sorted(waves.items()):
+        rows.append(f"Wave-size rejection messages: {count} (shader {lo}–{hi} lanes, adapter {amin}–{amax})")
+    return rows
 
 
 def diagnostic_summary(request, results, windows, complete, destination):
