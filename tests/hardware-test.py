@@ -93,11 +93,17 @@ class HardwareRequest(unittest.TestCase):
                 mock.patch("builtins.input", return_value=""), \
                 mock.patch.object(runner, "run_request", side_effect=AssertionError), \
                 mock.patch.object(runner, "github_rows") as github, contextlib.redirect_stdout(io.StringIO()) as out:
-            github.side_effect = [[{"number": 7, "title": "First scene", "head": "current"}],
+            github.side_effect = [[{"number": 7, "title": "First scene", "head": "current", "wanted": False},
+                                   {"number": 8, "title": "Check lights", "head": "other", "wanted": True},
+                                   {"number": 11, "title": "Other PR", "head": "other", "wanted": False}],
                                   [10, 12], [], [{"name": "victory-series-x-pr-9"},
                                                    {"name": "victory-series-x-pr-7"}]]
             runner.run()
             self.assertIn("#7  First scene", out.getvalue())
+            self.assertIn("kit available", out.getvalue())
+            self.assertIn("#8  Check lights", out.getvalue())
+            self.assertIn("/pull/8", out.getvalue())
+            self.assertNotIn("#11", out.getvalue())
             self.assertNotIn("#9", out.getvalue())
             self.assertIn("hardware-request.yml/runs?branch=main&event=workflow_dispatch&status=success",
                           github.call_args_list[1].args[0])
@@ -105,7 +111,16 @@ class HardwareRequest(unittest.TestCase):
             self.assertIn("expired == false", github.call_args_list[2].args[1])
             github.side_effect = [[]]
             runner.run()
-            self.assertIn("no published Series X", out.getvalue())
+            self.assertIn("no open Series X", out.getvalue())
+
+    def test_request_without_main_kit(self):
+        request = {8: ({"title": "Check lights", "wanted": True}, None, None)}
+        with mock.patch.object(runner, "hardware_requests", return_value=request), \
+                mock.patch.object(runner.subprocess, "run", side_effect=AssertionError), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertIsNone(runner.select_published(8, False, self.root))
+            self.assertIn("/pull/8", out.getvalue())
+            self.assertIn("no unexpired kit published from main", out.getvalue())
 
     def test_published_request(self):
         available = {7: ({"title": "First scene", "head": "current"}, 12, "victory-series-x-pr-7")}
@@ -117,7 +132,7 @@ class HardwareRequest(unittest.TestCase):
         with mock.patch.object(runner, "ROOT", self.root / "checkout"), \
                 mock.patch.object(sys, "argv", ["runner", "7", "--plan"]), \
                 mock.patch.object(subprocess, "run", side_effect=download), \
-                mock.patch.object(runner, "published_requests", return_value=available), \
+                mock.patch.object(runner, "hardware_requests", return_value=available), \
                 mock.patch.object(runner, "github_rows", return_value=parents), \
                 mock.patch.object(runner, "launch", side_effect=AssertionError), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
@@ -133,6 +148,12 @@ class HardwareRequest(unittest.TestCase):
             self.manifest.write_text(json.dumps(dict(self.request, pr=8)))
             with self.assertRaisesRegex(ValueError, "different PR"):
                 runner.run()
+
+    def test_explicit_preview_requires_a_kit(self):
+        with mock.patch.object(sys, "argv", ["runner", "7", "--plan"]), \
+                mock.patch.object(runner, "select_published", return_value=None), \
+                self.assertRaisesRegex(ValueError, "no published kit to preview"):
+            runner.run()
 
     def test_checkout_zip_and_extracted_kit_offline(self):
         archive = self.root / "Series X kit.zip"

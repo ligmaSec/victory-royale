@@ -29,7 +29,10 @@ using the [test report form](https://github.com/ligmaSec/victory-royale/issues/n
 When you ask for testers on a pull request, add the `tester wanted` label to
 the PR. If you cannot set labels, ask a maintainer in the same request. Say
 which configurations still need a run and remove the label when those results
-are in or the request is withdrawn.
+are in or the request is withdrawn. For a test that runs by PR number, publish
+the [matched kit](docs/testing.md#run-a-series-x-hardware-test) from `main` and
+check `python3 scripts/hardware-test/run-test.py PR_NUMBER --plan` before sharing
+the command. Put any manual test instructions in the PR.
 
 ## Help by reviewing pull requests
 
