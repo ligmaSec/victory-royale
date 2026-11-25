@@ -972,7 +972,7 @@ impl State {
         let host = heap.host()?;
         // The console forms this byte offset with a 32-bit shift by five.
         let Some(read) = heap.selected_buffer(selected & (u32::MAX >> 5)) else {
-            return Some([self.raw_slot(host, key, RawAccess::Read, None)?, 0, 0]);
+            return Some([self.raw_slot(host, key, RawAccess::Read, None)? << 4, 0, 0]);
         };
         let offset = read.shadow.offset(read.address);
         let bias = offset % 16;
@@ -990,7 +990,9 @@ impl State {
         };
         read.shadow
             .refresh_as(list, read.address, read.bytes, state);
-        Some([index, read.stride, bias as u32])
+        // VIEW_HEAP_LIMIT leaves room for the four-bit alignment bias.
+        const { assert!(victory_shader::emit::VIEW_HEAP_LIMIT <= 1 << 28) };
+        Some([(index << 4) | bias as u32, read.stride, read.bytes as u32])
     }
 
     /// Bind a raw view of the remaining host buffer. A writable view, its
@@ -4886,7 +4888,7 @@ mod structured_alias_tests {
         let desc = HeapDesc {
             desc: D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 4,
+                NumDescriptors: 6,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             },
@@ -4911,8 +4913,9 @@ mod structured_alias_tests {
         resource[0] = 1;
         resource[4] = 256;
         // The first view starts at byte 12 and has stride 12. The second starts
-        // at byte 32 and has stride 32. The last contains only one record.
-        for (slot, stride, count) in [(1, 12, 2), (2, 32, 2), (3, 16, 1)] {
+        // at byte 32 and has stride 32. The last two test reads starting just
+        // past a view and reads straddling its final dword.
+        for (slot, stride, count) in [(1, 12, 2), (2, 32, 2), (3, 16, 1), (4, 20, 1), (5, 8, 2)] {
             let mut words = [0u32; 16];
             words[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
             words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -4928,7 +4931,7 @@ mod structured_alias_tests {
                 heap.start + slot * 32,
             );
         }
-        let (buffer, mapped) = host.readback_buffer(48).unwrap();
+        let (buffer, mapped) = host.readback_buffer(64).unwrap();
         let mut state = State::default();
         state.set_heaps(&[views]);
         let list = host.new_list().unwrap();
@@ -4937,6 +4940,8 @@ mod structured_alias_tests {
             (1, 1),
             (2, 1),
             (3, 1),
+            (4, 1),
+            (5, 1),
             (99, 1),
             (2, 0x0800_0001),
             (1, 0x1555_5555),
@@ -4964,14 +4969,16 @@ mod structured_alias_tests {
         }
         list.close();
         host.execute(&[&list]);
-        // SAFETY: the submission completed, and the mapped buffer holds six pairs of dwords.
-        let got = unsafe { mapped.cast::<[[u32; 2]; 6]>().read_unaligned() };
+        // SAFETY: the submission completed, and the mapped buffer holds eight pairs of dwords.
+        let got = unsafe { mapped.cast::<[[u32; 2]; 8]>().read_unaligned() };
         assert_eq!(
             got,
             [
                 [backing[7], backing[8]],
                 [backing[17], backing[18]],
                 [0; 2],
+                [0; 2],
+                [backing[5], 0],
                 [0; 2],
                 [0; 2],
                 [0; 2]
