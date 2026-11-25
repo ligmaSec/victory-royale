@@ -151,11 +151,21 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    // Only these synthetic Metal test sources may use Python or Swift.
+    // Allow specific source files used by the Metal tests and the PR review worker.
     // All size, magic, NUL and encoded-data checks still apply.
     let allowed = matches!(
         path,
-        "tests/metal/generate.py" | "tests/metal/run.py" | "tests/metal/probe.swift"
+        "tests/metal/generate.py"
+            | "tests/metal/run.py"
+            | "tests/metal/probe.swift"
+            | "mistral/security-audit/Dockerfile"
+            | "mistral/security-audit/.dockerignore"
+            | "mistral/security-audit/src/security_audit_worker/__init__.py"
+            | "mistral/security-audit/src/security_audit_worker/review.py"
+            | "mistral/security-audit/src/security_audit_worker/worker.py"
+            | "mistral/security-audit/src/security_audit_worker/workflows/__init__.py"
+            | "mistral/security-audit/src/security_audit_worker/workflows/pr_security_audit.py"
+            | "mistral/security-audit/tests/test_audit.py"
     ) || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
