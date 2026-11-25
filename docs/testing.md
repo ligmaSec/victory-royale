@@ -97,8 +97,8 @@ adds `tester wanted` to the PR. If verification fails, fix the reported problem
 and republish the kit before inviting testers. Once verified, send the tester the
 checkout command for their OS with the PR number appended, plus the private report
 destination. Tell testers that logs can contain usernames, local paths and other
-sensitive information, and that they can reply with a written summary. For a manual
-test with its own instructions, add `tester wanted` yourself.
+sensitive information, and that they can reply with a written summary. For manual tests, add the
+`tester wanted` label to the PR while the request is open.
 The menu also lists the request. If the PR head changes or the kit
 expires, publish a fresh kit for the current revision.
 
