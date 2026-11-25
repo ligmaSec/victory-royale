@@ -234,6 +234,12 @@ Nothing from the title's data belongs in the report: no shader dumps, no
 frames, no memory, per [docs/asset-policy.md](docs/asset-policy.md). Names of
 our own functions, error codes and timings are enough to start.
 
+## Contributing
+
+A first contribution can be a test result from your machine. The
+[testing and reporting guide](CONTRIBUTING.md#help-by-testing) covers how to
+pick a test, confirm an existing issue, or report a new failure.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).

@@ -1,0 +1,36 @@
+name: Test report
+description: Report a failure from a game run, build, or synthetic test.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for testing VIctory. Give your issue a title that names the symptom and where it happened.
+        If an [existing issue](https://github.com/ligmaSec/victory-royale/issues) matches, add your result there.
+        Fill in what you observed. “Unknown” is fine for details you could not collect.
+  - type: textarea
+    id: environment
+    attributes:
+      label: Build and environment
+      description: Give the VIctory commit, CI run or executable hash, build profile, and OS version. For game runs, include the title version, CPU, GPU and driver. For Proton runs, include the UMU and Proton versions.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include the command or test name, any changed settings, and the actions leading up to the failure. Use placeholders for personal paths.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and observed result
+      description: What did you expect? What was the last step that worked, and what happened next? Mention if you closed the process yourself. If you already compared another build or machine, include that result.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Error or diagnostic excerpt
+      description: Paste a short, reviewed excerpt from this run with the error code and nearby lines. If there was no error text, give the exit status or last visible stage. Keep full archives, dumps, screenshots and game output local. Remove credentials and personal paths.
+      render: text

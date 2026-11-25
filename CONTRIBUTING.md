@@ -1,4 +1,29 @@
-# Developing VIctory
+# Contributing to VIctory
+
+## Help by testing
+
+If this is your first contribution, try one test and tell us what happened.
+You can help without writing a patch. A result from a second machine can
+show whether a failure follows a particular build, GPU driver, or setting.
+
+- **Have a game and a Linux workstation?** Install UMU (`umu-run`) and extract a tested
+  [Proton build](docs/testing.md#ci-and-build-downloads). From its `victory`
+  directory, run `./victory-proton.sh --report "/path/to/title.exe"`.
+  If you built from a checkout, use the same arguments with
+  `./scripts/victory-proton.sh`.
+- **Testing on Windows?** Follow the [Windows build and launch instructions](README.md#getting-started).
+  Keep the terminal output from the run. For a crash, check the newest entry
+  in the title's `crashes.log` and confirm its timestamp matches your run.
+- **Have a checkout but no game files?** On Linux, `bash tests/proton-launcher.sh`
+  exercises the launcher without Wine or a GPU. With the Rust toolchain installed,
+  `cargo test --workspace --locked` runs the workspace tests. If a test fails,
+  record its name and the first error.
+
+[Search existing issues](https://github.com/ligmaSec/victory-royale/issues) for the
+symptom or error. If someone has reported it, reply there with your build,
+hardware, and result. A successful run on a machine where a fix needed checking
+is worth posting too. For a new failure, open **one issue per distinct symptom**
+using the [test report form](https://github.com/ligmaSec/victory-royale/issues/new?template=test-report.yml).
 
 ## Game data
 
@@ -37,16 +62,27 @@ cargo xtask policy
 
 ## Report a failure
 
-For a Linux workstation run, use `./scripts/victory-proton.sh --report "/path/to/title.exe"`
-from the checkout, or `./victory-proton.sh --report "/path/to/title.exe"` inside
-the extracted build. The launcher prints the archive path when it exits.
-Review the logs locally and share the relevant error and observations according
-to the asset policy above.
+Give the issue a title someone else could search for, such as “Proton exits
+as the loading screen opens”. Include enough detail to repeat your run:
 
-Include the VIctory commit, build profile, operating system and, on Linux, Proton version, CPU, GPU and
-driver. Give the command or settings needed to reproduce the problem, the
-last stage that worked, and the exact error code if there is one. Replace
-personal paths with placeholders. When you compare two builds, use the same
-settings and give both commit IDs.
+1. Identify the build (commit or CI run, release or diagnostics) and your
+   environment. For a game run, include the title version, OS, CPU, GPU and
+   driver. On Linux, add the UMU and Proton versions when applicable.
+2. Give the command or shortest sequence of steps, including changed settings.
+   Describe what you expected, the last stage that worked, what you saw next,
+   and whether the process exited, hung, or you closed it. If you already
+   compared builds, give both revisions and the result with the same settings.
+3. Quote the relevant error with a few surrounding lines from that run. On
+   Linux, `--report` prints a local archive path. Inside it, `build.txt`
+   identifies the executable, `launcher-exit.txt` records the exit status,
+   and `launcher.log` and any `steam-*.log` hold the output. If the process
+   stopped silently, say so and include the last stage or exit code you saw.
+
+Keep the full archive local. Share only reviewed excerpts allowed by the
+[asset policy](docs/asset-policy.md). Replace usernames and personal paths
+with placeholders and remove credentials and any output from the title itself.
+If you use an AI assistant to draft the report, verify its commands, versions,
+and error codes against your run. Mark missing details as unknown. A single
+observed failure is enough to open an issue.
 
 For graphics failures, see [Reporting a GPU failure](README.md#reporting-a-gpu-failure).
