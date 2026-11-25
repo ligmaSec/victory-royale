@@ -14,6 +14,30 @@ contention for the graphics driver. Both jobs run Clippy. See the
 The workspace suite includes the [asset-policy check](asset-policy.md).
 Run `cargo xtask install-hooks` to enable it on commit.
 
+## CI and private builds
+
+CI runs for pull requests, merge groups, and pushes to `main`. The **Regression
+gate** requires formatting, workflow and shell lint, asset policy, Linux and
+Windows workspace tests, the declared minimum Rust version, and the distribution
+test to pass. Failed, skipped, and cancelled prerequisite jobs fail the gate.
+
+The distribution job builds the x86-64 Windows release on Linux and checks that
+all three compiled DXIL helpers are present in the executable. It unpacks the
+archive, exercises the launcher with a fake UMU, and runs the packaged executable
+under Wine against synthetic PE fixtures. The suite checks import binding, TLS,
+threads, memory, DLL loading, and expected title return codes. Game rendering and
+the full UMU/Proton runtime still require a separate workstation test.
+
+Successful main builds deliver a private Actions artifact named
+`victory-proton-x86_64-<commit>` for 14 days. Download it from the CI run,
+unzip the Actions download, and run the following in the extracted directory.
+
+```sh
+sha256sum --check SHA256SUMS
+tar -xf victory-proton-x86_64.tar.gz
+./victory/victory-proton.sh "/path/to/game/title.exe" --execute
+```
+
 ## What the host needs
 
 The Windows graphics tests create a Direct3D 12 device.

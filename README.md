@@ -12,7 +12,8 @@ it can and on first use where it must (shaders). See
 [docs/architecture.md](docs/architecture.md).
 
 The Windows executable can also be launched under Proton on x86-64 Linux. See
-[Running with the Proton launcher](docs/proton-launcher.md).
+[Running with the Proton launcher](docs/proton-launcher.md). Private builds and checksums are
+available from [successful main CI runs](docs/testing.md#ci-and-private-builds).
 
 ## Status
 
