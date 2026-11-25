@@ -56,6 +56,11 @@ tar -xf victory-proton-x86_64.tar.gz
 ## Run a Series X hardware test
 
 You'll need Python 3.9 or newer and your own title executable outside the VIctory checkout.
+> [!WARNING]
+> **Logs may contain sensitive information**, including usernames, local file paths,
+> credentials and output from the game. Review the filtered report before sharing.
+> Keeping all results local is always an option.
+
 On Linux, install Bash and UMU (`umu-run`). The Proton launcher may download its pinned
 runtime on first use.
 
@@ -74,17 +79,37 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
    specified in the scenario.
 2. The **candidate** opens next. Repeat the same steps with the same settings and window
    size. The runner gives each build its own fresh translation cache.
-3. At **REPORT READY** or **TEST INTERRUPTED**, review the ZIP at the printed path.
-   **Logs may contain your username, local file paths, or other sensitive information.**
-   On Linux, also check the logs inside the nested `.tar.gz` files. If you are comfortable
-   sharing the contents, send the ZIP privately to the requester before the temporary
-   folder is cleaned. You can send a written summary instead. For a partial report,
-   say which run stopped.
+3. At **REPORT READY** or **TEST INTERRUPTED**, read the summary for both builds.
+   It shows the build revisions, platform, recognized GPU vendor, launcher exits,
+   frame intervals and counts of recognized diagnostic messages. Timing covers all
+   completed reporting windows, including menus. A run without timing samples
+   says so. Tell the requester what you saw in the opening scene on each build.
+4. Press Enter to keep everything local, or choose a destination. Public sharing
+   previews the exact text and confirms the signed-in GitHub account and PR.
+   For private sharing, the filtered ZIP also contains per-window mean, median,
+   p95, longest frame time and stall counts for each build. Separate submission
+   samples record time spent on CPU preparation, buffer and texture copies,
+   GPU waits and copy-back, alongside draw and pipeline-drop counts. The private
+   event timeline connects shader binds, translations and pipeline results to
+   those samples through elapsed times and shader numbers shared across the pair.
+   You can inspect the filtered ZIP in the printed temporary `share` folder.
+5. For **Send encrypted report**, install GitHub CLI and sign in to github.com
+   with permission to create gists (`gh auth login --hostname github.com --scopes gist`).
+   For an existing CLI login, `gh auth refresh --hostname github.com --scopes gist`
+   adds the scope. The runner shows the account and maintainer. Choose **i**
+   to encrypt the ZIP locally and send it. The runner downloads the pinned,
+   checksum-verified x86-64 age tool. [Official age release](https://github.com/FiloSottile/age/releases/tag/v1.3.2).
+   GitHub stores the encrypted file in an unlisted gist owned by your account.
+   A mention on the gist notifies the maintainer. Your account, gist size and
+   upload time are visible to GitHub. Anyone with the URL can retrieve the
+   ciphertext. The maintainer's private age key is needed to read its contents.
+   Keep the receipt if notification fails. You can delete the gist from your account.
 
-Tell the requester what you saw on each build. For example, say whether the first
-scene showed roads and vehicles or only lights and subtitles. Include your OS,
-GPU and driver. Keep full logs and archives private. See the [asset policy](asset-policy.md)
-for what you can share on GitHub.
+**Raw logs may contain usernames, file paths, credentials or output from the title.**
+Keep `report.zip` local. Both sharing options use a fixed set of recognized
+fields. Unknown messages, command lines, hostnames, wall-clock timestamps, screenshots and
+the request's free text are excluded. If the summary misses something, describe
+it in words. See the [asset policy](asset-policy.md).
 
 ## Requesting a hardware comparison
 

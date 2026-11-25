@@ -200,14 +200,22 @@ class HardwareRequest(unittest.TestCase):
                 mock.patch.object(shutil, "which", return_value="tool"), \
                 mock.patch.object(runner, "launch", side_effect=launched), contextlib.redirect_stdout(stdout):
             runner.run()
-        report, = temp.rglob("*.zip")
+        report, = temp.rglob("report.zip")
         self.assertEqual(list(temp.iterdir()), [report.parent])
         self.assertIn("REPORT READY", stdout.getvalue())
         blocks = stdout.getvalue().split("REPORT READY")
-        self.assertIn("LOG PRIVACY", blocks[0].split("RUN 1 OF 2")[0])
-        self.assertIn("sensitive information", " ".join(blocks[1].split()))
+        self.assertIn(runner.PRIVACY_HEADING, " ".join(blocks[0].split("RUN 1 OF 2")[0].split()))
+        self.assertIn(runner.PRIVACY_HEADING, " ".join(blocks[1].split()))
         self.assertIn("written summary", " ".join(blocks[1].split()))
-        self.assertEqual(stdout.getvalue().rstrip().splitlines()[-1], f"Upload: {report}")
+        self.assertIn(f"Local logs: {report}", stdout.getvalue())
+        filtered, = temp.rglob("*-diagnostics.zip")
+        self.assertIn(f"Filtered diagnostics: {filtered}", stdout.getvalue())
+        self.assertEqual(filtered.parent.name, "share")
+        self.assertEqual(list(filtered.parent.iterdir()), [filtered])
+        with zipfile.ZipFile(filtered) as archive:
+            self.assertEqual(set(archive.namelist()), {"summary.txt", "main-frames.csv", "candidate-frames.csv",
+                                                       "main-submissions.csv", "candidate-submissions.csv",
+                                                       "main-events.csv", "candidate-events.csv"})
         with zipfile.ZipFile(report) as archive:
             self.assertEqual(set(archive.namelist()), {"request.json", "main.log", "candidate.log"})
 
@@ -232,11 +240,154 @@ class HardwareRequest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "interruption"):
             self.run_pair(fail, stdout)
         notice = " ".join(stdout.getvalue().split("TEST INTERRUPTED")[1].split())
-        self.assertIn("sensitive information", notice)
+        self.assertIn(runner.PRIVACY_HEADING, notice)
         self.assertIn("written summary", notice)
         partial, = set(self.output.glob("*/report.zip")) - set(bundles)
         with zipfile.ZipFile(partial) as archive:
             self.assertEqual(set(archive.namelist()), {"request.json", "main.log"})
+
+    def test_sensitive_information_banner_is_red_only_on_color_terminals(self):
+        for tty, term, no_color, expected in [(True, "xterm", False, True), (False, "xterm", False, False),
+                                             (True, "dumb", False, False), (True, "xterm", True, False)]:
+            env = {"TERM": term, "COLUMNS": "52"}
+            if no_color:
+                env["NO_COLOR"] = "1"
+            with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(io.StringIO()) as out, \
+                    mock.patch.object(out, "isatty", return_value=tty), mock.patch.object(sys, "platform", "linux"):
+                runner.instruction_block(runner.PRIVACY_HEADING, runner.LOG_PRIVACY)
+            text = out.getvalue()
+            self.assertEqual("\x1b[1;91m" in text, expected)
+            self.assertEqual("\x1b[0m" in text, expected)
+            self.assertIn(runner.PRIVACY_HEADING, text)
+            self.assertIn("credentials", text)
+
+    def test_filtered_result_keeps_only_numeric_windows_and_fixed_diagnostics(self):
+        request = dict(self.request, scenario="private scenario")
+        private = b"private_name private@example.test /home/private/ C:\\Users\\private 192.0.2.10 secret=value"
+        window = (b"present intervals: 2 frames, mean 750.00 ms, median 750.00 ms, p95 1400.00 ms, "
+                  b"longest 1400.00 ms, 1 over 100 ms, 1 over 1 s")
+        submission = (b"2.0 fps, 500.0 ms/frame (400.5 preparing: copies 380.0 ms 10.5 MB, "
+                      b"textures 5.0 ms 1.0 MB; 33.0 on the GPU; 4.0 copying back 2.0 MB), 123 draws/frame, "
+                      b"dropped 4 without a host pipeline (2 being made) and 1 indirect")
+        log = b"\n".join([private, submission, submission + private, b"host D3D12 device ready adapter=" + private + b" vendor=0x1002",
+                          b"shader does not translate: " + private, window, window + b" " + private])
+        for windows in (True, False):
+            destination = self.root / str(windows)
+            destination.mkdir()
+            (self.root / "main.log").write_bytes(log if windows else private)
+            (self.root / "main-exit.txt").write_text("42")
+            (self.root / "candidate-exit.txt").write_bytes(private)
+            if not windows:
+                with tarfile.open(self.root / "main.tar.gz", "w:gz") as tar:
+                    for name in ("./launcher.log", "./steam-victory.log", "./private.txt"):
+                        member = tarfile.TarInfo(name)
+                        member.size = len(log)
+                        tar.addfile(member, io.BytesIO(log))
+            body = runner.diagnostic_summary(request, self.root, windows, False, destination)
+            timings = (destination / "main-frames.csv").read_text()
+            self.assertIn("Partial comparison", body)
+            self.assertIn("GPU vendor: AMD", body)
+            self.assertIn("Mean: 750.00 ms/frame (1.33 FPS)", body)
+            self.assertIn("shader refusal: 1", body)
+            self.assertIn("Launcher exit: 42", body)
+            self.assertIn("Launcher exit: unreported", body)
+            self.assertIn("1,2,750.0,750.0,1400.0,1400.0,1,1", timings)
+            submissions = (destination / "main-submissions.csv").read_text().splitlines()
+            self.assertEqual(len(submissions), 2)
+            self.assertEqual(submissions[-1], "2.0,500.0,400.5,380.0,10.5,5.0,1.0,33.0,4.0,2.0,123,4,2,1")
+            for value in ("private", "192.0.2.10", "secret=value"):
+                self.assertNotIn(value, body + timings + "".join(submissions))
+
+    def test_proton_uses_recognized_output_with_a_nondefault_game_id(self):
+        (self.root / "main.log").write_bytes(b"wrapper")
+        header = b"Proton header only"
+        log = b"shader does not translate: synthetic refusal"
+        for steam, launcher in ((log, header), (header, log)):
+            with tarfile.open(self.root / "main.tar.gz", "w:gz") as tar:
+                for name, contents in (("./steam-victory.log", header), ("./steam-custom.log", steam),
+                                       ("./launcher.log", launcher)):
+                    member = tarfile.TarInfo(name)
+                    member.size = len(contents)
+                    tar.addfile(member, io.BytesIO(contents))
+            with tempfile.TemporaryDirectory() as output:
+                body = runner.diagnostic_summary(self.request, self.root, False, False, Path(output))
+            self.assertIn("shader refusal: 1", body)
+            self.assertNotIn("custom", body)
+
+    def test_public_post_requires_preview_and_uses_only_summary(self):
+        for tty, answers, posted in ((False, [], False), (True, [""], False),
+                                     (True, ["p", ""], False), (True, ["p", "y"], True)):
+            output = io.StringIO()
+            with mock.patch.object(sys.stdin, "isatty", return_value=tty), \
+                    mock.patch("builtins.input", side_effect=answers), \
+                    mock.patch.object(subprocess, "check_output", return_value="test-account"), \
+                    mock.patch.object(subprocess, "run") as send, contextlib.redirect_stdout(output):
+                runner.share_result(7, "Previewed result", self.root / "filtered.zip")
+            self.assertIn("Previewed result", output.getvalue())
+            self.assertEqual(send.called, posted)
+            if posted:
+                self.assertEqual(send.call_args.kwargs["input"], "Previewed result")
+                self.assertIn("github.com/" + runner.REPO, send.call_args.args[0])
+
+    def test_private_sharing_requires_a_pinned_key_login_and_explicit_choice(self):
+        safe = self.root / "filtered.zip"
+        for key, login, choice, sent in ((None, True, "i", False), ("configured", False, "i", False),
+                                         ("configured", True, "", False), ("configured", True, "i", True)):
+            with mock.patch.object(sys.stdin, "isatty", return_value=True), mock.patch.object(runner, "REPORT_RECIPIENT", key), \
+                    mock.patch.object(subprocess, "check_output", side_effect=None if login else FileNotFoundError,
+                                      return_value="fixture-account"), mock.patch("builtins.input", return_value=choice), \
+                    mock.patch.object(runner, "send_encrypted_report") as send, contextlib.redirect_stdout(io.StringIO()) as output:
+                runner.share_result(7, "Preview", safe)
+            self.assertEqual(send.called, sent)
+            if sent:
+                send.assert_called_once_with(safe, key)
+                self.assertIn("fixture-account", output.getvalue())
+
+    def test_gist_only_receives_ciphertext_and_a_failed_mention_preserves_the_receipt(self):
+        filtered = self.root / "report.zip"
+        filtered.write_bytes(b"private path and raw canary")
+        gist_id = "a" * 32
+        for notify_status in (0, 1):
+            def github(command, **kwargs):
+                self.assertEqual(command[:4], ["gh", "api", "--hostname", "github.com"])
+                body = json.loads(kwargs["input"])
+                if command[4] == "gists":
+                    self.assertEqual(body, {"public": False, "files": {"report.age": {"content": "ciphertext"}}})
+                    return subprocess.CompletedProcess(command, 0, stdout=gist_id)
+                self.assertEqual(command[4], f"gists/{gist_id}/comments")
+                self.assertEqual(list(body), ["body"])
+                self.assertIn("@" + runner.REPORT_MAINTAINER, body["body"])
+                self.assertNotIn("canary", body["body"])
+                return subprocess.CompletedProcess(command, notify_status)
+            with mock.patch.object(runner, "encrypt_report", return_value="ciphertext"), \
+                    mock.patch.object(subprocess, "run", side_effect=github) as api, contextlib.redirect_stdout(io.StringIO()) as out:
+                runner.send_encrypted_report(filtered, "recipient")
+            self.assertEqual(api.call_count, 2)
+            self.assertIn(f"https://gist.github.com/{gist_id}", out.getvalue())
+            self.assertIn("unsuccessful" if notify_status else "Notification posted", out.getvalue())
+        with mock.patch.object(runner, "encrypt_report", side_effect=ValueError("bad checksum")), \
+                mock.patch.object(subprocess, "run", side_effect=AssertionError), self.assertRaises(ValueError):
+            runner.send_encrypted_report(filtered, "recipient")
+
+    def test_private_timeline_correlates_builds_without_exporting_raw_identifiers(self):
+        import csv
+        shader = "0123456789abcdef"
+        for side, time in (("main", "2026-01-01T23:59:58"), ("candidate", "2026-03-04T12:00:06")):
+            outcome = "shader translated" if side == "candidate" else "shader does not translate; skipped"
+            logs = [f'{time}.100000Z first bind pipeline=0xabc frame=12 stage="compute" size=480 hash={shader}',
+                    f'{time}.350000Z {outcome} stage="compute" hash={shader} error=/home/private/file',
+                    f'{time}.400000Z starting host pipeline tid=ff shaders=[compute {shader}]',
+                    f'{time}.500000Z host pipeline \x1b[32mshaders\x1b[0m=[compute {shader}]']
+            (self.root / (side + ".log")).write_text("\n".join(logs))
+        body = runner.diagnostic_summary(self.request, self.root, True, True, self.root)
+        for side in ("main", "candidate"):
+            text = (self.root / (side + "-events.csv")).read_text()
+            rows = list(csv.DictReader(text.splitlines()))
+            self.assertEqual([(r["event"], r["elapsed_ms"], r["shader_id"]) for r in rows],
+                             [("first bind", "0", "1"), ("translated" if side == "candidate" else "translation refused",
+                               "250", "1"), ("pipeline ready", "400", "1")])
+            for forbidden in (shader, "2026-", "0xabc", "private"):
+                self.assertNotIn(forbidden, text + body)
 
     def test_platform_commands_and_cache_paths(self):
         for windows in (False, True):
