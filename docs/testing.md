@@ -42,7 +42,7 @@ unzip the Actions download, and run the following in the extracted directory.
 ```sh
 sha256sum --check SHA256SUMS
 tar -xf victory-proton-x86_64.tar.gz
-./victory/victory-proton.sh "/path/to/game/title.exe" --execute
+./victory/victory-proton.sh --run "/path/to/game/title.exe"
 ```
 
 ## What the host needs

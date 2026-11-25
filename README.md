@@ -23,6 +23,23 @@ World gameplay remains unplayable. On Windows a GPU hang can trigger a display
 driver reset. Use the diagnostics build with `VICTORY_D3D12_WARP=1` to
 investigate on the software adapter.
 
+## Run on Linux
+
+Install UMU (`umu-run`) and extract the verified Proton build from a successful
+`main` CI run. From the extracted `victory` directory, choose one command.
+
+```sh
+./victory-proton.sh --run "/path/to/title.exe"
+./victory-proton.sh --report "/path/to/title.exe"
+```
+
+`--report` launches once and prints the path to a compressed diagnostic archive
+when the process exits. Contributors running from source use
+`./scripts/victory-proton.sh --build` after installing the cross-toolchain,
+then the same commands with `./scripts/victory-proton.sh`.
+[Build downloads and checksums](docs/testing.md#ci-and-build-downloads) ·
+[Linux requirements and runtime options](docs/proton-launcher.md)
+
 ## Getting started
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with

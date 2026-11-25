@@ -37,6 +37,12 @@ cargo xtask policy
 
 ## Report a failure
 
+For a Linux workstation run, use `./scripts/victory-proton.sh --report "/path/to/title.exe"`
+from the checkout, or `./victory-proton.sh --report "/path/to/title.exe"` inside
+the extracted build. The launcher prints the archive path when it exits.
+Review the logs locally and share the relevant error and observations according
+to the asset policy above.
+
 Include the VIctory commit, build profile, operating system and, on Linux, Proton version, CPU, GPU and
 driver. Give the command or settings needed to reproduce the problem, the
 last stage that worked, and the exact error code if there is one. Replace
