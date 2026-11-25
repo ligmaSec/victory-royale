@@ -8167,6 +8167,7 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        let mut remaining = None;
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
@@ -8192,7 +8193,11 @@ impl<'a> Lower<'a> {
                 .flatten();
             match (index, selector) {
                 (Some(index), Some((slot, word))) => {
-                    let [alias, stride, bias] = self.selected_buffer(slot, word)?;
+                    let [packed, stride, length] = self.selected_buffer(slot, word)?;
+                    let four = self.s.m.i32(4);
+                    let low = self.s.m.i32(15);
+                    let alias = self.s.m.bin(c, Bin::LShr, packed, four);
+                    let bias = self.s.m.bin(c, Bin::And, packed, low);
                     let start = self.s.m.bin(c, Bin::Mul, index, stride);
                     let offset = self.s.m.bin(c, Bin::Add, start, off);
                     let byte = self.s.m.bin(c, Bin::Add, offset, bias);
@@ -8201,14 +8206,14 @@ impl<'a> Lower<'a> {
                     let zero = self.s.m.i32(0);
                     let product_wrapped = self.s.m.cmp(c, pred::NE, high, zero);
                     let offset_wrapped = self.s.m.cmp(c, pred::IULT, offset, start);
-                    let bias_wrapped = self.s.m.cmp(c, pred::IULT, byte, offset);
                     let wrapped = self.s.m.bin(c, Bin::Or, product_wrapped, offset_wrapped);
-                    let overflow = self.s.m.bin(c, Bin::Or, wrapped, bias_wrapped);
-                    // The host leaves this final block outside every alias. All
-                    // four component addresses still fit in a 32-bit offset.
+                    // The host leaves the final 16-byte block outside every alias.
+                    // Any offset within length still fits after adding the bias.
                     let invalid = self.s.m.i32(u32::MAX - 15);
-                    let in_last_block = self.s.m.cmp(c, pred::IUGE, byte, invalid);
-                    let invalid_address = self.s.m.bin(c, Bin::Or, overflow, in_last_block);
+                    let outside = self.s.m.cmp(c, pred::IUGE, offset, length);
+                    let invalid_address = self.s.m.bin(c, Bin::Or, wrapped, outside);
+                    let bytes = self.s.m.bin(c, Bin::Sub, length, offset);
+                    remaining = Some(self.s.m.select(c, invalid_address, zero, bytes));
                     let byte = self.s.m.select(c, invalid_address, invalid, byte);
                     let h = self.s.heap_handle(c, alias, false, false, (11, 0));
                     self.s.op(
@@ -8248,13 +8253,25 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = *data else {
             return Err("a buffer result");
         };
+        // A vector raw load may span the logical end of an aligned view.
+        let component = |this: &mut Self, k: u32| {
+            let value = this.s.m.extract(c, r, k);
+            if let Some(bytes) = remaining {
+                let needed = this.s.m.i32((k + 1) * 4);
+                let valid = this.s.m.cmp(c, pred::IUGE, bytes, needed);
+                let zero = this.s.m.f32(0);
+                this.s.m.select(c, valid, value, zero)
+            } else {
+                value
+            }
+        };
         if d16 {
             // Two f16 channels per VGPR (an odd last high half 0).
             let k16 = self.s.m.i32(16);
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
-                    let f = self.s.m.extract(c, r, ch);
+                    let f = component(self, ch);
                     let h = self.f16_nearest(f);
                     x = Some(match x {
                         Some(hi) => {
@@ -8269,7 +8286,7 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         for k in 0..count {
-            let x = self.s.m.extract(c, r, k);
+            let x = component(self, k);
             let x = self.as_int(x);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
