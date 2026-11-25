@@ -20,31 +20,46 @@ env:
 jobs:
   fmt-policy:
     name: fmt-policy
-    # rustfmt does not compile code, so a Linux runner can check the
-    # Windows-only crates.
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      route: ${{ steps.route.outputs.route }}
+      tree: ${{ steps.route.outputs.tree }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          fetch-depth: 0
           persist-credentials: false
-      # Installs the toolchain that rust-toolchain.toml gives, with its
-      # components, so CI uses the same rustfmt as local builds.
+      - name: Determine required jobs
+        id: route
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/ci-route.sh
       - name: Install the toolchain
         run: rustup toolchain install
       - name: Validate workflows and shell scripts
+        if: steps.route.outputs.route != 'docs'
         run: |
           bash .github/scripts/install-tools.sh lint
           "$RUNNER_TEMP/actionlint-bin/actionlint"
           git ls-files -z -- '*.sh' | xargs -0 -r shellcheck
+          bash tests/ci-route.sh
       - name: Documentation layout
         run: bash tests/docs.sh
       - name: Check the formatting
+        if: steps.route.outputs.route != 'docs'
         run: cargo fmt --all -- --check
       - name: Asset policy
         run: cargo xtask policy
 
   check:
+    needs: fmt-policy
+    if: needs.fmt-policy.outputs.route != 'docs'
     name: check
     runs-on: windows-2025
     timeout-minutes: 60
@@ -65,7 +80,9 @@ jobs:
         run: cargo test --workspace --locked -- --test-threads=1
 
   msrv:
-    name: msrv
+    needs: fmt-policy
+    if: needs.fmt-policy.outputs.route == 'code'
+    name: msrv / ${{ github.event.pull_request.number || github.event_name }} / ${{ needs.fmt-policy.outputs.tree }}
     runs-on: windows-2025
     timeout-minutes: 60
     steps:
@@ -82,6 +99,8 @@ jobs:
   # The portable crates build and test on Linux too; this catches
   # Windows-only code reaching them.
   linux:
+    needs: fmt-policy
+    if: needs.fmt-policy.outputs.route != 'docs'
     name: linux
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -101,6 +120,11 @@ jobs:
 
   proton:
     needs: [fmt-policy, check, msrv, linux]
+    if: >-
+      !cancelled() && needs.fmt-policy.result == 'success' &&
+      needs.check.result == 'success' && needs.linux.result == 'success' &&
+      ((needs.fmt-policy.outputs.route == 'code' && needs.msrv.result == 'success') ||
+       (needs.fmt-policy.outputs.route == 'verified-msrv' && needs.msrv.result == 'skipped'))
     uses: ./.github/workflows/proton.yml
 
   gate:
@@ -110,7 +134,21 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Require every job to pass
+      - name: Require the expected jobs to pass
         env:
           RESULTS: ${{ toJSON(needs) }}
-        run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
+        run: |
+          python3 - <<'PYTHON'
+          import json, os
+          jobs = json.loads(os.environ["RESULTS"])
+          route = jobs["fmt-policy"]["outputs"].get("route")
+          if route not in {"docs", "code", "verified-msrv"}:
+              raise SystemExit(f"Unknown CI route: {route}")
+          for name in ("fmt-policy", "check", "linux", "msrv", "proton"):
+              required = name == "fmt-policy" or (route != "docs" and (name != "msrv" or route == "code"))
+              expected = "success" if required else "skipped"
+              actual = jobs[name]["result"]
+              if actual != expected:
+                  raise SystemExit(f"{name}: expected {expected}, got {actual}")
+          print(f"All checks for {route} passed.")
+          PYTHON
