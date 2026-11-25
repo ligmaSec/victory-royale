@@ -17,6 +17,7 @@ import zipfile
 REPO = "ligmaSec/victory-royale"
 PACKAGE = "victory-proton-x86_64.tar.gz"
 ROOT = Path(__file__).resolve().parent
+LOG_PRIVACY = "Logs may contain your username, local file paths, or other sensitive information."
 
 
 def digest(path):
@@ -256,6 +257,7 @@ def instruction_block(heading, message, path_line=None):
 def run_request(manifest, options):
     request = read_request(manifest)
     print(f"VIctory PR #{request['pr']} | Series X | two launches", flush=True)
+    instruction_block("LOG PRIVACY", LOG_PRIVACY + " The report stays on your machine until you share it.")
     if options.plan:
         for side in ("main", "candidate"):
             build = request[side]
@@ -300,7 +302,8 @@ def run_request(manifest, options):
                 label = "Upload" if complete else "Partial report"
                 heading = "REPORT READY" if complete else "TEST INTERRUPTED"
                 instruction_block(heading,
-                                  "Send this ZIP privately to the person who requested the test. Keep it zipped.",
+                                  LOG_PRIVACY + " Review the logs before sharing. Send the ZIP privately to the requester "
+                                  "if you are comfortable sharing it, or send a written summary.",
                                   f"{label}: {bundle}")
 
 

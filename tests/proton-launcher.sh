@@ -120,6 +120,7 @@ test "$(<"${VICTORY_EXE%/*}/d3d12.dll")" = original
 reports="$HOME/.local/share/victory/reports"
 archives=("$reports"/*.tar.gz)
 test "${#archives[@]}" -eq 1
+grep -Fq "sensitive information" "$work/report-output"
 grep -Fq "${archives[0]}" "$work/report-output"
 tar -xOf "${archives[0]}" ./launcher-exit.txt | grep -qx 3
 tar -xOf "${archives[0]}" ./steam-victory.log | grep -qx 'Proton output'

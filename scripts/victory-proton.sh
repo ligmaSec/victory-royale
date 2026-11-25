@@ -294,6 +294,7 @@ export WINEDEBUG=${WINEDEBUG:--all,+timestamp,+pid,+tid,+seh}
         sha256sum -- d3d12.dll d3d12core.dll
     fi
 ) > "$report/build.txt"
+echo "Logs may contain your username, local file paths, or other sensitive information. Review them before sharing privately."
 echo "Recording this run in $report"
 status=0
 trap ':' INT

@@ -153,11 +153,11 @@ class HardwareRequest(unittest.TestCase):
                     mock.patch.object(runner, "run_request", side_effect=check_manifest):
                 runner.run()
 
-    def run_pair(self, launch):
+    def run_pair(self, launch, stdout=None):
         args = ["runner", str(self.manifest), "--title", str(self.title), "--output-dir", str(self.output)]
         with mock.patch.object(sys, "argv", args), mock.patch.object(shutil, "which", return_value="tool"), \
                 mock.patch.object(subprocess, "run", side_effect=self.fake_download), \
-                mock.patch.object(runner, "launch", side_effect=launch), contextlib.redirect_stdout(io.StringIO()):
+                mock.patch.object(runner, "launch", side_effect=launch), contextlib.redirect_stdout(stdout or io.StringIO()):
             runner.run()
 
     def test_instructions_at_launch_and_private_zip_in_temp(self):
@@ -182,7 +182,10 @@ class HardwareRequest(unittest.TestCase):
         report, = temp.rglob("*.zip")
         self.assertEqual(list(temp.iterdir()), [report.parent])
         self.assertIn("REPORT READY", stdout.getvalue())
-        self.assertIn("Send this ZIP privately", stdout.getvalue())
+        blocks = stdout.getvalue().split("REPORT READY")
+        self.assertIn("LOG PRIVACY", blocks[0].split("RUN 1 OF 2")[0])
+        self.assertIn("sensitive information", " ".join(blocks[1].split()))
+        self.assertIn("written summary", " ".join(blocks[1].split()))
         self.assertEqual(stdout.getvalue().rstrip().splitlines()[-1], f"Upload: {report}")
         with zipfile.ZipFile(report) as archive:
             self.assertEqual(set(archive.namelist()), {"request.json", "main.log", "candidate.log"})
@@ -204,8 +207,12 @@ class HardwareRequest(unittest.TestCase):
                 raise ValueError("test interruption")
             launched(side, *args)
 
+        stdout = io.StringIO()
         with self.assertRaisesRegex(ValueError, "interruption"):
-            self.run_pair(fail)
+            self.run_pair(fail, stdout)
+        notice = " ".join(stdout.getvalue().split("TEST INTERRUPTED")[1].split())
+        self.assertIn("sensitive information", notice)
+        self.assertIn("written summary", notice)
         partial, = set(self.output.glob("*/report.zip")) - set(bundles)
         with zipfile.ZipFile(partial) as archive:
             self.assertEqual(set(archive.namelist()), {"request.json", "main.log"})
