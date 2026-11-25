@@ -115,6 +115,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
         run: cargo test --workspace --locked
+      - name: Optional build-time shader compiler
+        run: bash tests/build-dxc.sh
       - name: Proton launcher (synthetic, no Wine)
         run: bash tests/proton-launcher.sh
 
