@@ -853,7 +853,6 @@ struct Readback {
     src_pitch: usize,
     lines: usize,
     row_bytes: usize,
-    total: usize,
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -1201,10 +1200,11 @@ impl Host {
         }
         for list in runs {
             for rb in &list.deferred().readbacks {
-                let written = if rb.dst_pitch == rb.src_pitch {
-                    crate::watch::writing(rb.dst, rb.total);
-                    write_mapped(rb.dst as *mut u8, rb.src as *const u8, rb.total);
-                    rb.total
+                let written = if rb.dst_pitch == rb.row_bytes && rb.src_pitch == rb.row_bytes {
+                    let total = rb.lines * rb.row_bytes;
+                    crate::watch::writing(rb.dst, total);
+                    write_mapped(rb.dst as *mut u8, rb.src as *const u8, total);
+                    total
                 } else {
                     let mut n = 0;
                     for line in 0..rb.lines {
@@ -2045,7 +2045,6 @@ impl HostList {
 
     /// Copies a GPU texture readback from `src` into title memory at `dst`
     /// once the list has finished running on the host GPU.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn defer_readback(
         &self,
         dst: *mut u8,
@@ -2054,7 +2053,6 @@ impl HostList {
         src_pitch: usize,
         lines: usize,
         row_bytes: usize,
-        total: usize,
     ) {
         self.mark_work();
         self.deferred().readbacks.push(Readback {
@@ -2064,7 +2062,6 @@ impl HostList {
             src_pitch,
             lines,
             row_bytes,
-            total,
         });
     }
 
