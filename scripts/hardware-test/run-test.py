@@ -13,16 +13,21 @@ import sys
 import tarfile
 import tempfile
 import textwrap
-import webbrowser
 import zipfile
 
 REPO = "ligmaSec/victory-royale"
 PACKAGE = "victory-proton-x86_64.tar.gz"
-# A maintainer can set the project's upload-only HTTPS page here after verifying
-# anonymous uploads and recipient access. A request manifest cannot override it.
-PRIVATE_INBOX = None
+# Only a reviewed runner change can select the recipient for private reports.
+REPORT_RECIPIENT = "age1mdqjdgme7frky259ez5xkmzylqafkjp3e8tms5flct2lh0h735hq4xjdkj"
+REPORT_MAINTAINER = "ligmaSec"
+AGE_RELEASE = "v1.3.2"
+AGE_PACKAGES = {
+    "linux": ("linux-amd64.tar.gz", "cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10"),
+    "win32": ("windows-amd64.zip", "f48d8f8f9ebe903ab5027ed067652f2cc1db94bc206976430133b905dcd8e8c7"),
+}
 ROOT = Path(__file__).resolve().parent
-LOG_PRIVACY = "Logs may contain your username, local file paths, or other sensitive information."
+PRIVACY_HEADING = "WARNING: LOGS MAY CONTAIN SENSITIVE INFORMATION"
+LOG_PRIVACY = "Raw logs can include your username, file paths, credentials, or output from the game."
 
 ANSI = re.compile(rb"\x1b\[[0-9;]*m")
 MS = rb"([0-9]{1,9}\.[0-9]{2})"
@@ -270,11 +275,33 @@ def run():
             run_request(manifest, options)
 
 
+def warning_color():
+    if not sys.stdout.isatty() or "NO_COLOR" in os.environ or os.environ.get("TERM") == "dumb":
+        return False
+    if sys.platform != "win32":
+        return True
+    # Enable VT processing on traditional Windows consoles as well as Windows Terminal.
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+    try:
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(sys.stdout.fileno()))
+    except (OSError, ValueError):
+        return False
+    mode = wintypes.DWORD()
+    kernel = ctypes.windll.kernel32
+    return bool(kernel.GetConsoleMode(handle, ctypes.byref(mode))
+                and kernel.SetConsoleMode(handle, mode.value | 0x0004))
+
+
 def instruction_block(heading, message, path_line=None):
     width = max(20, min(72, shutil.get_terminal_size().columns - 1))
     rule = "=" * width
     message = textwrap.fill(message, width, break_long_words=False, break_on_hyphens=False)
-    lines = ["", rule, textwrap.fill(heading, width), rule, message]
+    banner = "\n".join([rule, textwrap.fill(heading, width), rule])
+    if heading == PRIVACY_HEADING and warning_color():
+        banner = "\x1b[1;91m" + banner + "\x1b[0m"
+    lines = ["", banner, message]
     if path_line:
         lines.extend(["", path_line])
     print("\n".join(lines), end="\n\n", flush=True)
@@ -433,22 +460,83 @@ def diagnostic_summary(request, results, windows, complete, destination):
     return "\n".join(rows) + "\n"
 
 
+def encrypt_report(filtered, recipient):
+    # Only this file's native age recipient is accepted. No plugin or identity
+    # from a test request participates in encryption.
+    if not re.fullmatch(r"age1[023456789acdefghjklmnpqrstuvwxyz]{58}", recipient):
+        raise ValueError("Invalid project report recipient.")
+    with tempfile.TemporaryDirectory(prefix="victory-encrypt-") as temporary:
+        work = Path(temporary)
+        package, checksum = AGE_PACKAGES[sys.platform]
+        name = f"age-{AGE_RELEASE}-{package}"
+        subprocess.run(["gh", "release", "download", AGE_RELEASE, "-R", "github.com/FiloSottile/age",
+                        "-p", name, "-D", str(work)], check=True, capture_output=True)
+        archive = work / name
+        if digest(archive) != checksum:
+            raise ValueError("The age download failed its checksum.")
+        if sys.platform == "win32":
+            exe = work / "age.exe"
+            with zipfile.ZipFile(archive) as bundle, bundle.open("age/age.exe") as src, exe.open("xb") as out:
+                shutil.copyfileobj(src, out)
+        else:
+            exe = work / "age"
+            with tarfile.open(archive, "r:gz") as bundle, bundle.extractfile("age/age") as src, exe.open("xb") as out:
+                shutil.copyfileobj(src, out)
+            exe.chmod(0o700)
+        return subprocess.check_output([str(exe), "--armor", "--recipient", recipient, str(filtered)],
+                                       stderr=subprocess.PIPE).decode("ascii")
+
+
+def send_encrypted_report(filtered, recipient):
+    armor = encrypt_report(filtered, recipient)
+    # Always create explicitly unlisted on github.com. Only the encrypted file
+    # is present, including when the second request (notification) fails.
+    gist = {"public": False, "files": {"report.age": {"content": armor}}}
+    api = ["gh", "api", "--hostname", "github.com"]
+    gist_id = subprocess.run([*api, "gists", "--input", "-", "--jq", ".id"], input=json.dumps(gist),
+                             capture_output=True, text=True, check=True).stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", gist_id):
+        raise ValueError("GitHub did not return a gist receipt.")
+    # Record the receipt before notification so a failed mention needs no new upload.
+    receipt = f"https://gist.github.com/{gist_id}"
+    print(f"Encrypted report: {receipt}", flush=True)
+    notice = {"body": f"@{REPORT_MAINTAINER} A VIctory hardware report is ready."}
+    result = subprocess.run([*api, f"gists/{gist_id}/comments", "--input", "-"], input=json.dumps(notice),
+                            capture_output=True, text=True)
+    if result.returncode:
+        print(f"Send the receipt privately to @{REPORT_MAINTAINER}. The notification was unsuccessful.")
+    else:
+        print(f"Notification posted for @{REPORT_MAINTAINER}.")
+
+
 def share_result(pr, report, filtered):
     print(report, flush=True)
-    instruction_block("SHARE YOUR RESULT",
-                      "The filtered ZIP contains the summary above, frame timings, submission costs and a shader event timeline. "
-                      "You can also send a written summary.", f"Filtered diagnostics: {filtered}")
+    instruction_block(PRIVACY_HEADING, LOG_PRIVACY + " Keep the raw archive local. Review the summary and "
+                      "filtered ZIP before you share. The encrypted option sends the summary, frame timings, "
+                      "submission costs and shader events to the maintainer. You can send a written summary "
+                      "or press Enter to keep everything local.", f"Filtered diagnostics: {filtered}")
     if not sys.stdin.isatty():
         return
+    private = ""
+    if REPORT_RECIPIENT:
+        try:
+            account = subprocess.check_output(["gh", "api", "--hostname", "github.com", "user", "--jq", ".login"],
+                                              text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
+        except (OSError, subprocess.SubprocessError):
+            print("Encrypted sharing needs GitHub CLI signed in to github.com with gist access.")
+        else:
+            print(f"GitHub will associate the unlisted encrypted gist with {account}. "
+                  f"Only the holder of @{REPORT_MAINTAINER}'s report key can decrypt it.")
+            private = "   [i] Send encrypted report"
     try:
-        choice = input(f"[Enter] Keep local   [i] Private inbox   [p] Public summary on PR #{pr}: ").strip().lower()
-        if choice == "i":
-            if PRIVATE_INBOX:
-                print(f"Private upload page: {PRIVATE_INBOX}", flush=True)
-                webbrowser.open(PRIVATE_INBOX)
-            else:
-                print("Use the private upload destination supplied by the requester.")
-            print(f"Select this filtered ZIP: {filtered}")
+        choice = input(f"[Enter] Keep local{private}   [p] Public summary on PR #{pr}: ").strip().lower()
+        if choice == "i" and private:
+            try:
+                send_encrypted_report(filtered, REPORT_RECIPIENT)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                print("Private delivery unconfirmed. Check your gists before retrying. "
+                      "GitHub CLI must be signed in with gist access. "
+                      f"Your filtered ZIP is saved here: {filtered}")
             return
     except (EOFError, KeyboardInterrupt):
         return
@@ -470,7 +558,7 @@ def share_result(pr, report, filtered):
 def run_request(manifest, options):
     request = read_request(manifest)
     print(f"VIctory PR #{request['pr']} | Series X | two launches", flush=True)
-    instruction_block("LOG PRIVACY", LOG_PRIVACY + " The report stays on your machine until you share it.")
+    instruction_block(PRIVACY_HEADING, LOG_PRIVACY + " Your reports stay on this machine until you choose to share.")
     if options.plan:
         for side in ("main", "candidate"):
             build = request[side]
@@ -513,7 +601,7 @@ def run_request(manifest, options):
                     for path in sorted(results.iterdir()):
                         out.write(path, path.name)
                 heading = "REPORT READY" if complete else "TEST INTERRUPTED"
-                instruction_block(heading, LOG_PRIVACY + " Keep this raw archive local.", f"Local logs: {bundle}")
+                instruction_block(heading, "Keep this full troubleshooting archive on your machine.", f"Local logs: {bundle}")
                 report = diagnostic_summary(request, results, windows, complete, destination)
                 summary_path = destination / "summary.txt"
                 summary_path.write_text(report, encoding="utf-8")

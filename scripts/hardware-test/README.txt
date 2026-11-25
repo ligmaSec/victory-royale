@@ -11,13 +11,21 @@ Run the scenario on main, close the game as instructed, then repeat on the
 candidate with the same settings and window size. Each build gets a fresh
 translation cache. Add --plan to preview the instructions and build revisions.
 
-Logs may contain your username, local file paths, or other sensitive information.
+====================================================================
+WARNING: LOGS MAY CONTAIN SENSITIVE INFORMATION
+====================================================================
+Raw logs may include usernames, file paths, credentials and game output.
+Keep the full archive local. Review the filtered ZIP before choosing to share.
 At REPORT READY or TEST INTERRUPTED, review the on-screen summary. Press Enter
 to keep it local. You can post the summary to the PR under your GitHub account
-or choose [i] to send the filtered diagnostics ZIP privately. The ZIP contains the same summary
-and numeric tables of frame times, submission costs and shader events for both builds. It is the only file in the temporary share folder. Keep
-report.zip, which contains raw logs, on your machine. Tell the requester what
-you saw in each run.
+or press [i] to send detailed diagnostics encrypted to the maintainer. Sending
+requires GitHub CLI signed in to github.com with gist access. The runner names
+your account before sending. It downloads a checksum-verified age tool, encrypts
+the filtered ZIP and returns an unlisted GitHub Gist receipt. GitHub sees your
+account, upload time and size. Anyone with the receipt can retrieve the encrypted
+file. The private option requires a configured project key. Offline runs still
+save a shareable ZIP with frame times, submission costs and shader events.
+Keep the raw report.zip local. Tell the requester what you saw on each build.
 
 Both verified CI builds are included. You need Python 3.9 or newer. Linux
 also needs Bash and UMU (umu-run) and may download pinned vkd3d-proton on

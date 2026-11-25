@@ -183,8 +183,8 @@ class HardwareRequest(unittest.TestCase):
         self.assertEqual(list(temp.iterdir()), [report.parent])
         self.assertIn("REPORT READY", stdout.getvalue())
         blocks = stdout.getvalue().split("REPORT READY")
-        self.assertIn("LOG PRIVACY", blocks[0].split("RUN 1 OF 2")[0])
-        self.assertIn("sensitive information", " ".join(blocks[1].split()))
+        self.assertIn(runner.PRIVACY_HEADING, " ".join(blocks[0].split("RUN 1 OF 2")[0].split()))
+        self.assertIn(runner.PRIVACY_HEADING, " ".join(blocks[1].split()))
         self.assertIn("written summary", " ".join(blocks[1].split()))
         self.assertIn(f"Local logs: {report}", stdout.getvalue())
         filtered, = temp.rglob("*-diagnostics.zip")
@@ -219,11 +219,26 @@ class HardwareRequest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "interruption"):
             self.run_pair(fail, stdout)
         notice = " ".join(stdout.getvalue().split("TEST INTERRUPTED")[1].split())
-        self.assertIn("sensitive information", notice)
+        self.assertIn(runner.PRIVACY_HEADING, notice)
         self.assertIn("written summary", notice)
         partial, = set(self.output.glob("*/report.zip")) - set(bundles)
         with zipfile.ZipFile(partial) as archive:
             self.assertEqual(set(archive.namelist()), {"request.json", "main.log"})
+
+    def test_sensitive_information_banner_is_red_only_on_color_terminals(self):
+        for tty, term, no_color, expected in [(True, "xterm", False, True), (False, "xterm", False, False),
+                                             (True, "dumb", False, False), (True, "xterm", True, False)]:
+            env = {"TERM": term, "COLUMNS": "52"}
+            if no_color:
+                env["NO_COLOR"] = "1"
+            with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(io.StringIO()) as out, \
+                    mock.patch.object(out, "isatty", return_value=tty), mock.patch.object(sys, "platform", "linux"):
+                runner.instruction_block(runner.PRIVACY_HEADING, runner.LOG_PRIVACY)
+            text = out.getvalue()
+            self.assertEqual("\x1b[1;91m" in text, expected)
+            self.assertEqual("\x1b[0m" in text, expected)
+            self.assertIn(runner.PRIVACY_HEADING, text)
+            self.assertIn("credentials", text)
 
     def test_filtered_result_keeps_only_numeric_windows_and_fixed_diagnostics(self):
         request = dict(self.request, scenario="private scenario")
@@ -293,21 +308,45 @@ class HardwareRequest(unittest.TestCase):
                 self.assertEqual(send.call_args.kwargs["input"], "Previewed result")
                 self.assertIn("github.com/" + runner.REPO, send.call_args.args[0])
 
-    def test_private_choice_opens_only_the_project_page_and_names_the_filtered_zip(self):
+    def test_private_sharing_requires_a_pinned_key_login_and_explicit_choice(self):
         safe = self.root / "filtered.zip"
-        for inbox in (None, "https://example.test/upload"):
-            with mock.patch.object(sys.stdin, "isatty", return_value=True), \
-                    mock.patch("builtins.input", return_value="i"), mock.patch.object(runner, "PRIVATE_INBOX", inbox), \
-                    mock.patch.object(runner.webbrowser, "open") as browser, \
-                    mock.patch.object(subprocess, "run", side_effect=AssertionError), \
-                    contextlib.redirect_stdout(io.StringIO()) as output:
+        for key, login, choice, sent in ((None, True, "i", False), ("configured", False, "i", False),
+                                         ("configured", True, "", False), ("configured", True, "i", True)):
+            with mock.patch.object(sys.stdin, "isatty", return_value=True), mock.patch.object(runner, "REPORT_RECIPIENT", key), \
+                    mock.patch.object(subprocess, "check_output", side_effect=None if login else FileNotFoundError,
+                                      return_value="fixture-account"), mock.patch("builtins.input", return_value=choice), \
+                    mock.patch.object(runner, "send_encrypted_report") as send, contextlib.redirect_stdout(io.StringIO()) as output:
                 runner.share_result(7, "Preview", safe)
-            self.assertIn(f"Select this filtered ZIP: {safe}", output.getvalue())
-            if inbox:
-                browser.assert_called_once_with(inbox)
-            else:
-                browser.assert_not_called()
-                self.assertIn("supplied by the requester", output.getvalue())
+            self.assertEqual(send.called, sent)
+            if sent:
+                send.assert_called_once_with(safe, key)
+                self.assertIn("fixture-account", output.getvalue())
+
+    def test_gist_only_receives_ciphertext_and_a_failed_mention_preserves_the_receipt(self):
+        filtered = self.root / "report.zip"
+        filtered.write_bytes(b"private path and raw canary")
+        gist_id = "a" * 32
+        for notify_status in (0, 1):
+            def github(command, **kwargs):
+                self.assertEqual(command[:4], ["gh", "api", "--hostname", "github.com"])
+                body = json.loads(kwargs["input"])
+                if command[4] == "gists":
+                    self.assertEqual(body, {"public": False, "files": {"report.age": {"content": "ciphertext"}}})
+                    return subprocess.CompletedProcess(command, 0, stdout=gist_id)
+                self.assertEqual(command[4], f"gists/{gist_id}/comments")
+                self.assertEqual(list(body), ["body"])
+                self.assertIn("@" + runner.REPORT_MAINTAINER, body["body"])
+                self.assertNotIn("canary", body["body"])
+                return subprocess.CompletedProcess(command, notify_status)
+            with mock.patch.object(runner, "encrypt_report", return_value="ciphertext"), \
+                    mock.patch.object(subprocess, "run", side_effect=github) as api, contextlib.redirect_stdout(io.StringIO()) as out:
+                runner.send_encrypted_report(filtered, "recipient")
+            self.assertEqual(api.call_count, 2)
+            self.assertIn(f"https://gist.github.com/{gist_id}", out.getvalue())
+            self.assertIn("unsuccessful" if notify_status else "Notification posted", out.getvalue())
+        with mock.patch.object(runner, "encrypt_report", side_effect=ValueError("bad checksum")), \
+                mock.patch.object(subprocess, "run", side_effect=AssertionError), self.assertRaises(ValueError):
+            runner.send_encrypted_report(filtered, "recipient")
 
     def test_private_timeline_correlates_builds_without_exporting_raw_identifiers(self):
         import csv

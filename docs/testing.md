@@ -56,6 +56,11 @@ tar -xf victory-proton-x86_64.tar.gz
 ## Run a Series X hardware test
 
 You'll need Python 3.9 or newer and your own title executable outside the VIctory checkout.
+> [!WARNING]
+> **Logs may contain sensitive information**, including usernames, local file paths,
+> credentials and output from the game. Review the filtered report before sharing.
+> Keeping all results local is always an option.
+
 On Linux, install Bash and UMU (`umu-run`). The Proton launcher may download its pinned
 runtime on first use.
 
@@ -86,11 +91,19 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
    samples record time spent on CPU preparation, buffer and texture copies,
    GPU waits and copy-back, alongside draw and pipeline-drop counts. The private
    event timeline connects shader binds, translations and pipeline results to
-   those samples through elapsed times and shader numbers shared across the pair. You can open it
-   locally before sending. Choose **i** for the private upload page and select
-   the printed ZIP. Until a project inbox is configured, use the private destination
-   supplied by the requester. The printed `share` folder contains just the filtered
-   ZIP. The raw archive stays one directory up.
+   those samples through elapsed times and shader numbers shared across the pair.
+   You can inspect the filtered ZIP in the printed temporary `share` folder.
+5. For **Send encrypted report**, install GitHub CLI and sign in to github.com
+   with permission to create gists (`gh auth login --hostname github.com --scopes gist`).
+   For an existing CLI login, `gh auth refresh --hostname github.com --scopes gist`
+   adds the scope. The runner shows the account and maintainer. Choose **i**
+   to encrypt the ZIP locally and send it. The runner downloads the pinned,
+   checksum-verified x86-64 age tool. [Official age release](https://github.com/FiloSottile/age/releases/tag/v1.3.2).
+   GitHub stores the encrypted file in an unlisted gist owned by your account.
+   A mention on the gist notifies the maintainer. Your account, gist size and
+   upload time are visible to GitHub. Anyone with the URL can retrieve the
+   ciphertext. The maintainer's private age key is needed to read its contents.
+   Keep the receipt if notification fails. You can delete the gist from your account.
 
 **Raw logs may contain usernames, file paths, credentials or output from the title.**
 Keep `report.zip` local. Both sharing options use a fixed set of recognized
