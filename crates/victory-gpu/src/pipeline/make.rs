@@ -106,7 +106,10 @@ impl Pending {
         let host = crate::host::host()?;
         let bindings = std::cell::RefCell::new(BTreeSet::new());
         for shader in &self.shaders {
-            if shader.translated().is_none() {
+            if let Err(refusal) = shader.translation() {
+                if !refusal.required_stride {
+                    return None;
+                }
                 // Probe lowering with a valid annotation. Only the binding
                 // locations survive the probe; its DXIL never reaches D3D12.
                 translate_with_view_strides(
@@ -130,7 +133,7 @@ impl Pending {
         self.shaders
             .iter()
             .map(|shader| {
-                if shader.translated.get().is_some_and(Option::is_some) {
+                if shader.translated.get().is_some_and(Result::is_ok) {
                     return Some(shader.clone());
                 }
                 let accessed = std::cell::RefCell::new(BTreeSet::new());
@@ -188,7 +191,7 @@ impl Pending {
                     stage: shader.stage,
                     hash: shader.hash.clone(),
                     container: Vec::new(),
-                    translated: OnceLock::from(Some(Translated { host, used })),
+                    translated: OnceLock::from(Ok(Translated { host, used })),
                     #[cfg(feature = "diagnostics")]
                     wave64: OnceLock::new(),
                 }))
@@ -208,7 +211,7 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
             let failed: Vec<String> = p
                 .shaders
                 .iter()
-                .filter(|s| matches!(s.translated.get(), Some(None)))
+                .filter(|s| matches!(s.translated.get(), Some(Err(_))))
                 .map(|s| {
                     let fspx = victory_shader::inspect_fspx(&s.container).is_some();
                     let note = if fspx { " (FSPX compute module)" } else { "" };

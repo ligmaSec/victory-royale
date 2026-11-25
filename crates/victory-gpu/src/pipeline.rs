@@ -16,6 +16,8 @@
 //! only copy it inline, which our null command-list limits keep from running.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+#[cfg(windows)]
+use crate::shader_cache::Refusal;
 use std::collections::HashMap;
 use std::mem::offset_of;
 #[cfg(windows)]
@@ -66,7 +68,7 @@ pub(crate) struct Shader {
     pub(crate) hash: String,
     container: Vec<u8>,
     #[cfg(windows)]
-    translated: OnceLock<Option<Translated>>,
+    translated: OnceLock<Result<Translated, Refusal>>,
     /// Whether its native program runs in 64-lane console waves
     /// (diagnostics: `VICTORY_SKIP_WAVE64`).
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -119,7 +121,7 @@ impl Shader {
         used: Vec<victory_shader::UsedResource>,
     ) -> Arc<Self> {
         let translated = OnceLock::new();
-        let _ = translated.set(Some(Translated {
+        let _ = translated.set(Ok(Translated {
             host: victory_shader::emit::HostShader {
                 stage: hw_stage,
                 dxil: Vec::new(),
@@ -159,7 +161,7 @@ impl Shader {
             stage: "compute",
             hash: blake3::hash(&host.dxil).to_hex()[..16].to_string(),
             container: Vec::new(),
-            translated: OnceLock::from(Some(Translated {
+            translated: OnceLock::from(Ok(Translated {
                 host,
                 used: native.used,
             })),
@@ -171,49 +173,51 @@ impl Shader {
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
-        self.translated
-            .get_or_init(|| {
-                if let Some(fspx) = FspxSummary::of(&self.container) {
-                    tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        threads = ?fspx.threads,
-                        wave = fspx.wave(),
-                        code_size = fspx.code_size,
-                        container_size = self.container.len(),
-                        "FSPX compute module: it has no DXIL and its GFX10 code is not translated yet"
-                    );
-                }
-                let done = translate(&self.container);
-                match &done {
-                    Ok(t) => tracing::info!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
-                        "shader translated"
-                    ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
-                }
-                done.ok()
-            })
-            .as_ref()
+        self.translation().as_ref().ok()
+    }
+
+    fn translation(&self) -> &Result<Translated, Refusal> {
+        self.translated.get_or_init(|| {
+            if let Some(fspx) = FspxSummary::of(&self.container) {
+                tracing::warn!(
+                    stage = self.stage,
+                    hash = %self.hash,
+                    threads = ?fspx.threads,
+                    wave = fspx.wave(),
+                    code_size = fspx.code_size,
+                    container_size = self.container.len(),
+                    "FSPX compute module: it has no DXIL and its GFX10 code is not translated yet"
+                );
+            }
+            let done = translate(&self.container);
+            match &done {
+                Ok(t) => tracing::info!(
+                    stage = self.stage,
+                    hash = %self.hash,
+                    user_data = t.host.user_data.len(),
+                    samplers = t.host.samplers.len(),
+                    "shader translated"
+                ),
+                Err(e) => tracing::warn!(
+                    stage = self.stage,
+                    hash = %self.hash,
+                    error = %e.reason,
+                    "shader does not translate; its pipelines' draws are dropped"
+                ),
+            }
+            done
+        })
     }
 }
 
 #[cfg(windows)]
-fn translate(container: &[u8]) -> Result<Translated, String> {
+fn translate(container: &[u8]) -> Result<Translated, Refusal> {
     use victory_shader::{Container, FourCC, HwStage};
     let host = crate::shader_cache::host_shader(container)?;
-    let c = Container::parse(container).map_err(|e| e.to_string())?;
+    let c = Container::parse(container).map_err(Refusal::fixed)?;
     let used = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data)
-            .map_err(|e| e.to_string())?
+            .map_err(Refusal::fixed)?
             .into_iter()
             .find(|p| {
                 matches!(

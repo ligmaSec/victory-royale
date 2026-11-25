@@ -361,7 +361,7 @@ impl Shader {
             // This pipeline owns the finished variant. The shared shader
             // retains the source for any other pipeline that needs it.
             container: Vec::new(),
-            translated: Some(Translated {
+            translated: Ok(Translated {
                 host,
                 used: native.used,
             })

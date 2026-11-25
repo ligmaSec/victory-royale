@@ -6,7 +6,7 @@
 //! content-addressed cache, which writes them atomically; an entry that does
 //! not read back is translated again.
 //!
-//! Each entry is our own encoding of `Result<HostShader, String>`: a field
+//! Each entry is our own encoding of `Result<HostShader, Refusal>`: a field
 //! added to [`HostShader`] must be added to `encode` and `decode` too (entries
 //! of older builds are ignored anyway).
 
@@ -83,12 +83,41 @@ fn build(wave32: bool) -> &'static [u8; 32] {
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    pub(crate) reason: String,
+    /// At least one lowering attempt asked for a required, statically
+    /// addressable view stride. Only then can the four-byte probe change
+    /// the translation path.
+    pub(crate) required_stride: bool,
+}
+
+impl Refusal {
+    pub(crate) fn fixed(reason: impl ToString) -> Self {
+        Self {
+            reason: reason.to_string(),
+            required_stride: false,
+        }
+    }
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, Refusal> {
     let wave32 = allow_wave32();
     let translate = |c: &[u8]| {
-        victory_shader::emit::translate_with_wave32(c, wave32).map_err(|e| e.to_string())
+        let required_stride = std::cell::Cell::new(false);
+        victory_shader::emit::translate_with_view_strides(c, wave32, &|_, required| {
+            if required {
+                required_stride.set(true);
+            }
+            None
+        })
+        .map(|(shader, _)| shader)
+        .map_err(|error| Refusal {
+            reason: error.to_string(),
+            required_stride: required_stride.get(),
+        })
     };
     match CACHE.get() {
         Some(cache) => cached(cache, build(wave32), container, translate),
@@ -103,16 +132,15 @@ struct Translate<F> {
     ran: AtomicBool,
     /// The last translation outcome produced by `convert`, kept so a cache
     /// write failure returns it directly instead of re-running translation.
-    result: Mutex<Option<Result<HostShader, String>>>,
+    result: Mutex<Option<Result<HostShader, Refusal>>>,
 }
 
-impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
+impl<F: Fn(&[u8]) -> Result<HostShader, Refusal> + Send + Sync> Converter for Translate<F> {
     fn id(&self) -> &'static str {
         "shader.dxil"
     }
     fn version(&self) -> u32 {
-        // The build fingerprint in the input does the versioning.
-        1
+        2
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
@@ -127,8 +155,8 @@ fn cached(
     cache: &Cache,
     build: &[u8; 32],
     container: &[u8],
-    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
-) -> Result<HostShader, String> {
+    translate: impl Fn(&[u8]) -> Result<HostShader, Refusal> + Send + Sync,
+) -> Result<HostShader, Refusal> {
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
@@ -173,7 +201,7 @@ fn cached(
 }
 
 const MAGIC: &[u8; 4] = b"VSH2";
-const REFUSAL_MAGIC: &[u8; 4] = b"VSE1";
+const REFUSAL_MAGIC: &[u8; 4] = b"VSE2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -210,14 +238,15 @@ fn root_type(code: u32) -> RootType {
 }
 
 /// Little-endian words and length-prefixed lists.
-fn encode(outcome: &Result<HostShader, String>) -> Vec<u8> {
+fn encode(outcome: &Result<HostShader, Refusal>) -> Vec<u8> {
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
     let s = match outcome {
         Ok(s) => s,
-        Err(reason) => {
+        Err(refusal) => {
             let mut out = REFUSAL_MAGIC.to_vec();
-            word(&mut out, reason.len() as u32);
-            out.extend_from_slice(reason.as_bytes());
+            out.push(u8::from(refusal.required_stride));
+            word(&mut out, refusal.reason.len() as u32);
+            out.extend_from_slice(refusal.reason.as_bytes());
             return out;
         }
     };
@@ -270,7 +299,7 @@ fn encode(outcome: &Result<HostShader, String>) -> Vec<u8> {
     out
 }
 
-fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
+fn decode(bytes: &[u8]) -> Option<Result<HostShader, Refusal>> {
     struct Reader<'a>(&'a [u8]);
     impl<'a> Reader<'a> {
         fn take(&mut self, n: usize) -> Option<&'a [u8]> {
@@ -288,10 +317,23 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     }
     let mut r = Reader(bytes);
     let magic = r.take(4)?;
-    if magic == REFUSAL_MAGIC {
+    if magic == REFUSAL_MAGIC || magic == b"VSE1" {
+        // Older refusals carried only a message and always went through the probe.
+        let required_stride = if magic == b"VSE1" {
+            true
+        } else {
+            match r.take(1)? {
+                [0] => false,
+                [1] => true,
+                _ => return None,
+            }
+        };
         let raw = r.list()?;
         let reason = String::from_utf8(raw).ok()?;
-        return r.0.is_empty().then_some(Err(reason));
+        return r.0.is_empty().then_some(Err(Refusal {
+            reason,
+            required_stride,
+        }));
     }
     if magic != MAGIC {
         return None;
@@ -414,16 +456,16 @@ mod tests {
         let runs = AtomicU64::new(0);
         let refuse = |_: &[u8]| {
             runs.fetch_add(1, Ordering::Relaxed);
-            Err::<HostShader, _>("unsupported: test refusal".to_owned())
+            Err::<HostShader, _>(Refusal::fixed("unsupported: test refusal"))
         };
 
         assert_eq!(
             cached(&cache, &build_v1, container, refuse),
-            Err("unsupported: test refusal".to_owned())
+            Err(Refusal::fixed("unsupported: test refusal"))
         );
         assert_eq!(
             cached(&cache, &build_v1, container, refuse),
-            Err("unsupported: test refusal".to_owned())
+            Err(Refusal::fixed("unsupported: test refusal"))
         );
         assert_eq!(
             runs.load(Ordering::Relaxed),
@@ -447,7 +489,7 @@ mod tests {
         let damaged_runs = AtomicU64::new(0);
         let refuse_again = |_: &[u8]| {
             damaged_runs.fetch_add(1, Ordering::Relaxed);
-            Err::<HostShader, _>("unsupported: damaged".to_owned())
+            Err::<HostShader, _>(Refusal::fixed("unsupported: damaged"))
         };
         assert!(cached(&damaged_cache, &build_v1, container, refuse_again).is_err());
         assert_eq!(damaged_runs.load(Ordering::Relaxed), 1);
@@ -456,12 +498,12 @@ mod tests {
         }
         assert_eq!(
             cached(&damaged_cache, &build_v1, container, refuse_again),
-            Err("unsupported: damaged".to_owned())
+            Err(Refusal::fixed("unsupported: damaged"))
         );
         assert_eq!(damaged_runs.load(Ordering::Relaxed), 2);
         assert_eq!(
             cached(&damaged_cache, &build_v1, container, refuse_again),
-            Err("unsupported: damaged".to_owned())
+            Err(Refusal::fixed("unsupported: damaged"))
         );
         assert_eq!(damaged_runs.load(Ordering::Relaxed), 2);
     }
@@ -486,10 +528,10 @@ mod tests {
         let fail_runs = AtomicU64::new(0);
         let fail = |_: &[u8]| {
             fail_runs.fetch_add(1, Ordering::Relaxed);
-            Err::<HostShader, _>("unsupported".to_owned())
+            Err::<HostShader, _>(Refusal::fixed("unsupported"))
         };
         let error = cached(&cache, &[7; 32], b"other", fail).unwrap_err();
-        assert_eq!(error, "unsupported");
+        assert_eq!(error, Refusal::fixed("unsupported"));
         assert_eq!(fail_runs.load(Ordering::Relaxed), 1);
     }
 
@@ -514,17 +556,35 @@ mod tests {
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
 
-        let err: Result<HostShader, String> = Err("unsupported: opcode".to_owned());
+        let err: Result<HostShader, Refusal> = Err(Refusal::fixed("unsupported: opcode"));
         let err_bytes = encode(&err);
         assert_eq!(decode(&err_bytes), Some(err));
         assert_eq!(decode(&err_bytes[..err_bytes.len() - 1]), None);
         assert_eq!(decode(&[err_bytes.as_slice(), &[0]].concat()), None);
 
-        let empty_err: Result<HostShader, String> = Err(String::new());
+        let retry = Err(Refusal {
+            reason: "needs a view".into(),
+            required_stride: true,
+        });
+        assert_eq!(decode(&encode(&retry)), Some(retry));
+        let legacy = [b"VSE1".as_slice(), &2u32.to_le_bytes(), b"no"].concat();
+        assert_eq!(
+            decode(&legacy),
+            Some(Err(Refusal {
+                reason: "no".into(),
+                required_stride: true
+            }))
+        );
+        let mut invalid = err_bytes.clone();
+        invalid[4] = 2;
+        assert!(decode(&invalid).is_none());
+
+        let empty_err: Result<HostShader, Refusal> = Err(Refusal::fixed(""));
         assert_eq!(decode(&encode(&empty_err)), Some(empty_err));
 
         // Invalid UTF-8 inside a refusal entry is treated as damaged.
         let mut bad_utf8 = REFUSAL_MAGIC.to_vec();
+        bad_utf8.push(0);
         bad_utf8.extend(2u32.to_le_bytes());
         bad_utf8.extend([0xff, 0xfe]);
         assert_eq!(decode(&bad_utf8), None);

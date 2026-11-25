@@ -311,13 +311,23 @@ const STRUCTURED_READ: &[u32] = &[
 #[test]
 fn indexed_load_uses_the_view_stride_when_metadata_is_missing_or_invalid() {
     for metadata in [None, Some(0), Some(6), Some(2052)] {
+        let asked = std::cell::Cell::new(false);
         assert!(matches!(
-            buffer_shader(STRUCTURED_READ, metadata, &|_, _| None),
+            buffer_shader(STRUCTURED_READ, metadata, &|_, required| {
+                if required {
+                    asked.set(true);
+                }
+                None
+            }),
             Err(crate::ShaderError::Unsupported {
                 what: super::UNKNOWN_STRUCTURED_STRIDE,
                 ..
             })
         ));
+        assert!(
+            asked.get(),
+            "the initial refusal must permit a draw-time retry"
+        );
         for stride in [16, 32] {
             let called = std::cell::Cell::new(false);
             buffer_shader(STRUCTURED_READ, metadata, &|binding, required| {
@@ -338,6 +348,28 @@ fn indexed_load_uses_the_view_stride_when_metadata_is_missing_or_invalid() {
             .unwrap();
             assert!(called.get());
         }
+    }
+}
+
+#[test]
+fn a_gpu_selected_table_entry_never_requests_a_fixed_view_stride() {
+    // The group ID selects the descriptor in this table; there is no one
+    // binding the host can inspect before the dispatch.
+    let mut words = vec![0x8f04_8501]; // s_lshl_b32 s4, s1, 5
+    words.extend_from_slice(STRUCTURED_READ);
+    words[3] = 0x0800_0000; // s_load_dwordx4 s[8:11], s[0:1], s4
+    for value in [None, Some(4)] {
+        let result = buffer_shader(&words, None, &|_, required| {
+            assert!(!required, "a GPU-computed offset cannot name a fixed slot");
+            value.filter(|_| required)
+        });
+        assert!(matches!(
+            result,
+            Err(crate::ShaderError::Unsupported {
+                what: super::UNKNOWN_STRUCTURED_STRIDE,
+                ..
+            })
+        ));
     }
 }
 
