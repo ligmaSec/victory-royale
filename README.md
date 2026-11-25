@@ -360,6 +360,19 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
+These speed-ups are on by default in every build; `=0` turns one off to
+compare.
+
+| Variable | Default | Effect when `0` |
+|----------|---------|-----------------|
+| `VICTORY_DECLARE_ONCE` | on | each dispatch declares the ranges its shaders write again, even unchanged since the list's last title write |
+| `VICTORY_BIND_CACHE` | on | render targets are set on the host list again even when it already has the same views |
+| `VICTORY_CARD_HASH_LEN` | on | the card's hashes of a buffer copy cover its whole 64 KiB-rounded card buffer, not just the title buffer's bytes |
+
+`VICTORY_CARD_BUFFERS_MIN_KB=<KiB>` (unset: `VICTORY_CARD_BUFFERS_MIN_MB`,
+1 MiB) puts title buffer copies from that size up in the card's memory, also
+under 1 MiB; `64` takes every title buffer.
+
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
 

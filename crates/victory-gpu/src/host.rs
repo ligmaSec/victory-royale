@@ -783,6 +783,43 @@ mod tests {
         assert_eq!(first.raw_copies.advance(6, true), (5..6, 5..6));
     }
 
+    /// A range shaders write is declared once until a title write, and
+    /// every time with the switch off.
+    #[test]
+    fn gpu_writes_declared_once_until_title_written() {
+        let mut d = super::Deferred::default();
+        let (a, b) = ((1, 0x100, 64), (1, 0x200, 64));
+        assert!(d.declare_gpu_write(a, true));
+        assert!(!d.declare_gpu_write(a, true));
+        assert!(d.declare_gpu_write(b, true));
+        assert!(d.declare_gpu_write(a, false));
+        d.invalidate_refreshes();
+        assert!(d.declare_gpu_write(a, true));
+        assert!(d.declare_gpu_write(b, true));
+    }
+
+    /// Filled scratch blocks are forgotten at a title write, with the
+    /// refreshes.
+    #[test]
+    fn filled_scratch_forgotten_when_title_written() {
+        let mut d = super::Deferred::default();
+        d.filled.insert((0x1000, 288), 0xAB00);
+        assert_eq!(d.filled.get(&(0x1000, 288)), Some(&0xAB00));
+        d.invalidate_refreshes();
+        assert!(d.filled.is_empty());
+    }
+
+    /// A list's reset forgets the pipelines it kept, so a pipeline made
+    /// later at a freed address is kept again.
+    #[test]
+    fn bound_pipelines_forgotten_at_reset() {
+        let mut d = super::Deferred::default();
+        assert!(d.bound.insert(0x5000));
+        assert!(!d.bound.insert(0x5000));
+        d = super::Deferred::default();
+        assert!(d.bound.insert(0x5000));
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -1936,9 +1973,18 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The pipelines [`HostList::bind_pipeline`] kept, by address.
+    bound: std::collections::HashSet<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Ranges declared written by shaders since the list last wrote title
+    /// memory (host copy, address, bytes): declaring them again would
+    /// change nothing ([`Deferred::declare_gpu_write`]).
+    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
+    /// Scratch memory [`HostList::fill_scratch`] fills since the list last
+    /// wrote title memory (source, bytes): its host address.
+    filled: std::collections::HashMap<(usize, usize), u64>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// The numbered copies of title memory (`crate::memory`) the list
@@ -1996,7 +2042,19 @@ impl Deferred {
     /// before it is brought up to date again after it.
     fn invalidate_refreshes(&mut self) {
         self.refreshed.clear();
+        self.gpu_written.clear();
+        self.filled.clear();
         self.raw_copies.read = 0;
+    }
+
+    /// Whether shaders writing `key` (host copy, address, bytes) need a
+    /// step of its own: once until the list next writes title memory, or
+    /// every time with `VICTORY_DECLARE_ONCE=0`. Dispatches declared the
+    /// same few ranges thousands of times a frame, each step a flush of the
+    /// copy's pending refresh and a snapshot on the submitting thread (after
+    /// avatarmanz b32fb99, from Belobug dd799aad).
+    fn declare_gpu_write(&mut self, key: (usize, usize, usize), once: bool) -> bool {
+        self.gpu_written.insert(key) || !once
     }
 
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
@@ -3788,9 +3846,10 @@ impl Host {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     for (shadow, ranges) in &dirty {
-                        let Some((staging, before, size)) = shadow.card_sides() else {
+                        let Some((staging, before, _)) = shadow.card_sides() else {
                             continue;
                         };
+                        let size = shadow.card_hash_size();
                         for &(a, b) in ranges {
                             list.CopyBufferRegion(
                                 &shadow.buffer,
@@ -3938,9 +3997,10 @@ impl Host {
                         work.differs.0.GetGPUVirtualAddress(),
                     );
                     for r in plan.ranges.iter().filter(|r| r.compared) {
-                        let Some((_, Some(before), size)) = r.shadow.card_sides() else {
+                        let Some((_, Some(before), _)) = r.shadow.card_sides() else {
                             continue;
                         };
+                        let size = r.shadow.card_hash_size();
                         let constants = [
                             r.span.first,
                             r.span.skew,
@@ -5820,6 +5880,28 @@ impl HostList {
         }
     }
 
+    /// The list binds a pipeline: it and its root signature are kept until
+    /// the list is reset, and its name noted, the first time only. A kept
+    /// pipeline's address names no other until the reset (after avatarmanz
+    /// ab86ef7, from Belobug 92d353f8): two interface queries, three locks
+    /// and a name lookup less at every change of pipeline.
+    pub(crate) fn bind_pipeline(
+        &self,
+        name: &str,
+        pso: &ID3D12PipelineState,
+        root: &ID3D12RootSignature,
+    ) {
+        {
+            let mut deferred = self.deferred();
+            if !deferred.bound.insert(pso.as_raw() as usize) {
+                return;
+            }
+            deferred.kept.push(pso.clone().into());
+            deferred.kept.push(root.clone().into());
+        }
+        self.used_pipeline(name);
+    }
+
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -5858,6 +5940,22 @@ impl HostList {
         self.deferred().append_fill(fill, fill_workers());
     }
 
+    /// The host address of `len` bytes of scratch memory that hold the title
+    /// memory at `src` as of the list's submission: one scratch block and
+    /// fill per (source, bytes) until the list next writes title memory, so
+    /// a root constant buffer bound for many draws is filled once (up to 64
+    /// KiB each; after avatarmanz c96525d, from Belobug 84ea9c12).
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        if let Some(&gpu) = self.deferred().filled.get(&key) {
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        self.deferred().filled.insert(key, gpu);
+        Some(gpu)
+    }
+
     /// Brings `[address, address + len)` of a buffer's host copy up to date
     /// when the list is submitted (once per range until a title copy
     /// intervenes), keeping the copy alive until the list is reset.
@@ -5878,15 +5976,23 @@ impl HostList {
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
+    /// Declared once until the list next writes title memory
+    /// ([`Deferred::declare_gpu_write`]).
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        static ONCE: OnceLock<bool> = OnceLock::new();
+        let once = *ONCE.get_or_init(|| !crate::switch::off("VICTORY_DECLARE_ONCE"));
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.declare_gpu_write(key, once) {
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len));
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go

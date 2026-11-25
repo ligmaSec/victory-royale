@@ -164,11 +164,44 @@ fn card_limits() -> (u64, u64) {
         // the shader writes of the smaller buffers are then found by the
         // card's hashes too, and with that the first room's walls were
         // drawn in every run.
-        (
-            mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20),
-            mb("VICTORY_CARD_BUFFERS_MB", 1024),
-        )
+        let min_kb = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        let least = least_card_bytes(mb("VICTORY_CARD_BUFFERS_MIN_MB", 1), min_kb);
+        let most = mb("VICTORY_CARD_BUFFERS_MB", 1024);
+        tracing::info!(
+            card_buffers_min_kb = least >> 10,
+            card_buffers_max_mb = most >> 20,
+            "card buffer limits"
+        );
+        (least, most)
     })
+}
+
+/// The least title buffer size whose copy goes to the card's memory:
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (bytes, at least 1 MiB), or, when set above
+/// 0, `VICTORY_CARD_BUFFERS_MIN_KB` in KiB, which may go under 1 MiB (64:
+/// every title buffer; after avatarmanz 17c4717, from fxceless c36971b2).
+/// Copies under 1 MiB are nearly all there are and few bytes; in the PC's
+/// memory every shader access to them crosses the bus.
+fn least_card_bytes(min_mb_bytes: u64, min_kb: Option<u64>) -> u64 {
+    match min_kb {
+        Some(kib) if kib > 0 => kib.saturating_mul(1 << 10),
+        _ => min_mb_bytes.max(1 << 20),
+    }
+}
+
+/// The bytes of a copy the card's hashes cover: the title buffer's own
+/// (`len`), rounded up to the hash's 16-byte step, not the card buffer's
+/// `card_size` (rounded up to 64 KiB: a title buffer of 288 bytes gives
+/// nothing back past them). `own` off (`VICTORY_CARD_HASH_LEN=0`): the
+/// whole buffer.
+fn card_hash_size_of(len: u64, card_size: u64, own: bool) -> u64 {
+    if own {
+        len.next_multiple_of(16).min(card_size)
+    } else {
+        card_size
+    }
 }
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
@@ -414,7 +447,30 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{
+        CardSpan, PIECE, card_hash_size_of, card_piece_of, card_span_of, joined, joined_piece_runs,
+        least_card_bytes,
+    };
+
+    /// The MiB floor stays unless a KiB size above 0 is asked for.
+    #[test]
+    fn card_buffers_min_kb_goes_under_a_mib() {
+        assert_eq!(least_card_bytes(1 << 20, None), 1 << 20);
+        assert_eq!(least_card_bytes(0, None), 1 << 20);
+        assert_eq!(least_card_bytes(16 << 20, Some(0)), 16 << 20);
+        assert_eq!(least_card_bytes(16 << 20, Some(64)), 64 << 10);
+        assert_eq!(least_card_bytes(16 << 20, Some(u64::MAX)), u64::MAX);
+    }
+
+    /// Hashes cover the title buffer's bytes, 16-byte rounded, within the
+    /// card buffer; the switch off covers all of it.
+    #[test]
+    fn card_hashes_cover_the_title_buffer_only() {
+        assert_eq!(card_hash_size_of(288, 1 << 16, true), 288);
+        assert_eq!(card_hash_size_of(289, 1 << 16, true), 304);
+        assert_eq!(card_hash_size_of(1 << 16, 1 << 16, true), 1 << 16);
+        assert_eq!(card_hash_size_of(288, 1 << 16, false), 1 << 16);
+    }
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -2971,6 +3027,15 @@ impl Shadow {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         Some((&card.staging, before, card.size))
+    }
+
+    /// The bytes of the copy the card's hashes cover ([`card_hash_size_of`]),
+    /// the same for the hashes stored and those compared.
+    pub(crate) fn card_hash_size(&self) -> u64 {
+        static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let own = *OWN.get_or_init(|| !crate::switch::off("VICTORY_CARD_HASH_LEN"));
+        let size = self.card.as_ref().map_or(self.len, |c| c.size);
+        card_hash_size_of(self.len, size, own)
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
