@@ -11,10 +11,11 @@ Run the scenario on main, close the game as instructed, then repeat on the
 candidate with the same settings and window size. Each build gets a fresh
 translation cache. Add --plan to preview the instructions and build revisions.
 
-At REPORT READY, send the intact report.zip at the Upload: path privately
-to the requester. It stays in a new system temporary folder after exit.
-Send it before the system cleans that folder. If you see Partial report:,
-send that file and tell the requester which run stopped.
+Logs may contain your username, local file paths, or other sensitive information.
+At REPORT READY or TEST INTERRUPTED, review the logs in report.zip, including
+the .tar.gz archives on Linux. Share the ZIP privately with the requester only
+if you are comfortable with its contents. You can send a written summary instead.
+The printed path is in a temporary folder. If a run stopped, say which one.
 
 Both verified CI builds are included. You need Python 3.9 or newer. Linux
 also needs Bash and UMU (umu-run) and may download pinned vkd3d-proton on
