@@ -1,0 +1,43 @@
+name: Prepare a hardware test kit
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number
+        required: true
+        type: string
+      scenario:
+        description: What to do in each Series X run and when to close it
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+jobs:
+  kit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Match and verify both CI builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
+          SCENARIO: ${{ inputs.scenario }}
+        run: |
+          python3 scripts/hardware-test/prepare.py "$PR" --scenario "$SCENARIO" --output "$RUNNER_TEMP/kit.zip"
+          unzip -q "$RUNNER_TEMP/kit.zip" -d "$RUNNER_TEMP/kit"
+      - name: Publish the test kit
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: victory-series-x-pr-${{ inputs.pr }}
+          path: ${{ runner.temp }}/kit/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error

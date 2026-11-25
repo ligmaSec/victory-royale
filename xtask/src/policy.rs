@@ -151,11 +151,16 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    // Only these synthetic Metal test sources may use Python or Swift.
+    // Only the listed testing tools may use Python or Swift.
     // All size, magic, NUL and encoded-data checks still apply.
     let allowed = matches!(
         path,
-        "tests/metal/generate.py" | "tests/metal/run.py" | "tests/metal/probe.swift"
+        "tests/metal/generate.py"
+            | "tests/metal/run.py"
+            | "tests/metal/probe.swift"
+            | "scripts/hardware-test/run-test.py"
+            | "scripts/hardware-test/prepare.py"
+            | "tests/hardware-test.py"
     ) || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()

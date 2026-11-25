@@ -54,6 +54,30 @@ tar -xf victory-proton-x86_64.tar.gz
 ./victory/victory-proton.sh --run "/path/to/game/title.exe"
 ```
 
+## Requesting a hardware comparison
+
+Send testers one test kit and the instruction to extract it and run
+`python3 run-test.py` on Linux or `py run-test.py` on Windows. They select
+their game executable once. The runner shows the scenario, verifies both CI
+packages included in the kit, launches each with the Series X profile and a fresh translation
+cache, and prints one private report path. Testers can preview with `--plan`.
+
+Maintainers can run the [hardware kit workflow](../.github/workflows/hardware-request.yml)
+on main and share its ZIP, or prepare it from a trusted checkout using a
+signed-in GitHub CLI:
+
+```sh
+python3 scripts/hardware-test/prepare.py PR_NUMBER --output test-kit.zip \
+  --scenario "Wait at the menu for ten seconds. Enter the first scene. Close each run at the first subtitle."
+```
+
+The packager matches the successful PR build to its tested main parent and
+checks both artifact digests. If either artifact has expired, refresh the
+build pair first.
+The kit contains both unmodified CI distributions, the runner,
+instructions, license and request JSON. A full kit needs no tester GitHub login. Future requests can share just the JSON with the same runner.
+Testers share reports privately. Post configuration and measurements on the PR.
+
 ## What the host needs
 
 The Windows graphics tests create a Direct3D 12 device.
