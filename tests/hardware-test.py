@@ -240,6 +240,36 @@ class HardwareRequest(unittest.TestCase):
                 if not windows:
                     self.assertEqual((results / "main.tar.gz").read_bytes(), b"this launch")
 
+    def test_main_ci_refresh_after_a_docs_only_push(self):
+        prefix = "victory-proton-x86_64-"
+        calls = []
+        def api(path):
+            calls.append(path)
+            if "ci.yml/runs?" in path:
+                self.assertIn("head_sha=" + self.revision, path)
+                self.assertIn("branch=main", path)
+                return {"workflow_runs": [
+                    {"id": 1, "event": "workflow_dispatch", "head_branch": "another"},
+                    {"id": 2, "event": "pull_request", "head_branch": "main"},
+                    {"id": 3, "event": "push", "head_branch": "main"},
+                    {"id": 12, "event": "workflow_dispatch", "head_branch": "main"},
+                ]}
+            if "/3/artifacts" in path:
+                return {"artifacts": []}
+            self.assertIn("/12/artifacts", path)
+            return {"artifacts": [{"name": prefix + rev, "expired": False}
+                                  for rev in ("b" * 40, self.revision)]}
+
+        def download(args, check):
+            self.fake_download(args, check)
+            self.assertEqual(args[args.index("-n") + 1], prefix + self.revision)
+            (Path(args[-1]) / "SHA256SUMS").write_text(self.build["sha256"] + "  " + runner.PACKAGE)
+        with mock.patch.object(prepare, "api", side_effect=api), \
+                mock.patch.object(subprocess, "run", side_effect=download):
+            build, base, data = prepare.find_build("main", self.revision, prefix)
+        self.assertEqual((build, base, data), (self.build, None, self.package.read_bytes()))
+        self.assertEqual(len(calls), 3)
+
     def test_reject_wrong_merge_parent_and_expired_builds(self):
         artifact = {"name": "pr-7-" + self.revision, "expired": False}
         for expired in (False, True):
