@@ -351,6 +351,34 @@ pub(crate) fn save(now: bool) {
     }
 }
 
+/// Take turns replacing the cache entry across processes. Proton can deny a
+/// concurrent rename even when every writer has its own staging file.
+fn publish_cache_file(tmp: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+    let lock_path = path.with_extension("lock");
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0);
+    let started = Instant::now();
+    loop {
+        match options.open(&lock_path) {
+            Ok(_exclusive_handle) => return std::fs::rename(tmp, path),
+            Err(e)
+                if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION.0 as i32)
+                    && started.elapsed() < Duration::from_millis(250) =>
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Writes `bytes` to a unique temporary file beside `path`, then renames it
 /// over `path`: a reader never sees a part, and overlapping saves do not
 /// share a temporary file.
@@ -362,7 +390,7 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
         NEXT.fetch_add(1, Ordering::Relaxed)
     );
     let tmp = path.with_extension(extension);
-    let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    let written = std::fs::write(&tmp, bytes).and_then(|()| publish_cache_file(&tmp, path));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -539,6 +567,28 @@ mod tests {
                 .flatten()
                 .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
         );
+    }
+
+    #[test]
+    fn a_busy_publisher_leaves_the_previous_cache_for_the_next_save() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        write_atomically(&path, b"previous").unwrap();
+        let other = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(0)
+            .open(path.with_extension("lock"))
+            .unwrap();
+
+        assert!(write_atomically(&path, b"busy").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        drop(other);
+
+        write_atomically(&path, b"next").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"next");
     }
 
     #[test]
