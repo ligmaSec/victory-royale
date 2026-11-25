@@ -783,6 +783,21 @@ mod tests {
         assert_eq!(first.raw_copies.advance(6, true), (5..6, 5..6));
     }
 
+    /// A range shaders write is declared once until a title write, and
+    /// every time with the switch off.
+    #[test]
+    fn gpu_writes_declared_once_until_title_written() {
+        let mut d = super::Deferred::default();
+        let (a, b) = ((1, 0x100, 64), (1, 0x200, 64));
+        assert!(d.declare_gpu_write(a, true));
+        assert!(!d.declare_gpu_write(a, true));
+        assert!(d.declare_gpu_write(b, true));
+        assert!(d.declare_gpu_write(a, false));
+        d.invalidate_refreshes();
+        assert!(d.declare_gpu_write(a, true));
+        assert!(d.declare_gpu_write(b, true));
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -1939,6 +1954,10 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Ranges declared written by shaders since the list last wrote title
+    /// memory (host copy, address, bytes): declaring them again would
+    /// change nothing ([`Deferred::declare_gpu_write`]).
+    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// The numbered copies of title memory (`crate::memory`) the list
@@ -1996,7 +2015,18 @@ impl Deferred {
     /// before it is brought up to date again after it.
     fn invalidate_refreshes(&mut self) {
         self.refreshed.clear();
+        self.gpu_written.clear();
         self.raw_copies.read = 0;
+    }
+
+    /// Whether shaders writing `key` (host copy, address, bytes) need a
+    /// step of its own: once until the list next writes title memory, or
+    /// every time with `VICTORY_DECLARE_ONCE=0`. Dispatches declared the
+    /// same few ranges thousands of times a frame, each step a flush of the
+    /// copy's pending refresh and a snapshot on the submitting thread (after
+    /// avatarmanz b32fb99, from Belobug dd799aad).
+    fn declare_gpu_write(&mut self, key: (usize, usize, usize), once: bool) -> bool {
+        self.gpu_written.insert(key) || !once
     }
 
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
@@ -5878,15 +5908,23 @@ impl HostList {
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
+    /// Declared once until the list next writes title memory
+    /// ([`Deferred::declare_gpu_write`]).
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        static ONCE: OnceLock<bool> = OnceLock::new();
+        let once = *ONCE.get_or_init(|| !crate::switch::off("VICTORY_DECLARE_ONCE"));
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.declare_gpu_write(key, once) {
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len));
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go

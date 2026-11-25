@@ -360,6 +360,13 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
+These speed-ups are on by default in every build; `=0` turns one off to
+compare.
+
+| Variable | Default | Effect when `0` |
+|----------|---------|-----------------|
+| `VICTORY_DECLARE_ONCE` | on | each dispatch declares the ranges its shaders write again, even unchanged since the list's last title write |
+
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
 

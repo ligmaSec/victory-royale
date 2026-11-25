@@ -24,9 +24,21 @@ pub(crate) fn on(name: &str) -> bool {
     value_is_on(std::env::var_os(name).as_deref())
 }
 
+/// Whether a value switches off what is on by default: it is exactly `0`.
+fn value_is_off(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|v| v == "0")
+}
+
+/// Whether the environment variable `name` switches off something that is
+/// on by default (`VICTORY_DECLARE_ONCE=0` and its siblings).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn off(name: &str) -> bool {
+    value_is_off(std::env::var_os(name).as_deref())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::value_is_on;
+    use super::{value_is_off, value_is_on};
     use std::ffi::OsStr;
 
     #[test]
@@ -50,6 +62,15 @@ mod tests {
         // only `0` is new.
         for value in ["", "true", "yes", "2", "00", " 0", "0 "] {
             assert!(value_is_on(Some(OsStr::new(value))), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn default_on_switches_go_off_only_at_zero() {
+        assert!(!value_is_off(None));
+        assert!(value_is_off(Some(OsStr::new("0"))));
+        for value in ["", "1", "00", " 0", "false"] {
+            assert!(!value_is_off(Some(OsStr::new(value))), "{value:?}");
         }
     }
 }
