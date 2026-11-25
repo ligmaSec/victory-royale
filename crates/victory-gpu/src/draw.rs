@@ -170,6 +170,7 @@ pub(crate) struct State {
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
+    widened_targets: [u32; 8],
     depth: Option<DepthTarget>,
     /// The current draw also samples its read-only depth target.
     depth_sampled: bool,
@@ -246,8 +247,8 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
-fn dropped(pipeline: usize) {
-    crate::pipeline::note_drop(pipeline as This);
+fn dropped(state: &State) {
+    crate::pipeline::note_drop(state.pipeline as This, Some(&state.widened_targets));
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
@@ -454,6 +455,7 @@ impl State {
     /// Render targets and depth, resolved at bind time and set on the host list.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
         self.targets.clear();
+        self.widened_targets = [0; 8];
         self.bound_rtvs.clear();
         self.depth = None;
         self.bound_dsv = None;
@@ -497,9 +499,17 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
+            let desc = record.desc();
+            if let Some(format) = self.widened_targets.get_mut(self.bound_rtvs.len())
+                && desc.as_ref().is_none_or(|desc| {
+                    desc.Format.0 == 0 || desc.Format.0 as u32 == crate::resource::RGBA8_UNORM
+                })
+            {
+                *format = crate::resource::widened_packed_format(record.resource).unwrap_or(0);
+            }
             self.bound_rtvs.push(BoundRtv {
                 host: Some(texture.clone()),
-                desc: record.desc(),
+                desc,
             });
         }
         if let Some(record) = crate::descriptor::dsv_record(depth)
@@ -604,19 +614,24 @@ impl State {
     }
 
     fn bound_pipeline(&self, compute: bool) -> Option<std::sync::Arc<HostPipeline>> {
-        crate::pipeline::host::bound_pipeline(self.pipeline as This, |binding| {
-            let Root::Table(base) = *self.roots_ref(compute).get(usize::from(binding.slot))? else {
-                return None;
-            };
-            let handle = base.checked_add(u64::from(binding.offset_dwords) * 4)?;
-            let heap = self.heap_of(base)?;
-            if heap.samplers() {
-                return None;
-            }
-            heap.index(handle)?;
-            let view = crate::descriptor::view(handle)?;
-            crate::descriptor::host::structured_stride(&view, binding.uav)
-        })
+        crate::pipeline::host::bound_pipeline(
+            self.pipeline as This,
+            (!compute).then_some(&self.widened_targets),
+            |binding| {
+                let Root::Table(base) = *self.roots_ref(compute).get(usize::from(binding.slot))?
+                else {
+                    return None;
+                };
+                let handle = base.checked_add(u64::from(binding.offset_dwords) * 4)?;
+                let heap = self.heap_of(base)?;
+                if heap.samplers() {
+                    return None;
+                }
+                heap.index(handle)?;
+                let view = crate::descriptor::view(handle)?;
+                crate::descriptor::host::structured_stride(&view, binding.uav)
+            },
+        )
     }
 
     /// Brings the host list up to date for a draw; false if the draw cannot
@@ -714,6 +729,12 @@ impl State {
         self.depth
             .filter(|depth| !compute && depth.state == DEPTH_READ)
             .map(|depth| depth.resource)
+    }
+
+    /// An internal compute pass changed the host PSO and compute root signature.
+    pub(crate) fn invalidate_compute_binding(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots[1] = 0;
     }
 
     /// A descriptor a shader reads through a table: its host slot made if
@@ -1240,7 +1261,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            crate::pipeline::note_drop(self.pipeline as This);
+            crate::pipeline::note_drop(self.pipeline as This, None);
             self.frame_op(&format!("dispatch {x}x{y}x{z}"), true, false);
             return;
         }
@@ -1251,7 +1272,7 @@ impl State {
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
+            crate::pipeline::note_drop(self.pipeline as This, None);
             #[cfg(feature = "diagnostics")]
             self.frame_op(&format!("dispatch {x}x{y}x{z}"), true, false);
             return;
@@ -1396,7 +1417,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(self);
         }
     }
 
@@ -1882,7 +1903,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(self);
         }
     }
 
@@ -1987,7 +2008,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(self);
         }
     }
 }
@@ -2012,7 +2033,10 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             *dropped = "skipped shader";
-            crate::pipeline::note_drop(self.pipeline as This);
+            crate::pipeline::note_drop(
+                self.pipeline as This,
+                (kind != 2).then_some(&self.widened_targets),
+            );
             self.frame_op(&format!("indirect kind {kind}"), kind == 2, false);
             return false;
         }
@@ -2061,7 +2085,10 @@ impl State {
             let Some(p) = self.bound_pipeline(false) else {
                 *dropped = "no host pipeline for the rectangle path";
                 #[cfg(feature = "diagnostics")]
-                crate::pipeline::note_drop(self.pipeline as This);
+                crate::pipeline::note_drop(
+                    self.pipeline as This,
+                    (kind != 2).then_some(&self.widened_targets),
+                );
                 return false;
             };
             (!p.rects).then_some(p)
@@ -2169,8 +2196,7 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh_as(list, *at, 4, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
         }
-        self.host_pipeline = 0;
-        self.host_roots[1] = 0;
+        self.invalidate_compute_binding();
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),

@@ -12,7 +12,18 @@ use windows::core::{PCSTR, s};
 /// Compiles compute shader `source` (entry `main`) named `name` in
 /// messages: the system's compiler first, then DXC.
 pub(crate) fn compile_compute(name: &str, source: &str) -> windows::core::Result<Vec<u8>> {
-    match system_compile(name, source) {
+    let compiled = system_compile(name, source).and_then(|code| {
+        // Wine can accept the HLSL while omitting the root signature attribute.
+        if has_root_signature(&code) {
+            Ok(code)
+        } else {
+            Err((
+                windows::core::Error::empty(),
+                "missing embedded root signature".into(),
+            ))
+        }
+    });
+    match compiled {
         Ok(code) => Ok(code),
         Err((e, msg)) => {
             #[cfg(victory_bundled_hlsl)]
@@ -27,6 +38,11 @@ pub(crate) fn compile_compute(name: &str, source: &str) -> windows::core::Result
     }
 }
 
+fn has_root_signature(code: &[u8]) -> bool {
+    victory_shader::Container::parse(code)
+        .is_ok_and(|container| container.part(victory_shader::FourCC::RTS0).is_some())
+}
+
 // Match the source so a changed shader can never pick up another helper's bytecode.
 #[cfg(victory_bundled_hlsl)]
 fn bundled_shader(source: &str) -> Option<&'static [u8]> {
@@ -39,6 +55,7 @@ fn bundled_shader(source: &str) -> Option<&'static [u8]> {
         include_str!("../shaders/argument_clamp.hlsl") => Some(bytecode!("argument_clamp")),
         include_str!("../shaders/rect_rewrite.hlsl") => Some(bytecode!("rect_rewrite")),
         include_str!("../shaders/rect_expand.hlsl") => Some(bytecode!("rect_expand")),
+        include_str!("../shaders/packed_copy.hlsl") => Some(bytecode!("packed_copy")),
         _ => None,
     }
 }
@@ -202,10 +219,12 @@ mod tests {
             include_str!("../shaders/argument_clamp.hlsl"),
             include_str!("../shaders/rect_rewrite.hlsl"),
             include_str!("../shaders/rect_expand.hlsl"),
+            include_str!("../shaders/packed_copy.hlsl"),
         ] {
             let expected = bundled_shader(source).unwrap();
             let bytes = compile_compute("bundled helper", source).unwrap();
-            if system_compile("bundled helper", source).is_err() {
+            if !system_compile("bundled helper", source).is_ok_and(|code| has_root_signature(&code))
+            {
                 assert_eq!(bytes, expected);
             }
             let container = Container::parse(expected).unwrap();
@@ -227,7 +246,7 @@ mod tests {
         {
             assert_eq!(&code[..4], b"DXBC");
         }
-        if system.is_ok() || dxc.is_ok() {
+        if system.is_ok_and(|code| has_root_signature(&code)) || dxc.is_ok() {
             assert_eq!(&compile_compute("probe", PROBE).unwrap()[..4], b"DXBC");
         } else {
             assert!(compile_compute("probe", PROBE).is_err());

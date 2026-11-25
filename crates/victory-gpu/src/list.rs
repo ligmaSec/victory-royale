@@ -591,6 +591,25 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
+#[cfg(windows)]
+fn packed_transfer(
+    this: This,
+    dst: This,
+    record: impl FnOnce(&crate::host::HostList) -> bool,
+) -> bool {
+    let mut converted = false;
+    with_state(this, |list, state| {
+        converted = record(list);
+        if converted {
+            list.mark_work();
+            mark_work(this);
+            state.invalidate_compute_binding();
+            crate::texture::host_written(dst);
+        }
+    });
+    converted
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -603,6 +622,21 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         ) {
             if crate::texture::title_written(from) {
                 crate::texture::upload(&list, src, from);
+            }
+            if let Some(format) = crate::resource::packed_copy_format(dst, src)
+                && packed_transfer(this, dst, |list| {
+                    crate::packed_copy::record(list, to, from, format, || {
+                        ensure_state(list, dst, COPY_DEST);
+                        ensure_state(list, src, COPY_SOURCE);
+                    })
+                })
+            {
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| format!("copy packed resource {src:?} to {dst:?}"));
+                return;
+            }
+            if crate::resource::skip_mixed_packed_copy("CopyResource", to, from) {
+                return;
             }
             ensure_state(&list, dst, COPY_DEST);
             ensure_state(&list, src, COPY_SOURCE);
@@ -637,6 +671,86 @@ pub(crate) struct CopyLocation {
     resource: This,
     kind: u32,
     footprint: crate::resource::PlacedFootprint,
+}
+
+/// Stages a buffer-to-texture `CopyTextureRegion` source into an upload buffer
+/// filled at submission. When the destination was widened from a packed 16-bit
+/// format to `R8G8B8A8_UNORM` on this GPU, the upload footprint is widened and
+/// the texels are expanded on the CPU at submission.
+#[cfg(windows)]
+fn prepare_footprint_upload(
+    list: &crate::host::HostList,
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    src: CopyLocation,
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    CopyLocation,
+    u64,
+)> {
+    use windows::core::Interface;
+    let host = crate::host::host()?;
+    let bytes = src.footprint.bytes()?;
+    let data = buffer_range(src.resource, src.footprint.offset, bytes)?;
+    // SAFETY: a live host resource.
+    let dst_fmt = unsafe { to.GetDesc() }.Format.0 as u32;
+    let src_fmt = crate::resource::pc_format(src.footprint.format);
+    let mut from = src;
+    if dst_fmt == crate::resource::RGBA8_UNORM && crate::resource::PACKED_16.contains(&src_fmt) {
+        if src.footprint.width == 0 || src.footprint.height == 0 || src.footprint.depth == 0 {
+            return None;
+        }
+        if u64::from(src.footprint.row_pitch) < u64::from(src.footprint.width) * 2 {
+            tracing::warn!(
+                footprint = ?src.footprint,
+                "packed 16-bit copy footprint row pitch is smaller than a row"
+            );
+            return None;
+        }
+        let row_pitch = u64::from(src.footprint.width)
+            .checked_mul(4)?
+            .next_multiple_of(256);
+        let widened = crate::resource::PlacedFootprint {
+            offset: 0,
+            format: crate::resource::RGBA8_UNORM,
+            row_pitch: u32::try_from(row_pitch).ok()?,
+            ..src.footprint
+        };
+        let dst_bytes = widened.bytes()?;
+        let lines =
+            usize::try_from(u64::from(src.footprint.height) * u64::from(src.footprint.depth))
+                .ok()?;
+        let (src_len, dst_len) = (
+            usize::try_from(bytes).ok()?,
+            usize::try_from(dst_bytes).ok()?,
+        );
+        let (buffer, staging) = list.upload(host, dst_bytes)?;
+        let (width, src_pitch, dst_pitch) = (
+            src.footprint.width as usize,
+            src.footprint.row_pitch as usize,
+            widened.row_pitch as usize,
+        );
+        let (src_at, dst_at) = (data as usize, staging as usize);
+        list.defer_host(move || {
+            let mut packed = vec![0u8; src_len];
+            crate::host::copy_mapped(packed.as_mut_ptr(), src_at as *const u8, src_len, false);
+            // SAFETY: `staging` is the persistent mapping of `buffer`, kept
+            // alive in the list's `uploads` until the list is reset.
+            let dst = unsafe { std::slice::from_raw_parts_mut(dst_at as *mut u8, dst_len) };
+            crate::resource::expand_packed16_rows(
+                src_fmt, width, lines, &packed, src_pitch, dst, dst_pitch,
+            );
+        });
+        from.resource = buffer.as_raw().cast_const().cast();
+        from.footprint = widened;
+        return Some((buffer, from, dst_bytes));
+    }
+    let (buffer, staging) = list.upload(host, bytes)?;
+    // The list owns this mapped D3D12 upload buffer. Wine can report
+    // its address as MEM_FREE, so use the host-upload path.
+    list.defer_fill(staging, data, bytes as usize);
+    from.resource = buffer.as_raw().cast_const().cast();
+    from.footprint.offset = 0;
+    Some((buffer, from, bytes))
 }
 
 /// Texture to texture on the GPU, buffer to texture through an upload
@@ -782,28 +896,17 @@ extern "system" fn copy_texture_region(
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
-            let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
+            let Some((buffer, staged, bytes)) = prepare_footprint_upload(&list, to, src) else {
                 return;
             };
-            let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
-                return;
-            };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
-                return;
-            };
-            // Host-owned mapped upload (not title memory): `defer_fill` so
-            // `copy_mapped` skips the title-destination VirtualQuery guard.
-            // Wine+vkd3d can report Map memory as MEM_FREE; `defer_copy` would
-            // then skip the upload (#518). Buffer→buffer title destinations
-            // above keep `defer_copy`.
-            list.defer_fill(staging, data, bytes as usize);
-            from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
+            from = staged;
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
                 read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
             }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = bytes;
             _upload = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
@@ -811,6 +914,33 @@ extern "system" fn copy_texture_region(
             };
             if crate::texture::title_written(texture) {
                 crate::texture::upload(&list, src.resource, texture);
+            }
+            if dst.kind == 0
+                && src.kind == 0
+                && let Some(format) =
+                    crate::resource::packed_copy_format(dst.resource, src.resource)
+            {
+                // SAFETY: a non-null source box points at the six coordinates of the guest box.
+                let source_box = unsafe { source_box.cast::<D3D12_BOX>().as_ref() }.copied();
+                let region = crate::packed_copy::Region {
+                    src_subresource: src.footprint.offset as u32,
+                    dst_subresource: dst.footprint.offset as u32,
+                    offset: [x, y, z],
+                    source_box,
+                };
+                if packed_transfer(this, dst.resource, |list| {
+                    crate::packed_copy::record_region(list, to, texture, format, region, || {
+                        ensure_state(list, src.resource, COPY_SOURCE);
+                        ensure_state(list, dst.resource, COPY_DEST);
+                    })
+                }) {
+                    #[cfg(feature = "diagnostics")]
+                    list.note_op(|| format!("copy packed texture region {region:?}"));
+                    return;
+                }
+            }
+            if crate::resource::skip_mixed_packed_copy("CopyTextureRegion", to, texture) {
+                return;
             }
             ensure_state(&list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
@@ -874,6 +1004,138 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+#[cfg(windows)]
+fn packed_resolve(
+    this: This,
+    dst: This,
+    dst_sub: u32,
+    src: This,
+    src_sub: u32,
+    logical: u32,
+) -> bool {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::core::Interface;
+
+    let (Some(host), Some(to), Some(from)) = (
+        crate::host::host(),
+        crate::resource::host_resource(dst),
+        crate::resource::host_resource(src),
+    ) else {
+        return false;
+    };
+    // SAFETY: both host textures are live.
+    let (to_desc, from_desc) = unsafe { (to.GetDesc(), from.GetDesc()) };
+    if from_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || to_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || from_desc.SampleDesc.Count <= 1
+        || to_desc.SampleDesc.Count != 1
+    {
+        return false;
+    }
+    let (Some([src_w, src_h, _]), Some([dst_w, dst_h, _])) = (
+        crate::packed_copy::subresource_extent(&from_desc, src_sub),
+        crate::packed_copy::subresource_extent(&to_desc, dst_sub),
+    ) else {
+        return false;
+    };
+    let (resolve_w, resolve_h) = (src_w.min(dst_w), src_h.min(dst_h));
+    let cropped = (src_w, src_h) != (resolve_w, resolve_h);
+
+    packed_transfer(this, dst, |list| {
+        let list1 = if cropped {
+            let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() else {
+                return false;
+            };
+            Some(list1)
+        } else {
+            None
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let temp_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: u64::from(resolve_w),
+            Height: resolve_h,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: from_desc.Format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let mut temp: Option<ID3D12Resource> = None;
+        // SAFETY: default single-sample texture matching `from`'s physical format.
+        if unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &temp_desc,
+                D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                None,
+                &mut temp,
+            )
+        }
+        .is_err()
+        {
+            return false;
+        }
+        let Some(temp) = temp else {
+            return false;
+        };
+
+        const RESOLVE_SOURCE: u32 = 0x2000;
+        ensure_state(list, src, RESOLVE_SOURCE);
+        // SAFETY: open direct list, live textures, `src` in RESOLVE_SOURCE,
+        // `temp` in RESOLVE_DEST, matching physical formats and extents.
+        unsafe {
+            if let Some(list1) = &list1 {
+                let rect = RECT {
+                    left: 0,
+                    top: 0,
+                    right: resolve_w as i32,
+                    bottom: resolve_h as i32,
+                };
+                list1.ResolveSubresourceRegion(
+                    &temp,
+                    0,
+                    0,
+                    0,
+                    from,
+                    src_sub,
+                    Some(&rect),
+                    from_desc.Format,
+                    D3D12_RESOLVE_MODE_AVERAGE,
+                );
+            } else {
+                list.list
+                    .ResolveSubresource(&temp, 0, from, src_sub, from_desc.Format);
+            }
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &temp,
+                D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        list.keep(&temp);
+
+        let region = crate::packed_copy::Region {
+            src_subresource: 0,
+            dst_subresource: dst_sub,
+            offset: [0; 3],
+            source_box: None,
+        };
+        crate::packed_copy::record_region(list, to, &temp, logical, region, || {
+            ensure_state(list, dst, COPY_DEST);
+        })
+    })
+}
+
 extern "system" fn resolve(
     this: This,
     dst: This,
@@ -889,6 +1151,16 @@ extern "system" fn resolve(
             crate::resource::host_resource(src),
         )
     {
+        if let Some(logical) = crate::resource::packed_copy_format(dst, src)
+            && packed_resolve(this, dst, dst_sub, src, src_sub, logical)
+        {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("resolve packed {src:?} to {dst:?} format {logical}"));
+            return;
+        }
+        if crate::resource::skip_mixed_packed_copy("ResolveSubresource", to, from) {
+            return;
+        }
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, D3D12_RESOURCE_DESC, ID3D12GraphicsCommandList1,
@@ -901,6 +1173,7 @@ extern "system" fn resolve(
         ensure_state(&list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
         list.mark_work();
+        let format = crate::resource::bound_view_format(src, format);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         let extent = |d: D3D12_RESOURCE_DESC, subresource: u32| {
@@ -2964,5 +3237,128 @@ mod tests {
 
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_converts_between_packed_and_widened_targets() {
+        use crate::resource::{
+            PACKED_16, RGBA8_UNORM, pack_rgba8_to_16, packed_test, target_format,
+        };
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        eprintln!("adapter: {}", packed_test::adapter_name(host));
+        let mut cmd = packed_test::GuestCmd::new();
+
+        let pack_rgba = |format: u32, rgba: [u8; 4]| -> u16 {
+            let mut out = [0u8; 2];
+            pack_rgba8_to_16(format, &rgba, &mut out);
+            u16::from_le_bytes(out)
+        };
+
+        for fmt in PACKED_16 {
+            let msaa_supported = packed_test::adapter_supports_packed_msaa(&host.device, fmt, 4);
+            let msaa_phys = target_format(fmt, 1, (4, 0));
+            let uav_phys = target_format(fmt, 5, (1, 0));
+            eprintln!("f{fmt}: msaa={msaa_supported}, msaa_rt->f{msaa_phys}, uav_rt->f{uav_phys}");
+
+            // Mandatory cross-backend path when MSAA falls back to RGBA8_UNORM:
+            // physical 28 MSAA (logical 86/115) -> physical 86/115 single-sample.
+            if msaa_phys == RGBA8_UNORM {
+                let rtv_2dms = [fmt, 6, 0, 0, 0, 0];
+
+                // 1) Same-size resolve (4x4 -> 4x4).
+                let msaa_same = cmd.make_texture(4, 4, fmt, 1, 1, 1, 4);
+                let dst_same = cmd.make_texture(4, 4, fmt, 0, 1, 1, 1);
+                assert_eq!(packed_test::physical_format(msaa_same), RGBA8_UNORM);
+                assert_eq!(packed_test::physical_format(dst_same), fmt);
+                cmd.clear_rtv(msaa_same, Some(&rtv_2dms), &[1.0, 0.0, 0.0, 1.0], &[]);
+                cmd.resolve(dst_same, 0, msaa_same, 0, fmt);
+                cmd.execute();
+                cmd.reset();
+                let red = pack_rgba(fmt, [255, 0, 0, 255]);
+                let read = packed_test::readback_subresource(host, dst_same, 0, fmt, 4, 4, 256);
+                packed_test::assert_texels(fmt, fmt, &read, 256, 4, 4, |_, _| red);
+
+                // 2) Cropped src > dst resolve (6x6 -> 4x4) with spatial color rects.
+                let msaa_big = cmd.make_texture(6, 6, fmt, 1, 1, 1, 4);
+                let dst_small = cmd.make_texture(4, 4, fmt, 0, 1, 1, 1);
+                cmd.clear_rtv(msaa_big, Some(&rtv_2dms), &[0.0, 1.0, 0.0, 1.0], &[]);
+                cmd.clear_rtv(
+                    msaa_big,
+                    Some(&rtv_2dms),
+                    &[1.0, 0.0, 0.0, 1.0],
+                    &[[0, 0, 2, 2]],
+                );
+                cmd.clear_rtv(
+                    msaa_big,
+                    Some(&rtv_2dms),
+                    &[0.0, 0.0, 1.0, 1.0],
+                    &[[2, 2, 4, 4]],
+                );
+                cmd.resolve(dst_small, 0, msaa_big, 0, fmt);
+                cmd.execute();
+                cmd.reset();
+                let green = pack_rgba(fmt, [0, 255, 0, 255]);
+                let blue = pack_rgba(fmt, [0, 0, 255, 255]);
+                let cropped = packed_test::readback_subresource(host, dst_small, 0, fmt, 4, 4, 256);
+                packed_test::assert_texels(fmt, fmt, &cropped, 256, 4, 4, |x, y| {
+                    if x < 2 && y < 2 {
+                        red
+                    } else if (2..4).contains(&x) && (2..4).contains(&y) {
+                        blue
+                    } else {
+                        green
+                    }
+                });
+
+                // 3) Non-zero array slice & mip resolve (slice 1 -> slice 1 mip 1) with canary.
+                const CANARY: u16 = 0x4210;
+                let msaa_arr = cmd.make_texture(4, 4, fmt, 1, 1, 2, 4);
+                let dst_arr = cmd.make_texture(8, 8, fmt, 0, 2, 2, 1);
+                packed_test::upload_2d(&mut cmd, dst_arr, 0, fmt, (8, 8), 256, |_, _| CANARY);
+                packed_test::upload_2d(&mut cmd, dst_arr, 1, fmt, (4, 4), 256, |_, _| CANARY);
+                packed_test::upload_2d(&mut cmd, dst_arr, 2, fmt, (8, 8), 256, |_, _| CANARY);
+                let rtv_slice1 = [fmt, 7, 1, 1, 0, 0]; // D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY
+                cmd.clear_rtv(msaa_arr, Some(&rtv_slice1), &[0.0, 1.0, 1.0, 1.0], &[]);
+                cmd.resolve(dst_arr, 3, msaa_arr, 1, fmt);
+                cmd.execute();
+                cmd.reset();
+                let cyan = pack_rgba(fmt, [0, 255, 255, 255]);
+                let sub3 = packed_test::readback_subresource(host, dst_arr, 3, fmt, 4, 4, 256);
+                packed_test::assert_texels(fmt, fmt, &sub3, 256, 4, 4, |_, _| cyan);
+                for (sub, w, h) in [(0, 8, 8), (1, 4, 4), (2, 8, 8)] {
+                    let keep =
+                        packed_test::readback_subresource(host, dst_arr, sub, fmt, w, h, 256);
+                    packed_test::assert_texels(fmt, fmt, &keep, 256, w, h, |_, _| CANARY);
+                }
+            }
+
+            // Capability-gated reverse path: native MSAA -> widened 28 single-sample if
+            // supported, else verify guest MSAA falls back to 28 and resolves cleanly.
+            let msaa_src = cmd.make_texture(4, 4, fmt, 1, 1, 1, 4);
+            let dst_uav = cmd.make_texture(4, 4, fmt, 5, 1, 1, 1);
+            let actual_src_phys = packed_test::physical_format(msaa_src);
+            let actual_dst_phys = packed_test::physical_format(dst_uav);
+            if !msaa_supported {
+                assert_eq!(
+                    actual_src_phys, RGBA8_UNORM,
+                    "unsupported MSAA format {fmt} must fall back to RGBA8_UNORM"
+                );
+            }
+            let rtv_2dms = [fmt, 6, 0, 0, 0, 0];
+            cmd.clear_rtv(msaa_src, Some(&rtv_2dms), &[1.0, 0.0, 0.0, 1.0], &[]);
+            cmd.resolve(dst_uav, 0, msaa_src, 0, fmt);
+            cmd.execute();
+            cmd.reset();
+            let red = pack_rgba(fmt, [255, 0, 0, 255]);
+            let read =
+                packed_test::readback_subresource(host, dst_uav, 0, actual_dst_phys, 4, 4, 256);
+            packed_test::assert_texels(fmt, actual_dst_phys, &read, 256, 4, 4, |_, _| red);
+            eprintln!("f{fmt} reverse/fallback: src f{actual_src_phys} -> dst f{actual_dst_phys}");
+            packed_test::assert_no_d3d12_errors(host);
+        }
     }
 }

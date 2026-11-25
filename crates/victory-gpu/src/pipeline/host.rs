@@ -19,6 +19,7 @@ use crate::host::host;
 
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
+#[derive(Clone)]
 pub(crate) struct GraphicsState {
     blend: D3D12_BLEND_DESC,
     sample_mask: u32,
@@ -26,7 +27,7 @@ pub(crate) struct GraphicsState {
     depth: D3D12_DEPTH_STENCIL_DESC,
     /// Input elements, their names pointing into `names`.
     inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
-    names: Vec<CString>,
+    names: Arc<[CString]>,
     strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     pub(crate) topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE,
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
@@ -76,7 +77,7 @@ impl Default for GraphicsState {
                 ..Default::default()
             },
             inputs: Vec::new(),
-            names: Vec::new(),
+            names: Arc::from([]),
             strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
             topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED,
             targets: D3D12_RT_FORMAT_ARRAY::default(),
@@ -149,6 +150,30 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
 }
 
 impl GraphicsState {
+    pub(crate) fn choose_default_formats(&mut self) {
+        let samples = (self.samples.Count, self.samples.Quality);
+        for format in &mut self.targets.RTFormats {
+            format.0 = crate::resource::target_format(format.0 as u32, 1, samples) as i32;
+        }
+    }
+
+    /// Replaces the declared packed targets that are currently bound as RGBA8.
+    pub(crate) fn formats_for_targets(&self, widened: &[u32; 8]) -> Option<[i32; 8]> {
+        let mut formats = self.targets.RTFormats.map(|format| format.0);
+        let mut changed = false;
+        for (format, &logical) in formats
+            .iter_mut()
+            .zip(widened)
+            .take(self.targets.NumRenderTargets as usize)
+        {
+            if logical != 0 && *format as u32 == logical {
+                *format = crate::resource::RGBA8_UNORM as i32;
+                changed = true;
+            }
+        }
+        changed.then_some(formats)
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -191,10 +216,10 @@ impl GraphicsState {
                     self.names = elements
                         .iter()
                         .map(|e| CStr::from_ptr(e.SemanticName.0.cast()).to_owned())
-                        .collect();
+                        .collect::<Arc<[_]>>();
                     self.inputs = elements
                         .iter()
-                        .zip(&self.names)
+                        .zip(self.names.iter())
                         .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
                             SemanticName: PCSTR(name.as_ptr().cast()),
                             Format: DXGI_FORMAT(
@@ -212,12 +237,7 @@ impl GraphicsState {
                     self.topology =
                         D3D12_PRIMITIVE_TOPOLOGY_TYPE(data.cast::<i32>().read_unaligned())
                 }
-                15 => {
-                    self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
-                    for f in &mut self.targets.RTFormats {
-                        f.0 = crate::resource::target_format(f.0 as u32) as i32;
-                    }
-                }
+                15 => self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned(),
                 16 => {
                     let f = data.cast::<u32>().read_unaligned();
                     self.depth_format = DXGI_FORMAT(crate::resource::pc_format(f) as i32);
@@ -234,7 +254,7 @@ impl GraphicsState {
         let inputs: Vec<String> = self
             .inputs
             .iter()
-            .zip(&self.names)
+            .zip(self.names.iter())
             .map(|(e, name)| {
                 format!(
                     "{name:?} {} {} {} {} {} {}",
@@ -375,13 +395,17 @@ impl Shader {
 /// Gets the host PSO for the strides of the views bound to this draw or dispatch.
 pub(crate) fn bound_pipeline(
     this: crate::object::This,
+    widened: Option<&[u32; 8]>,
     view_stride: impl Fn(victory_shader::emit::StructuredBinding) -> Option<u32>,
 ) -> Option<Arc<HostPipeline>> {
     if this.is_null() {
         return None;
     }
-    let _ = super::host_pipeline(this);
-    super::make::ready_with_strides(&super::pipeline(this).host, view_stride)
+    let pipeline = super::pipeline(this);
+    let variant = pipeline.variant(widened);
+    let pending = variant.as_ref().unwrap_or(&pipeline.host);
+    let _ = super::make::ready(pending);
+    super::make::ready_with_strides(pending, view_stride)
 }
 
 pub(crate) struct HostPipeline {

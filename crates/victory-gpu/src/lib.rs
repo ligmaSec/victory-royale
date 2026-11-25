@@ -50,6 +50,8 @@ mod indirect;
 mod indirect_budget;
 pub mod list;
 pub mod object;
+#[cfg(windows)]
+mod packed_copy;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;

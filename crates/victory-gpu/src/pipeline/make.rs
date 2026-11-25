@@ -76,6 +76,13 @@ impl Pending {
         }
     }
 
+    pub(crate) fn with_formats(&self, graphics: &GraphicsState, formats: [i32; 8]) -> Pending {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let mut state = graphics.clone();
+        state.targets.RTFormats = formats.map(DXGI_FORMAT);
+        Self::new(self.shaders.clone(), Some(Box::new(state)))
+    }
+
     fn make(&self) {
         self.made.get_or_init(|| {
             static TRACE: OnceLock<bool> = OnceLock::new();

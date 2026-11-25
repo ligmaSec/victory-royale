@@ -240,6 +240,8 @@ struct Pipeline {
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
+    #[cfg(windows)]
+    variants: Mutex<HashMap<[i32; 8], Arc<make::Pending>>>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -267,15 +269,22 @@ pub(crate) fn bound(this: This) {
     }
 }
 
-/// The host pipeline of a title pipeline; `None` if one of its shaders does
-/// not translate, the host refuses it, or it is still being made (its first
-/// use starts that, see [`make`]).
 #[cfg(windows)]
-pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
-    if this.is_null() {
-        return None;
+impl Pipeline {
+    fn variant(&self, widened: Option<&[u32; 8]>) -> Option<Arc<make::Pending>> {
+        let graphics = self.host.graphics.as_deref()?;
+        let formats = graphics.formats_for_targets(widened?)?;
+        let mut variants = self
+            .variants
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        Some(
+            variants
+                .entry(formats)
+                .or_insert_with(|| Arc::new(self.host.with_formats(graphics, formats)))
+                .clone(),
+        )
     }
-    make::ready(&pipeline(this).host)
 }
 
 /// Host pipelines queued and not made yet.
@@ -396,14 +405,17 @@ pub(crate) fn drop_reason(this: This) -> String {
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
 /// for want of a host pipeline (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn note_drop(this: This) {
+pub(crate) fn note_drop(this: This, widened: Option<&[u32; 8]>) {
     let why = if this.is_null() {
         Some("no pipeline set".to_owned())
     } else {
         let p = pipeline(this);
         skipped_shader(p)
             .map(|hash| format!("skipped shader {hash}"))
-            .or_else(|| make::missing(&p.host))
+            .or_else(|| {
+                let variant = p.variant(widened);
+                make::missing(variant.as_ref().unwrap_or(&p.host))
+            })
     };
     if let Some(why) = why {
         note_why(why);
@@ -450,7 +462,13 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = {
+        let mut graphics = graphics;
+        if let Some(state) = graphics.as_deref_mut() {
+            state.choose_default_formats();
+        }
+        Arc::new(make::Pending::new(shaders.clone(), graphics))
+    };
     #[cfg(windows)]
     make::early(&host);
     let pipeline = Box::new(Pipeline {
@@ -458,6 +476,8 @@ fn hand_out(
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(windows)]
+        variants: Mutex::new(HashMap::new()),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -1088,5 +1108,265 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packed_rtv_pipeline_switches_physical_formats() {
+        use crate::resource::{packed_test, target_format};
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B5G5R5A1_UNORM;
+        use windows::core::{PCSTR, s};
+
+        const SOURCE: &str = r#"
+float4 vs(uint vertex : SV_VertexID) : SV_Position {
+    return float4(vertex == 1 ? 3.0 : -1.0, vertex == 2 ? -3.0 : 1.0, 0.5, 1.0);
+}
+float4 ps() : SV_Target0 {
+    return float4(1.0, 0.0, 0.0, 1.0);
+}
+"#;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let make_shader = |stage, hw_stage, entry: PCSTR, profile: PCSTR| {
+            let mut blob: Option<ID3DBlob> = None;
+            let mut errors: Option<ID3DBlob> = None;
+            // SAFETY: the HLSL source, C strings, and output locations live through compilation.
+            let result = unsafe {
+                D3DCompile(
+                    SOURCE.as_ptr().cast(),
+                    SOURCE.len(),
+                    s!("packed-rtv-variant"),
+                    None,
+                    None,
+                    entry,
+                    profile,
+                    0,
+                    0,
+                    &mut blob,
+                    Some(&mut errors),
+                )
+            };
+            if let Err(error) = result {
+                let detail = errors.as_ref().map(|blob| {
+                    // SAFETY: the diagnostic blob owns this range.
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            blob.GetBufferPointer().cast::<u8>(),
+                            blob.GetBufferSize(),
+                        )
+                    };
+                    String::from_utf8_lossy(bytes)
+                });
+                panic!("{stage} compilation failed: {error:?} {detail:?}");
+            }
+            let blob = blob.unwrap();
+            // SAFETY: the compiled blob owns this range until copied.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    blob.GetBufferPointer().cast::<u8>(),
+                    blob.GetBufferSize(),
+                )
+            };
+            Arc::new(Shader {
+                stage,
+                hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
+                container: bytes.to_vec(),
+                #[cfg(feature = "diagnostics")]
+                wave64: false.into(),
+                translated: OnceLock::from(Some(Translated {
+                    host: victory_shader::emit::HostShader {
+                        stage: hw_stage,
+                        dxil: bytes.to_vec(),
+                        user_data: Vec::new(),
+                        samplers: Vec::new(),
+                        static_samplers: Vec::new(),
+                        root_cbvs: Vec::new(),
+                        root_srvs: Vec::new(),
+                        root_uavs: Vec::new(),
+                    },
+                    used: Vec::new(),
+                })),
+            })
+        };
+        let vs = make_shader(
+            "vertex",
+            victory_shader::HwStage::Vs,
+            s!("vs"),
+            s!("vs_5_1"),
+        );
+        let ps = make_shader("pixel", victory_shader::HwStage::Ps, s!("ps"), s!("ps_5_1"));
+
+        #[repr(C)]
+        struct Subobject<T> {
+            kind: u32,
+            desc: T,
+        }
+        let face = D3D12_DEPTH_STENCILOP_DESC {
+            StencilFailOp: D3D12_STENCIL_OP_KEEP,
+            StencilDepthFailOp: D3D12_STENCIL_OP_KEEP,
+            StencilPassOp: D3D12_STENCIL_OP_KEEP,
+            StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+        };
+        let depth = Subobject {
+            kind: 11,
+            desc: D3D12_DEPTH_STENCIL_DESC {
+                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+                DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+                FrontFace: face,
+                BackFace: face,
+                ..Default::default()
+            },
+        };
+        let raster = Subobject {
+            kind: 10,
+            desc: D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                DepthClipEnable: true.into(),
+                ..Default::default()
+            },
+        };
+        let mut targets = Subobject {
+            kind: 15,
+            desc: D3D12_RT_FORMAT_ARRAY {
+                NumRenderTargets: 1,
+                ..Default::default()
+            },
+        };
+        targets.desc.RTFormats[0] = DXGI_FORMAT_B5G5R5A1_UNORM;
+        let mut graphics = host::GraphicsState::default();
+        graphics.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        // SAFETY: stack values contain complete stream subobjects in the expected layout.
+        unsafe {
+            graphics.read(depth.kind, (&raw const depth).cast());
+            graphics.read(raster.kind, (&raw const raster).cast());
+            graphics.read(targets.kind, (&raw const targets).cast());
+        }
+        let mut guest_pipeline = std::ptr::null();
+        assert_eq!(
+            hand_out(
+                vec![vs, ps],
+                Some(Box::new(graphics)),
+                &PIPELINE_IIDS[0],
+                &mut guest_pipeline
+            ),
+            S_OK
+        );
+
+        let mut cmd = packed_test::GuestCmd::new();
+        let rt = cmd.make_texture(1, 1, 86, 1, 1, 1, 1);
+        let rt_uav = cmd.make_texture(1, 1, 86, 5, 1, 1, 1);
+        let resources = [rt, rt_uav];
+        let formats = [
+            packed_test::physical_format(rt),
+            packed_test::physical_format(rt_uav),
+        ];
+        assert_eq!(formats[0], target_format(86, 1, (1, 0)));
+        assert_eq!(formats[1], target_format(86, 5, (1, 0)));
+        eprintln!(
+            "adapter: {}, f86 flags=1 -> f{}, flags=5 -> f{}",
+            packed_test::adapter_name(host),
+            formats[0],
+            formats[1]
+        );
+
+        let make_heap = |ty| -> ID3D12DescriptorHeap {
+            // SAFETY: valid shader-visible heap descriptor on a live device.
+            unsafe {
+                host.device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: ty,
+                        NumDescriptors: 1,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        ..Default::default()
+                    })
+            }
+            .unwrap()
+        };
+        let heaps = [
+            Some(make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)),
+            Some(make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)),
+        ];
+
+        for (order, explicit) in [([0usize, 1], true), ([1, 0], false)] {
+            let list = host.new_list().unwrap();
+            let mut state = crate::draw::State::default();
+            let mut records = [[0u64; 14]; 2];
+            // SAFETY: the list is open and the shader-visible heaps outlive submission.
+            unsafe {
+                list.list.SetDescriptorHeaps(&heaps);
+                list.list.RSSetViewports(&[D3D12_VIEWPORT {
+                    Width: 1.0,
+                    Height: 1.0,
+                    MaxDepth: 1.0,
+                    ..Default::default()
+                }]);
+                list.list.RSSetScissorRects(&[RECT {
+                    left: 0,
+                    top: 0,
+                    right: 1,
+                    bottom: 1,
+                }]);
+            }
+            state.set_topology(&list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32);
+            state.set_pipeline(guest_pipeline);
+            for index in order {
+                let guest = resources[index];
+                let image = crate::resource::host_resource(guest).unwrap();
+                crate::list::ensure_state(
+                    &list,
+                    guest,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32,
+                );
+                let clear_view = host.rtv(Some(image), None);
+                // SAFETY: texture is in RENDER_TARGET state and clear_view is live.
+                unsafe {
+                    list.list
+                        .ClearRenderTargetView(clear_view, &[0.0, 1.0, 0.0, 1.0], None);
+                }
+                let desc = [
+                    DXGI_FORMAT_B5G5R5A1_UNORM.0 as u32,
+                    D3D12_RTV_DIMENSION_TEXTURE2D.0 as u32,
+                    0,
+                    0,
+                    0,
+                    0,
+                ];
+                let handle = records[index].as_mut_ptr() as u64;
+                crate::descriptor::create_rtv(
+                    std::ptr::null(),
+                    guest,
+                    if explicit {
+                        desc.as_ptr().cast()
+                    } else {
+                        std::ptr::null()
+                    },
+                    handle,
+                );
+                state.set_targets(&list, &[handle], 0);
+                state.draw(&list, 3, 1, 0, 0);
+            }
+            packed_test::assert_no_d3d12_errors(host);
+            list.close();
+            host.execute(&[&list]);
+
+            for (i, &guest) in resources.iter().enumerate() {
+                let bytes =
+                    packed_test::readback_subresource(host, guest, 0, formats[i], 1, 1, 256);
+                packed_test::assert_texels(86, formats[i], &bytes, 256, 1, 1, |_, _| 0xfc00);
+            }
+            packed_test::assert_no_d3d12_errors(host);
+        }
+
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(guest_pipeline, 0x10)(guest_pipeline),
+            0
+        );
     }
 }

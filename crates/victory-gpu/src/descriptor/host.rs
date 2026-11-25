@@ -1763,7 +1763,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     // A texture whose console format PC forbids as a render target or UAV
     // was substituted (`resource::target_format`): views name its host format.
-    if view != own && crate::resource::target_format(view) == own {
+    if view != own && view == 67 && own == 10 {
         if let Some(format) = format {
             *format = d.Format;
         }
@@ -1830,6 +1830,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         }
                     }
                 }
+                if let Some(desc) = &mut desc {
+                    desc.Format.0 =
+                        crate::resource::bound_view_format(resource, desc.Format.0 as u32) as i32;
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -1879,6 +1883,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         desc = Some(default_uav_desc(&rd, fmt)?);
                     }
                 }
+            }
+            if let Some(desc) = &mut desc {
+                desc.Format.0 =
+                    crate::resource::bound_view_format(resource, desc.Format.0 as u32) as i32;
             }
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;

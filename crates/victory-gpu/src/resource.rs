@@ -91,7 +91,7 @@ pub(crate) struct ResourceDesc {
     height: u32,
     depth_or_array_size: u16,
     mip_levels: u16,
-    format: u32,
+    pub(crate) format: u32,
     sample_count: u32,
     sample_quality: u32,
     layout: u32,
@@ -250,20 +250,349 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
-/// The format a render target or unordered-access texture of `format` is
-/// made in on the host, and that render target views and pipelines name:
-/// `R16G16B16A16_FLOAT` (10) for `R9G9B9E5_SHAREDEXP` (67), which PC D3D12
-/// forbids as a render target or unordered-access resource; else
-/// [`pc_format`]. Textures only sampled keep `R9G9B9E5_SHAREDEXP`.
-pub(crate) fn target_format(format: u32) -> u32 {
-    const R9G9B9E5_SHAREDEXP: u32 = 67;
-    const RGBA16_FLOAT: u32 = 10;
+/// R8G8B8A8_UNORM, which stands in for a packed 16-bit render target the
+/// host cannot make (see [`target_format`]).
+pub(crate) const RGBA8_UNORM: u32 = 28;
+
+/// The console's packed 16-bit colour formats a title renders to:
+/// B5G5R5A1_UNORM (86) and B4G4R4A4_UNORM (115).
+pub(crate) const PACKED_16: [u32; 2] = [86, 115];
+
+const PACKED_WRITE_FLAGS: u32 = 1 | 4;
+
+/// D3D12 resource flags supported by the adapter for this packed format.
+#[cfg(windows)]
+fn packed_write_flags(format: u32) -> u32 {
+    use std::sync::OnceLock;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+
+    static SUPPORT: [OnceLock<u32>; PACKED_16.len()] = [const { OnceLock::new() }; PACKED_16.len()];
+    let i = PACKED_16
+        .iter()
+        .position(|&f| f == format)
+        .expect("packed format");
+    *SUPPORT[i].get_or_init(|| {
+        let Some(host) = crate::host::host() else {
+            return PACKED_WRITE_FLAGS;
+        };
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: DXGI_FORMAT(format as i32),
+            ..Default::default()
+        };
+        // SAFETY: the feature writes the matching local structure.
+        if unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_err()
+        {
+            return 0;
+        }
+        let rt = support
+            .Support1
+            .contains(D3D12_FORMAT_SUPPORT1_RENDER_TARGET);
+        let uav = support
+            .Support1
+            .contains(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)
+            && support
+                .Support2
+                .contains(D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+        u32::from(rt) | (u32::from(uav) << 2)
+    })
+}
+
+#[cfg(not(windows))]
+fn packed_write_flags(_: u32) -> u32 {
+    PACKED_WRITE_FLAGS
+}
+
+#[cfg(windows)]
+fn packed_supports_samples(format: u32, (count, quality): (u32, u32)) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+
+    let Some(host) = crate::host::host() else {
+        return true;
+    };
+    let mut support = D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS {
+        Format: DXGI_FORMAT(format as i32),
+        SampleCount: count,
+        ..Default::default()
+    };
+    // SAFETY: the feature writes the matching local structure.
+    let supported = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    }
+    .is_ok();
+    // The standard and center patterns use the two reserved quality values.
+    supported
+        && support.NumQualityLevels > 0
+        && (quality < support.NumQualityLevels || quality >= u32::MAX - 1)
+}
+
+#[cfg(not(windows))]
+fn packed_supports_samples(_: u32, _: (u32, u32)) -> bool {
+    true
+}
+
+/// Physical texture format for the declared write uses and sample description.
+pub(crate) fn target_format(format: u32, flags: u32, samples: (u32, u32)) -> u32 {
     let format = pc_format(format);
-    if format == R9G9B9E5_SHAREDEXP {
-        RGBA16_FLOAT
+    let write = flags & PACKED_WRITE_FLAGS;
+    if write != 0 && format == 67 {
+        return 10;
+    }
+    if write != 0
+        && PACKED_16.contains(&format)
+        && (packed_write_flags(format) & write != write
+            || (samples.0 > 1 && !packed_supports_samples(format, samples)))
+    {
+        RGBA8_UNORM
     } else {
         format
     }
+}
+
+/// The logical format of a packed resource backed by RGBA8 on this device.
+#[cfg(windows)]
+pub(crate) fn widened_packed_format(this: This) -> Option<u32> {
+    let host = host_resource(this)?;
+    let format = pc_format(resource(this).desc.format);
+    if !PACKED_16.contains(&format) {
+        return None;
+    }
+    // SAFETY: the host texture is live for the call.
+    (unsafe { host.GetDesc() }.Format.0 as u32 == RGBA8_UNORM).then_some(format)
+}
+
+/// The packed view of a widened resource uses its backing format.
+#[cfg(windows)]
+pub(crate) fn bound_view_format(this: This, view: u32) -> u32 {
+    let view = pc_format(view);
+    if view == 67 {
+        return 10;
+    }
+    if PACKED_16.contains(&view) && widened_packed_format(this) == Some(view) {
+        RGBA8_UNORM
+    } else {
+        view
+    }
+}
+
+/// Expands one packed 16-bit texel in DXGI `B5G5R5A1_UNORM` (86: B bits 0-4,
+/// G 5-9, R 10-14, A 15) or `B4G4R4A4_UNORM` (115: B 0-3, G 4-7, R 8-11, A
+/// 12-15) into `R8G8B8A8_UNORM` by bit replication.
+fn unpack_16(format: u32, packed: u16) -> [u8; 4] {
+    let bits = |shift: u32, width: u32| -> u8 { ((packed >> shift) & ((1 << width) - 1)) as u8 };
+    match format {
+        86 => {
+            let (r, g, b) = (bits(10, 5), bits(5, 5), bits(0, 5));
+            let a = if packed >> 15 != 0 { 255 } else { 0 };
+            [
+                (r << 3) | (r >> 2),
+                (g << 3) | (g >> 2),
+                (b << 3) | (b >> 2),
+                a,
+            ]
+        }
+        115 => {
+            let (r, g, b, a) = (bits(8, 4), bits(4, 4), bits(0, 4), bits(12, 4));
+            [(r << 4) | r, (g << 4) | g, (b << 4) | b, (a << 4) | a]
+        }
+        _ => unreachable!("only B5G5R5A1 and B4G4R4A4 are packed 16-bit"),
+    }
+}
+
+#[cfg(test)]
+fn quantize_unorm(v: u8, max: u16) -> u16 {
+    (u16::from(v) * max + 127) / 255
+}
+
+/// Packs one `R8G8B8A8_UNORM` texel into DXGI `B5G5R5A1_UNORM` (86) or
+/// `B4G4R4A4_UNORM` (115).
+#[cfg(test)]
+fn pack_16(format: u32, rgba: [u8; 4]) -> u16 {
+    let [r, g, b, a] = rgba;
+    match format {
+        86 => {
+            quantize_unorm(b, 31)
+                | (quantize_unorm(g, 31) << 5)
+                | (quantize_unorm(r, 31) << 10)
+                | (quantize_unorm(a, 1) << 15)
+        }
+        115 => {
+            quantize_unorm(b, 15)
+                | (quantize_unorm(g, 15) << 4)
+                | (quantize_unorm(r, 15) << 8)
+                | (quantize_unorm(a, 15) << 12)
+        }
+        _ => unreachable!("only B5G5R5A1 and B4G4R4A4 are packed 16-bit"),
+    }
+}
+
+/// Expands `src` (`B5G5R5A1_UNORM` 86 or `B4G4R4A4_UNORM` 115, 2 bytes per
+/// texel) into `dst` (`R8G8B8A8_UNORM`, 4 bytes per texel).
+pub(crate) fn expand_packed16(format: u32, src: &[u8], dst: &mut [u8]) {
+    if !PACKED_16.contains(&format) {
+        return;
+    }
+    for (s, d) in src
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+    {
+        *d = unpack_16(format, u16::from_le_bytes(*s));
+    }
+}
+
+/// Packs `src` (`R8G8B8A8_UNORM`, 4 bytes per texel) into `dst`
+/// (`B5G5R5A1_UNORM` 86 or `B4G4R4A4_UNORM` 115, 2 bytes per texel).
+#[cfg(test)]
+pub(crate) fn pack_rgba8_to_16(format: u32, src: &[u8], dst: &mut [u8]) {
+    if !PACKED_16.contains(&format) {
+        return;
+    }
+    for (s, d) in src
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<2>().0.iter_mut())
+    {
+        *d = pack_16(format, *s).to_le_bytes();
+    }
+}
+
+fn for_rows(
+    width: usize,
+    lines: usize,
+    src: (&[u8], usize, usize),
+    dst: (&mut [u8], usize, usize),
+    mut row: impl FnMut(&[u8], &mut [u8]),
+) {
+    if width == 0 || lines == 0 {
+        return;
+    }
+    for line in 0..lines {
+        let s = &src.0[line * src.1..][..width * src.2];
+        let d = &mut dst.0[line * dst.1..][..width * dst.2];
+        row(s, d);
+    }
+}
+
+/// Expands `lines` rows of `width` texels in packed 16-bit `format`
+/// (`src_pitch` bytes apart) into `R8G8B8A8_UNORM` (`dst_pitch` bytes apart).
+pub(crate) fn expand_packed16_rows(
+    format: u32,
+    width: usize,
+    lines: usize,
+    src: &[u8],
+    src_pitch: usize,
+    dst: &mut [u8],
+    dst_pitch: usize,
+) {
+    if !PACKED_16.contains(&format) {
+        return;
+    }
+    for_rows(
+        width,
+        lines,
+        (src, src_pitch, 2),
+        (dst, dst_pitch, 4),
+        |s, d| {
+            expand_packed16(format, s, d);
+        },
+    );
+}
+
+/// Packs `lines` rows of `width` `R8G8B8A8_UNORM` texels (`src_pitch` bytes
+/// apart) into packed 16-bit `format` (`dst_pitch` bytes apart).
+#[cfg(test)]
+pub(crate) fn pack_rgba8_to_16_rows(
+    format: u32,
+    width: usize,
+    lines: usize,
+    src: &[u8],
+    src_pitch: usize,
+    dst: &mut [u8],
+    dst_pitch: usize,
+) {
+    if !PACKED_16.contains(&format) {
+        return;
+    }
+    for_rows(
+        width,
+        lines,
+        (src, src_pitch, 4),
+        (dst, dst_pitch, 2),
+        |s, d| {
+            pack_rgba8_to_16(format, s, d);
+        },
+    );
+}
+
+/// Packing format shared by a widened texture and one with native storage.
+#[cfg(windows)]
+pub(crate) fn packed_copy_format(to: This, from: This) -> Option<u32> {
+    let (to_host, from_host) = (host_resource(to)?, host_resource(from)?);
+    let format = pc_format(resource(to).desc.format);
+    if !PACKED_16.contains(&format) || pc_format(resource(from).desc.format) != format {
+        return None;
+    }
+    // SAFETY: both host resources are live.
+    let formats = unsafe {
+        (
+            to_host.GetDesc().Format.0 as u32,
+            from_host.GetDesc().Format.0 as u32,
+        )
+    };
+    (formats == (format, RGBA8_UNORM) || formats == (RGBA8_UNORM, format)).then_some(format)
+}
+
+/// Whether a GPU-to-GPU copy or resolve between `to` and `from` mixes a
+/// native packed 16-bit texture with a widened (or different) format, logging
+/// once per packed format so callers can skip the command before recording
+/// barriers or marking the destination written.
+#[cfg(windows)]
+pub(crate) fn skip_mixed_packed_copy(
+    op: &str,
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> bool {
+    use std::sync::Once;
+    // SAFETY: live host resources.
+    let (to_fmt, from_fmt) =
+        unsafe { (to.GetDesc().Format.0 as u32, from.GetDesc().Format.0 as u32) };
+    if to_fmt == from_fmt {
+        return false;
+    }
+    let Some(packed) = [from_fmt, to_fmt]
+        .into_iter()
+        .find(|f| PACKED_16.contains(f))
+    else {
+        return false;
+    };
+    static ONCE: [Once; 2] = [Once::new(), Once::new()];
+    if let Some(i) = PACKED_16.iter().position(|&f| f == packed) {
+        ONCE[i].call_once(|| {
+            tracing::warn!(
+                op,
+                packed_format = packed,
+                to_format = to_fmt,
+                from_format = from_fmt,
+                "skipping GPU copy between packed 16-bit texture and widened R8G8B8A8_UNORM target"
+            );
+        });
+    }
+    true
 }
 
 /// The typeless format of a format's family (itself if it has none).
@@ -323,7 +652,10 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     let own = pc_format(resource(this).desc.format);
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    (format != own && format != target_format(own)).then_some(own)
+    (format != own
+        && !(own == 67 && format == 10)
+        && !(PACKED_16.contains(&own) && format == RGBA8_UNORM))
+        .then_some(own)
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -943,17 +1275,13 @@ fn host_texture(
     // allows both; the title's shadow maps ask for it).
     // shortcut: the host copy loses UAV use; give it a second view-only
     // copy if draws write it as a UAV.
+    const RENDER_TARGET: u32 = 1;
     const DEPTH: u32 = 2;
     const UNORDERED: u32 = 4;
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
-    const RENDER_TARGET: u32 = 1;
-    d.format = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
-        target_format(d.format)
-    } else {
-        pc_format(d.format)
-    };
+    d.format = target_format(d.format, d.flags, (d.sample_count, d.sample_quality));
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -974,11 +1302,7 @@ fn host_texture(
     let clear_value: Option<[u32; 5]> = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
-        value[0] = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
-            target_format(value[0])
-        } else {
-            pc_format(value[0])
-        };
+        value[0] = target_format(value[0], d.flags, (d.sample_count, d.sample_quality));
         value
     });
     let heap = D3D12_HEAP_PROPERTIES {
@@ -1507,7 +1831,11 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         && o.desc.mip_levels == r.desc.mip_levels
         && o.desc.depth_or_array_size == r.desc.depth_or_array_size
         && o.desc.flags & DEPTH == 0
-        && target_format(o.desc.format) == o.desc.format
+        && target_format(
+            o.desc.format,
+            o.desc.flags,
+            (o.desc.sample_count, o.desc.sample_quality),
+        ) == o.desc.format
         && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
     same.then_some(other)
 }
@@ -3025,9 +3353,223 @@ void main() {
     #[test]
     fn r9g9b9e5_target_format_substitutes_rgba16f() {
         assert_eq!(pc_format(67), 67);
-        assert_eq!(target_format(67), 10);
-        assert_eq!(target_format(28), 28);
-        assert_eq!(target_format(118), 45);
+        assert_eq!(target_format(67, 1, (1, 0)), 10);
+        assert_eq!(target_format(28, 1, (1, 0)), 28);
+        assert_eq!(target_format(118, 1, (1, 0)), 45);
+    }
+
+    #[test]
+    fn packed_16_conversion_matches_dxgi_layout() {
+        // B5G5R5A1_UNORM (86): B in bits 0-4, G 5-9, R 10-14, A 15.
+        let mut out = [0u8; 4];
+        for (packed, expected) in [
+            (0x0000u16, [0, 0, 0, 0]),
+            (0xffff, [255, 255, 255, 255]),
+            (0x8000, [0, 0, 0, 255]),
+            (0x7c00, [255, 0, 0, 0]),
+            (0x03e0, [0, 255, 0, 0]),
+            (0x001f, [0, 0, 255, 0]),
+            // Bit replication: v << 3 | v >> 2 (r=24->198, g=10->82, b=21->173).
+            (0x8000 | (24 << 10) | (10 << 5) | 21, [198, 82, 173, 255]),
+            ((1 << 10) | (16 << 5) | 2, [8, 132, 16, 0]),
+        ] {
+            expand_packed16(86, &packed.to_le_bytes(), &mut out);
+            assert_eq!(out, expected, "B5G5R5A1 {packed:#06x}");
+        }
+
+        // B4G4R4A4_UNORM (115): B in bits 0-3, G 4-7, R 8-11, A 12-15.
+        for (packed, expected) in [
+            (0x0000u16, [0, 0, 0, 0]),
+            (0xffff, [255, 255, 255, 255]),
+            (0xf000, [0, 0, 0, 255]),
+            (0x0f00, [255, 0, 0, 0]),
+            (0x00f0, [0, 255, 0, 0]),
+            (0x000f, [0, 0, 255, 0]),
+            (0xca73, [0xaa, 0x77, 0x33, 0xcc]),
+        ] {
+            expand_packed16(115, &packed.to_le_bytes(), &mut out);
+            assert_eq!(out, expected, "B4G4R4A4 {packed:#06x}");
+        }
+
+        // Every 16-bit value round-trips losslessly through RGBA8 and back.
+        for format in PACKED_16 {
+            let mut rgba = [0u8; 4];
+            let mut back = [0u8; 2];
+            for value in 0..=u16::MAX {
+                let raw = value.to_le_bytes();
+                expand_packed16(format, &raw, &mut rgba);
+                pack_rgba8_to_16(format, &rgba, &mut back);
+                assert_eq!(back, raw, "format {format} value {value:#06x}");
+            }
+        }
+
+        // Alpha thresholding on B5G5R5A1 and pitched multi-row expansion/packing.
+        let mut back = [0u8; 4];
+        pack_rgba8_to_16(86, &[0, 0, 0, 127, 0, 0, 0, 128], &mut back);
+        assert_eq!(
+            [
+                u16::from_le_bytes([back[0], back[1]]),
+                u16::from_le_bytes([back[2], back[3]]),
+            ],
+            [0x0000, 0x8000]
+        );
+
+        let src_rows = [
+            0x1fu8, 0x00, 0xe0, 0x03, 0xaa, 0xaa, // row 0: 2 texels + 2B pitch pad
+            0x00, 0x7c, 0x00, 0x80, // row 1: 2 texels (exact end, no pad)
+        ];
+        let mut dst_rows = [0u8; 16 + 8]; // pitch 16 on row 0, 8 bytes on row 1
+        expand_packed16_rows(86, 2, 2, &src_rows, 6, &mut dst_rows, 16);
+        assert_eq!(&dst_rows[0..8], &[0, 0, 255, 0, 0, 255, 0, 0]);
+        assert_eq!(&dst_rows[16..24], &[255, 0, 0, 0, 0, 0, 0, 255]);
+
+        let mut repacked = [0u8; 10];
+        pack_rgba8_to_16_rows(86, 2, 2, &dst_rows, 16, &mut repacked, 6);
+        assert_eq!(&repacked[0..4], &src_rows[0..4]);
+        assert_eq!(&repacked[6..10], &src_rows[6..10]);
+    }
+
+    #[test]
+    fn target_format_is_identity_for_non_packed_formats() {
+        for format in 0..=200u32 {
+            if PACKED_16.contains(&format) {
+                assert!(
+                    [format, RGBA8_UNORM].contains(&target_format(format, 1 | 4, (1, 0))),
+                    "unexpected target format for {format}"
+                );
+            } else if format == 67 {
+                assert_eq!(target_format(format, 5, (1, 0)), 10);
+            } else if (118..=120).contains(&format) {
+                assert_eq!(target_format(format, 1 | 4, (1, 0)), format - 118 + 45);
+            } else {
+                assert_eq!(
+                    target_format(format, 1 | 4, (1, 0)),
+                    format,
+                    "format {format}"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packed_16_targets_copy_and_resolve() {
+        const TEXELS: [u16; 16] = [
+            0x0000, 0xffff, 0x8000, 0x7c00, 0x03e0, 0x001f, 0xca73, 0x92a5, 0x1234, 0x5678, 0x9abc,
+            0xdef0, 0x8421, 0x4210, 0x0f0f, 0xf0f0,
+        ];
+        const CANARY: u16 = 0x03e0;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let mut cmd = packed_test::GuestCmd::new();
+
+        for fmt in PACKED_16 {
+            let rt = cmd.make_texture(4, 4, fmt, 1 | 4, 1, 1, 1);
+            let rt2 = cmd.make_texture(4, 4, fmt, 1, 1, 1, 1);
+            let msaa_rt = cmd.make_texture(4, 4, fmt, 1, 1, 1, 4);
+            let sampled = cmd.make_texture(4, 4, fmt, 0, 1, 1, 1);
+            let source = cmd.make_buffer(2048);
+
+            let (data, _) = buffer_bytes(source).unwrap();
+            // SAFETY: the buffer holds 2048 bytes.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(data, 2048) };
+            // Non-zero buffer offset (512) with 4x4 packed 16-bit texels.
+            for row in 0..4 {
+                let at = 512 + row * 256;
+                for col in 0..4 {
+                    let le = TEXELS[row * 4 + col].to_le_bytes();
+                    bytes[at + col * 2..at + col * 2 + 2].copy_from_slice(&le);
+                }
+            }
+            let src_fp = PlacedFootprint {
+                offset: 512,
+                format: fmt,
+                width: 4,
+                height: 4,
+                depth: 1,
+                row_pitch: 256,
+            };
+            let tex_fp = PlacedFootprint {
+                offset: 0,
+                ..src_fp
+            };
+            let to = packed_test::CopyLocation {
+                resource: rt,
+                kind: 0,
+                footprint: tex_fp,
+            };
+            let from = packed_test::CopyLocation {
+                resource: source,
+                kind: 1,
+                footprint: src_fp,
+            };
+            cmd.copy_region(&to, 0, 0, 0, &from, None);
+            cmd.execute();
+
+            let host_fmt = packed_test::physical_format(rt);
+            assert_eq!(host_fmt, target_format(fmt, 1 | 4, (1, 0)));
+            assert_eq!(packed_test::physical_format(sampled), fmt);
+            assert_eq!(view_format(rt), None);
+
+            let read = packed_test::readback_subresource(host, rt, 0, host_fmt, 4, 4, 256);
+            packed_test::assert_texels(fmt, host_fmt, &read, 256, 4, 4, |x, y| {
+                TEXELS[(y * 4 + x) as usize]
+            });
+
+            // Upload into sampled, copy sampled -> rt2, overwrite sampled with canary,
+            // copy rt2 -> sampled, and verify real pixel readbacks across both paths.
+            cmd.reset();
+            packed_test::upload_2d(&mut cmd, sampled, 0, fmt, (4, 4), 256, |x, y| {
+                TEXELS[(y * 4 + x) as usize]
+            });
+            let tex_to = packed_test::CopyLocation {
+                resource: rt2,
+                kind: 0,
+                footprint: tex_fp,
+            };
+            let tex_from = packed_test::CopyLocation {
+                resource: sampled,
+                kind: 0,
+                footprint: tex_fp,
+            };
+            cmd.copy_region(&tex_to, 0, 0, 0, &tex_from, None);
+            cmd.execute();
+            let rt2_fmt = packed_test::physical_format(rt2);
+            let read_rt2 = packed_test::readback_subresource(host, rt2, 0, rt2_fmt, 4, 4, 256);
+            packed_test::assert_texels(fmt, rt2_fmt, &read_rt2, 256, 4, 4, |x, y| {
+                TEXELS[(y * 4 + x) as usize]
+            });
+
+            cmd.reset();
+            packed_test::upload_2d(&mut cmd, sampled, 0, fmt, (4, 4), 256, |_, _| CANARY);
+            cmd.copy_resource(sampled, rt2);
+            cmd.execute();
+            let read_sampled = packed_test::readback_subresource(host, sampled, 0, fmt, 4, 4, 256);
+            packed_test::assert_texels(fmt, fmt, &read_sampled, 256, 4, 4, |x, y| {
+                TEXELS[(y * 4 + x) as usize]
+            });
+
+            // Clear MSAA target to solid red and resolve to both rt2 and sampled.
+            cmd.reset();
+            let rtv_desc = [
+                fmt, 6, // D3D12_RTV_DIMENSION_TEXTURE2DMS
+                0, 0, 0, 0,
+            ];
+            cmd.clear_rtv(msaa_rt, Some(&rtv_desc), &[1.0, 0.0, 0.0, 1.0], &[]);
+            cmd.resolve(rt2, 0, msaa_rt, 0, fmt);
+            cmd.resolve(sampled, 0, msaa_rt, 0, fmt);
+            cmd.execute();
+            cmd.reset();
+
+            let expected_red = pack_16(fmt, [255, 0, 0, 255]);
+            let read_res_rt2 = packed_test::readback_subresource(host, rt2, 0, rt2_fmt, 4, 4, 256);
+            packed_test::assert_texels(fmt, rt2_fmt, &read_res_rt2, 256, 4, 4, |_, _| expected_red);
+            let read_res_sampled =
+                packed_test::readback_subresource(host, sampled, 0, fmt, 4, 4, 256);
+            packed_test::assert_texels(fmt, fmt, &read_res_sampled, 256, 4, 4, |_, _| expected_red);
+            packed_test::assert_no_d3d12_errors(host);
+        }
     }
 
     #[cfg(windows)]
@@ -3069,6 +3611,675 @@ void main() {
             assert_eq!(got, expected_host_format, "flags {flags}");
             assert_eq!(view_format(out), None, "flags {flags}");
             assert_eq!(slot::<Release>(out, 0x10)(out), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packed_resource_copy_roundtrips_all_subresources() {
+        const WIDTH: u32 = 3;
+        const HEIGHT: u32 = 2;
+        const CASES: [(u32, [u16; 6]); 2] = [
+            (86, [0xfc00, 0x83e0, 0x001f, 0xaa53, 0x4210, 0x7fff]),
+            (115, [0xff00, 0xf0f0, 0x000f, 0xa357, 0x84c1, 0x0fff]),
+        ];
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        eprintln!("adapter: {}", packed_test::adapter_name(host));
+        let mut cmd = packed_test::GuestCmd::new();
+
+        for (format, values) in CASES {
+            let packed = cmd.make_texture(WIDTH, HEIGHT, format, 0, 2, 2, 1);
+            let widened = cmd.make_texture(WIDTH, HEIGHT, format, 5, 2, 2, 1);
+            let roundtrip = cmd.make_texture(WIDTH, HEIGHT, format, 0, 2, 2, 1);
+            let widened_fmt = packed_test::physical_format(widened);
+            assert_eq!(widened_fmt, target_format(format, 5, (1, 0)));
+
+            let dims = |sub: u32| {
+                if sub.is_multiple_of(2) {
+                    (WIDTH, HEIGHT)
+                } else {
+                    (1, 1)
+                }
+            };
+            let texel = |sub: u32, x: u32, y: u32| {
+                let (w, _) = dims(sub);
+                values[(sub as usize * 2 + (y * w + x) as usize) % values.len()]
+            };
+
+            let upload = cmd.make_buffer(4 * 512);
+            let (data, len) = buffer_bytes(upload).unwrap();
+            assert_eq!(len, 2048);
+            // SAFETY: live upload buffer of 2048 bytes.
+            let buf = unsafe { std::slice::from_raw_parts_mut(data, 2048) };
+            for sub in 0..4u32 {
+                let (w, h) = dims(sub);
+                for y in 0..h {
+                    for x in 0..w {
+                        let at = sub as usize * 512 + y as usize * 256 + x as usize * 2;
+                        buf[at..at + 2].copy_from_slice(&texel(sub, x, y).to_le_bytes());
+                    }
+                }
+                let footprint = PlacedFootprint {
+                    offset: u64::from(sub) * 512,
+                    format,
+                    width: w,
+                    height: h,
+                    depth: 1,
+                    row_pitch: 256,
+                };
+                let from = packed_test::CopyLocation {
+                    resource: upload,
+                    kind: 1,
+                    footprint,
+                };
+                let to = packed_test::CopyLocation {
+                    resource: packed,
+                    kind: 0,
+                    footprint: PlacedFootprint {
+                        offset: u64::from(sub),
+                        ..footprint
+                    },
+                };
+                cmd.copy_region(&to, 0, 0, 0, &from, None);
+            }
+            cmd.copy_resource(widened, packed);
+            cmd.copy_resource(roundtrip, widened);
+            cmd.execute();
+            cmd.reset();
+
+            for (image, physical) in [(widened, widened_fmt), (roundtrip, format)] {
+                for sub in 0..4u32 {
+                    let (w, h) = dims(sub);
+                    let bytes =
+                        packed_test::readback_subresource(host, image, sub, physical, w, h, 256);
+                    packed_test::assert_texels(format, physical, &bytes, 256, w, h, |x, y| {
+                        texel(sub, x, y)
+                    });
+                }
+            }
+            eprintln!("f{format} (flags=5 -> f{widened_fmt}): 4 subresources roundtripped");
+            packed_test::assert_no_d3d12_errors(host);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packed_texture_region_copy_preserves_box_and_neighbours() {
+        const SRC: (u32, u32) = (5, 4);
+        const DST: (u32, u32) = (6, 5);
+        const BOX: [u32; 6] = [1, 1, 0, 4, 3, 1];
+        const ORIGIN: (u32, u32) = (2, 2);
+        const CANARY: u16 = 0x03e0;
+        const COLOURS: [u16; 6] = [0x95bb, 0x6d10, 0xfc00, 0x07d2, 0x001f, 0xffff];
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let mut cmd = packed_test::GuestCmd::new();
+
+        for format in PACKED_16 {
+            let colour = |x: u32, y: u32, reverse: bool| {
+                let i = (y * (BOX[3] - BOX[0]) + x) as usize;
+                COLOURS[if reverse { COLOURS.len() - 1 - i } else { i }]
+            };
+            let fp = |(w, h), sub| PlacedFootprint {
+                offset: sub,
+                format,
+                width: w,
+                height: h,
+                depth: 1,
+                row_pitch: 256,
+            };
+            for reverse in [false, true] {
+                let (src_flags, dst_flags) = if reverse { (5, 0) } else { (0, 5) };
+                let source = cmd.make_texture(SRC.0, SRC.1, format, src_flags, 1, 2, 1);
+                let dest = cmd.make_texture(DST.0, DST.1, format, dst_flags, 1, 2, 1);
+                let src_phys = packed_test::physical_format(source);
+                let dst_phys = packed_test::physical_format(dest);
+                assert_eq!(src_phys, target_format(format, src_flags, (1, 0)));
+                assert_eq!(dst_phys, target_format(format, dst_flags, (1, 0)));
+
+                // Copy between slice 1 of source and slice 1 of dest; slice 0 stays canary.
+                packed_test::upload_2d(&mut cmd, source, 1, format, SRC, 256, |x, y| {
+                    if (BOX[0]..BOX[3]).contains(&x) && (BOX[1]..BOX[4]).contains(&y) {
+                        colour(x - BOX[0], y - BOX[1], reverse)
+                    } else {
+                        0x4210
+                    }
+                });
+                packed_test::upload_2d(&mut cmd, dest, 0, format, DST, 256, |_, _| CANARY);
+                packed_test::upload_2d(&mut cmd, dest, 1, format, DST, 256, |_, _| CANARY);
+
+                let from = packed_test::CopyLocation {
+                    resource: source,
+                    kind: 0,
+                    footprint: fp(SRC, 1),
+                };
+                let to = packed_test::CopyLocation {
+                    resource: dest,
+                    kind: 0,
+                    footprint: fp(DST, 1),
+                };
+                cmd.copy_region(&to, ORIGIN.0, ORIGIN.1, 0, &from, Some(&BOX));
+                cmd.execute();
+                cmd.reset();
+
+                let box_w = BOX[3] - BOX[0];
+                let box_h = BOX[4] - BOX[1];
+                let slice1 =
+                    packed_test::readback_subresource(host, dest, 1, dst_phys, DST.0, DST.1, 256);
+                packed_test::assert_texels(format, dst_phys, &slice1, 256, DST.0, DST.1, |x, y| {
+                    if (ORIGIN.0..ORIGIN.0 + box_w).contains(&x)
+                        && (ORIGIN.1..ORIGIN.1 + box_h).contains(&y)
+                    {
+                        colour(x - ORIGIN.0, y - ORIGIN.1, reverse)
+                    } else {
+                        CANARY
+                    }
+                });
+                let slice0 =
+                    packed_test::readback_subresource(host, dest, 0, dst_phys, DST.0, DST.1, 256);
+                packed_test::assert_texels(format, dst_phys, &slice0, 256, DST.0, DST.1, |_, _| {
+                    CANARY
+                });
+                eprintln!("f{format} region f{src_phys} -> f{dst_phys}: box + canary verified");
+            }
+            packed_test::assert_no_d3d12_errors(host);
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) mod packed_test {
+    use super::*;
+    use crate::object::slot;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter, IDXGIFactory4,
+    };
+    use windows::core::Interface;
+
+    type Release = extern "system" fn(This) -> u32;
+
+    const PROPERTIES: HeapProperties = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 0,
+        visible_nodes: 0,
+    };
+
+    #[repr(C)]
+    pub(crate) struct CopyLocation {
+        pub resource: This,
+        pub kind: u32,
+        pub footprint: PlacedFootprint,
+    }
+    const _: () = assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
+
+    type CopyRegion = extern "system" fn(
+        This,
+        *const CopyLocation,
+        u32,
+        u32,
+        u32,
+        *const CopyLocation,
+        *const u8,
+    );
+    type CopyRes = extern "system" fn(This, This, This);
+    type Resolve = extern "system" fn(This, This, u32, This, u32, u32);
+    type ClearRtv = extern "system" fn(This, u64, *const [f32; 4], u32, *const [i32; 4]);
+    type Close = extern "system" fn(This) -> HRESULT;
+    type Reset = extern "system" fn(This, This, This) -> HRESULT;
+    type Execute = extern "system" fn(This, u32, *const This);
+
+    pub(crate) struct GuestCmd {
+        pub queue: This,
+        pub allocator: This,
+        pub list: This,
+        owned: Vec<This>,
+    }
+
+    impl GuestCmd {
+        pub(crate) fn new() -> Self {
+            let null = std::ptr::null();
+            let queue_iid = guid(
+                0x0ec870a6,
+                0x5d7e,
+                0x4c22,
+                [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+            );
+            let allocator_iid = guid(
+                0x6102dee4,
+                0xaf59,
+                0x4b09,
+                [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+            );
+            let list_iid = guid(
+                0x5b160d0f,
+                0xac1b,
+                0x4185,
+                [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+            );
+            let (mut queue, mut allocator, mut list) = (null, null, null);
+            let queue_desc = [0u32; 4];
+            assert_eq!(
+                crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+                S_OK
+            );
+            assert_eq!(
+                crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+                S_OK
+            );
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+                S_OK
+            );
+            Self {
+                queue,
+                allocator,
+                list,
+                owned: Vec::new(),
+            }
+        }
+
+        pub(crate) fn make_resource(&mut self, desc: &ResourceDesc, state: u32) -> This {
+            let null = std::ptr::null();
+            let mut out = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    desc,
+                    state,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut out,
+                ),
+                S_OK
+            );
+            self.owned.push(out);
+            out
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn make_texture(
+            &mut self,
+            width: u32,
+            height: u32,
+            format: u32,
+            flags: u32,
+            mips: u16,
+            array: u16,
+            samples: u32,
+        ) -> This {
+            const COPY_DEST: u32 = 0x400;
+            self.make_resource(
+                &ResourceDesc {
+                    dimension: 3,
+                    alignment: 0,
+                    width: u64::from(width),
+                    height,
+                    depth_or_array_size: array,
+                    mip_levels: mips,
+                    format,
+                    sample_count: samples,
+                    sample_quality: 0,
+                    layout: 0,
+                    flags,
+                },
+                COPY_DEST,
+            )
+        }
+
+        pub(crate) fn make_buffer(&mut self, bytes: u64) -> This {
+            self.make_resource(
+                &ResourceDesc {
+                    dimension: 1,
+                    alignment: 0,
+                    width: bytes,
+                    height: 1,
+                    depth_or_array_size: 1,
+                    mip_levels: 1,
+                    format: 0,
+                    sample_count: 1,
+                    sample_quality: 0,
+                    layout: 1,
+                    flags: 0,
+                },
+                0,
+            )
+        }
+
+        pub(crate) fn copy_region(
+            &self,
+            to: &CopyLocation,
+            x: u32,
+            y: u32,
+            z: u32,
+            from: &CopyLocation,
+            source_box: Option<&[u32; 6]>,
+        ) {
+            let box_ptr = source_box.map_or(std::ptr::null(), |b| b.as_ptr().cast());
+            slot::<CopyRegion>(self.list, 0x80)(self.list, to, x, y, z, from, box_ptr);
+        }
+
+        pub(crate) fn copy_resource(&self, dst: This, src: This) {
+            slot::<CopyRes>(self.list, 0x88)(self.list, dst, src);
+        }
+
+        pub(crate) fn resolve(
+            &self,
+            dst: This,
+            dst_sub: u32,
+            src: This,
+            src_sub: u32,
+            format: u32,
+        ) {
+            slot::<Resolve>(self.list, 0x98)(self.list, dst, dst_sub, src, src_sub, format);
+        }
+
+        pub(crate) fn clear_rtv(
+            &self,
+            resource: This,
+            desc: Option<&[u32; 6]>,
+            color: &[f32; 4],
+            rects: &[[i32; 4]],
+        ) {
+            let mut record = [0u64; 14];
+            let handle = record.as_mut_ptr() as u64;
+            let desc_ptr = desc.map_or(std::ptr::null(), |d| d.as_ptr().cast());
+            crate::descriptor::create_rtv(std::ptr::null(), resource, desc_ptr, handle);
+            let rects_ptr = if rects.is_empty() {
+                std::ptr::null()
+            } else {
+                rects.as_ptr()
+            };
+            slot::<ClearRtv>(self.list, 0x1a0)(
+                self.list,
+                handle,
+                color,
+                rects.len() as u32,
+                rects_ptr,
+            );
+        }
+
+        pub(crate) fn execute(&self) {
+            assert_eq!(slot::<Close>(self.list, 0x48)(self.list), S_OK);
+            slot::<Execute>(self.queue, 0x50)(self.queue, 1, &self.list);
+        }
+
+        pub(crate) fn reset(&self) {
+            assert_eq!(
+                slot::<Reset>(self.list, 0x50)(self.list, self.allocator, std::ptr::null()),
+                S_OK
+            );
+        }
+    }
+
+    impl Drop for GuestCmd {
+        fn drop(&mut self) {
+            for r in self.owned.drain(..) {
+                let rc = slot::<Release>(r, 0x10)(r);
+                if !std::thread::panicking() {
+                    assert_eq!(rc, 0);
+                }
+            }
+            for o in [self.list, self.allocator, self.queue] {
+                let rc = slot::<Release>(o, 0x10)(o);
+                if !std::thread::panicking() {
+                    assert_eq!(rc, 0);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn adapter_name(host: &crate::host::Host) -> String {
+        // SAFETY: the live device supplies its adapter LUID.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter = factory
+                .EnumAdapterByLuid(host.device.GetAdapterLuid())
+                .unwrap();
+            let desc = adapter.GetDesc().unwrap();
+            String::from_utf16_lossy(&desc.Description)
+                .trim_end_matches('\0')
+                .to_owned()
+        }
+    }
+
+    pub(crate) fn adapter_supports_packed_msaa(
+        device: &ID3D12Device,
+        format: u32,
+        samples: u32,
+    ) -> bool {
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: DXGI_FORMAT(format as i32),
+            ..Default::default()
+        };
+        let mut quality = D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS {
+            Format: DXGI_FORMAT(format as i32),
+            SampleCount: samples,
+            ..Default::default()
+        };
+        // SAFETY: valid D3D12 feature query structures on a live device.
+        unsafe {
+            let fmt_ok = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+                .is_ok();
+            let msaa_ok = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                    (&raw mut quality).cast(),
+                    size_of_val(&quality) as u32,
+                )
+                .is_ok();
+            fmt_ok
+                && msaa_ok
+                && support
+                    .Support1
+                    .contains(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET)
+                && support
+                    .Support1
+                    .contains(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE)
+                && quality.NumQualityLevels > 0
+        }
+    }
+
+    pub(crate) fn assert_no_d3d12_errors(host: &crate::host::Host) {
+        let messages = host.log_messages();
+        assert!(messages.is_none(), "D3D12 debug messages: {messages:?}");
+        // SAFETY: plain device health query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    pub(crate) fn physical_format(guest: This) -> u32 {
+        let host = host_resource(guest).expect("host resource");
+        // SAFETY: live host resource.
+        unsafe { host.GetDesc() }.Format.0 as u32
+    }
+
+    pub(crate) fn upload_2d(
+        cmd: &mut GuestCmd,
+        dst: This,
+        subresource: u32,
+        format: u32,
+        (width, height): (u32, u32),
+        row_pitch: usize,
+        pixel: impl Fn(u32, u32) -> u16,
+    ) -> This {
+        let len = row_pitch * height as usize;
+        let buffer = cmd.make_buffer(len as u64);
+        let (data, actual_len) = buffer_bytes(buffer).unwrap();
+        assert_eq!(actual_len, len as u64);
+        // SAFETY: live guest upload buffer of `len` bytes.
+        let slice = unsafe { std::slice::from_raw_parts_mut(data, len) };
+        for y in 0..height {
+            for x in 0..width {
+                let at = y as usize * row_pitch + x as usize * 2;
+                slice[at..at + 2].copy_from_slice(&pixel(x, y).to_le_bytes());
+            }
+        }
+        let fp = PlacedFootprint {
+            offset: 0,
+            format,
+            width,
+            height,
+            depth: 1,
+            row_pitch: row_pitch as u32,
+        };
+        let from = CopyLocation {
+            resource: buffer,
+            kind: 1,
+            footprint: fp,
+        };
+        let to = CopyLocation {
+            resource: dst,
+            kind: 0,
+            footprint: PlacedFootprint {
+                offset: u64::from(subresource),
+                ..fp
+            },
+        };
+        cmd.copy_region(&to, 0, 0, 0, &from, None);
+        buffer
+    }
+
+    pub(crate) fn readback_subresource(
+        host: &crate::host::Host,
+        guest: This,
+        subresource: u32,
+        format: u32,
+        width: u32,
+        height: u32,
+        row_pitch: usize,
+    ) -> Vec<u8> {
+        let len = row_pitch * height as usize;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: len as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT(0),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: valid readback buffer description and local output pointer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        let image = host_resource(guest).expect("host texture");
+        let back = host.new_list().unwrap();
+        const COPY_SOURCE: u32 = 0x800;
+        crate::list::ensure_state(&back, guest, COPY_SOURCE);
+        let from = CopyLocation {
+            resource: image.as_raw().cast_const().cast(),
+            kind: 0,
+            footprint: PlacedFootprint {
+                offset: u64::from(subresource),
+                format,
+                width,
+                height,
+                depth: 1,
+                row_pitch: row_pitch as u32,
+            },
+        };
+        let to = CopyLocation {
+            resource: readback.as_raw().cast_const().cast(),
+            kind: 1,
+            footprint: PlacedFootprint {
+                offset: 0,
+                ..from.footprint
+            },
+        };
+        // SAFETY: live resources and matching physical subresource footprint.
+        unsafe {
+            back.list.CopyTextureRegion(
+                (&raw const to).cast(),
+                0,
+                0,
+                0,
+                (&raw const from).cast(),
+                None,
+            );
+        }
+        back.close();
+        host.execute(&[&back]);
+
+        let mut out = vec![0u8; len];
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: host.execute waited for GPU completion; buffer spans `len` bytes.
+        unsafe {
+            readback
+                .Map(
+                    0,
+                    Some(&D3D12_RANGE { Begin: 0, End: len }),
+                    Some(&mut mapped),
+                )
+                .unwrap();
+            out.copy_from_slice(std::slice::from_raw_parts(mapped.cast::<u8>(), len));
+            readback.Unmap(0, None);
+        }
+        out
+    }
+
+    pub(crate) fn assert_texels(
+        logical: u32,
+        physical: u32,
+        bytes: &[u8],
+        row_pitch: usize,
+        width: u32,
+        height: u32,
+        expected: impl Fn(u32, u32) -> u16,
+    ) {
+        let mut rgba = [0u8; 4];
+        for y in 0..height {
+            for x in 0..width {
+                let word = expected(x, y);
+                if physical == RGBA8_UNORM {
+                    expand_packed16(logical, &word.to_le_bytes(), &mut rgba);
+                    let at = y as usize * row_pitch + x as usize * 4;
+                    assert_eq!(
+                        &bytes[at..at + 4],
+                        &rgba,
+                        "f{logical}->f{physical} ({x},{y})"
+                    );
+                } else {
+                    let at = y as usize * row_pitch + x as usize * 2;
+                    assert_eq!(
+                        &bytes[at..at + 2],
+                        &word.to_le_bytes(),
+                        "f{logical}->f{physical} ({x},{y})"
+                    );
+                }
+            }
         }
     }
 }
