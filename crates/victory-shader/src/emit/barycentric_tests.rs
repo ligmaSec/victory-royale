@@ -38,13 +38,14 @@ fn element(name: &str, kind: u8, row: u32) -> SigElement {
 /// Translates a pixel program with the input VGPRs `input_addr`
 /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
 fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
-    pixel_with_precision(words, input_addr, false)
+    pixel_with_layout(words, input_addr, false, 0)
 }
 
-fn pixel_with_precision(
+fn pixel_with_layout(
     words: &[u32],
     input_addr: u32,
     fp16: bool,
+    row: u8,
 ) -> Result<HostShader, ShaderError> {
     let native = NativeProgram {
         stage: HwStage::Ps,
@@ -55,13 +56,13 @@ fn pixel_with_precision(
         io: StageIo::Ps {
             inputs: vec![PsInput {
                 usage: Usage::Generic,
-                row: 0,
+                row,
                 mask: 0b1111,
                 attr: 0,
                 flat: false,
                 fp16,
                 pack2: false,
-                row2: 0,
+                row2: row,
             }],
             input_addr,
             db_shader_control: 0,
@@ -71,8 +72,12 @@ fn pixel_with_precision(
     };
     let mut target = element("SV_Target", 16, 0);
     target.usage = 15;
-    // Pruning the unused element must renumber the per-vertex and ordinary reads.
-    let isg1 = container::signature(&[element("SPARE", 0, 1), element("TEXCOORD", 0, 0)], true);
+    let mut signature = Vec::new();
+    if row > 0 {
+        signature.push(element("SPARE", 0, 0));
+    }
+    signature.push(element("TEXCOORD", 0, u32::from(row)));
+    let isg1 = container::signature(&signature, true);
     let osg1 = container::signature(&[target], false);
     let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
     let c = Container::parse(&bytes).unwrap();
@@ -329,7 +334,7 @@ fn drawn_weights_are_the_hosts_vertex_weights() {
 }
 
 /// Return both the saved intermediate (R and B) and the completed interpolation (G and A).
-fn live_pair(half: bool) -> HostShader {
+fn live_pair(half: bool, row: u8) -> HostShader {
     let mut words = if half {
         vec![0xD742_0002, 0x0002_0000]
     } else {
@@ -343,13 +348,15 @@ fn live_pair(half: bool) -> HostShader {
         words.push(0xC809_0001);
     }
     words.extend([0xF800_180F, 0x0203_0203, 0xBF81_0000]);
-    pixel_with_precision(&words, PERSP_CENTER, half).unwrap()
+    pixel_with_layout(&words, PERSP_CENTER, half, row).unwrap()
 }
 
 #[test]
 fn live_and_dead_interpolation_halves_have_distinct_requirements() {
     for half in [false, true] {
-        let ps = live_pair(half);
+        // Row zero is unused. Both attributeAtVertex and loadInput must follow
+        // their signature elements when that row is pruned.
+        let ps = live_pair(half, 1);
         assert!(ps.requirements().barycentrics);
         let (_, inputs) = parts(&ps);
         assert!(inputs.iter().any(|e| e.kind == 28));
@@ -419,7 +426,7 @@ fn live_pixel_interpolation_returns_partial_and_complete_values() {
         1.0, 0.5, 1.0, 10.0, 0.0, 0.0, 0.0,
     ];
 
-    let shaders = [live_pair(false), live_pair(true)];
+    let shaders = [live_pair(false, 0), live_pair(true, 0)];
     for (name, warp) in [("default", false), ("WARP", true)] {
         let Ok(host) = Host::new(warp) else { continue };
         if !barycentrics_supported(&host) {
