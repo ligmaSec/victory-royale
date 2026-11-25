@@ -3,19 +3,64 @@
 set -euo pipefail
 
 usage() {
-    echo 'Usage: victory-proton.sh TITLE.exe [--execute] [other victory run options]'
+    cat <<'HELP'
+Usage: victory-proton.sh --build
+       victory-proton.sh [--run | --report] [--vkd3d-dir DIR] TITLE.exe [options]
+
+  --build          Build the Windows release from a source checkout with LLVM-MinGW.
+  --run            Execute the title.
+  --report         Execute once and save the launcher and Proton logs in one archive.
+  --vkd3d-dir DIR  Use the x64 d3d12.dll and d3d12core.dll from DIR for this run.
+
+With no mode, the launcher forwards the title and options to victory run.
+Use TITLE.exe alone to check imports, or TITLE.exe --execute to launch.
+HELP
 }
 
-if [[ ${1:-} == --help ]]; then
-    usage
-    exit 0
+script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+if [[ ${1:-} == --build ]]; then
+    if (( $# != 1 )); then usage >&2; exit 2; fi
+    if [[ ! -f $script_dir/../.victory-root ]]; then
+        echo 'Build from a source checkout. This distribution is ready to run.' >&2
+        exit 2
+    fi
+    export CC_x86_64_pc_windows_gnullvm=${CC_x86_64_pc_windows_gnullvm:-x86_64-w64-mingw32-clang}
+    export AR_x86_64_pc_windows_gnullvm=${AR_x86_64_pc_windows_gnullvm:-llvm-ar}
+    if [[ -z ${VICTORY_BUILD_DXC:-} ]] && dxc_path=$(type -P dxc); then
+        export VICTORY_BUILD_DXC="$dxc_path"
+    fi
+    if [[ -n ${CARGO_TARGET_DIR:-} ]]; then
+        CARGO_TARGET_DIR=$(realpath -m -- "$CARGO_TARGET_DIR")
+        export CARGO_TARGET_DIR
+    fi
+    cd -- "$script_dir/.."
+    exec cargo build --locked --release -p victory --target x86_64-pc-windows-gnullvm
 fi
+
+mode=
+vkd3d_dir=
+while (( $# )); do
+    case $1 in
+        --help|-h) usage; exit 0 ;;
+        --run|--report)
+            if [[ -n $mode ]]; then usage >&2; exit 2; fi
+            mode=$1
+            shift
+            ;;
+        --vkd3d-dir)
+            if [[ -z ${2:-} ]]; then usage >&2; exit 2; fi
+            vkd3d_dir=$2
+            shift 2
+            ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
 if (( $# == 0 )); then
     usage >&2
     exit 2
 fi
 
-script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 target_dir=${CARGO_TARGET_DIR:-$script_dir/../target}
 binary=${VICTORY_EXE:-}
 if [[ -z $binary ]]; then
@@ -29,7 +74,7 @@ if [[ -z $binary ]]; then
     done
 fi
 if [[ ! -f $binary ]]; then
-    echo "Missing Windows build: ${binary:-set VICTORY_EXE or see docs/proton-launcher.md}" >&2
+    echo "Missing Windows build. Run $0 --build from a checkout or set VICTORY_EXE to an existing build." >&2
     exit 1
 fi
 if [[ ! -f $1 ]]; then
@@ -43,6 +88,15 @@ fi
 binary=$(realpath -- "$binary")
 title=$(realpath -- "$1")
 shift
+if [[ -n $mode ]]; then
+    # Accept an existing --execute, including invocations migrated from the old syntax.
+    execute=(--execute)
+    for arg in "$@"; do
+        [[ $arg != -- ]] || break
+        if [[ $arg == --execute ]]; then execute=(); break; fi
+    done
+    set -- "${execute[@]}" "$@"
+fi
 
 # Hand Proton Windows paths on its standard Z: drive. A Windows executable
 # path also lets UMU-Proton attach this CLI to the calling terminal.
@@ -60,7 +114,83 @@ if [[ $VKD3D_SHADER_CACHE_PATH != 0 ]]; then
     mkdir -p -- "$VKD3D_SHADER_CACHE_PATH"
 fi
 mkdir -p -- "$DXVK_STATE_CACHE_PATH"
+# Stage an alternate runtime for this process without changing the build or Wine prefix.
+stage=
+if [[ -n $vkd3d_dir ]]; then
+    for dll in d3d12.dll d3d12core.dll; do
+        if [[ ! -f $vkd3d_dir/$dll ]]; then
+            echo "Missing $vkd3d_dir/$dll. Pass the directory containing both x64 DLLs." >&2
+            exit 1
+        fi
+    done
+    mkdir -p -- "$cache_home/victory"
+    stage=$(mktemp -d -- "$cache_home/victory/runtime.XXXXXXXX")
+    trap 'rm -rf -- "$stage"' EXIT
+    cp --reflink=auto -- "$binary" "$stage/victory.exe"
+    # Preserve companion libraries such as the optional DXC runtime.
+    shopt -s nocaseglob
+    for dll in "${binary%/*}"/*.dll; do
+        [[ -f $dll ]] || continue
+        case ${dll,,} in */d3d12.dll|*/d3d12core.dll) continue ;; esac
+        ln -s -- "$dll" "$stage/"
+    done
+    cp -- "$vkd3d_dir/d3d12.dll" "$vkd3d_dir/d3d12core.dll" "$stage/"
+    export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}d3d12,d3d12core=n"
+fi
+launch_binary=$binary
+if [[ -n $stage ]]; then launch_binary=$stage/victory.exe; fi
 windows_title=${title//\//\\}
-windows_binary=${binary//\//\\}
+windows_binary=${launch_binary//\//\\}
 export STEAM_COMPAT_INSTALL_PATH=${STEAM_COMPAT_INSTALL_PATH:-$(dirname -- "$binary")}
-exec umu-run "Z:$windows_binary" run "Z:$windows_title" "$@"
+command=(umu-run "Z:$windows_binary" run "Z:$windows_title" "$@")
+if [[ $mode != --report ]]; then
+    if [[ -z $stage ]]; then exec "${command[@]}"; fi
+    "${command[@]}"
+    exit $?
+fi
+
+umask 077
+reports=$(realpath -m -- "$data_home/victory/reports")
+ancestor=$reports
+while [[ $ancestor != / ]]; do
+    if [[ -f $ancestor/.victory-root ]]; then
+        echo 'Set XDG_DATA_HOME outside the source tree to record a run.' >&2
+        exit 1
+    fi
+    ancestor=$(dirname -- "$ancestor")
+done
+mkdir -p -- "$reports"
+report=$(mktemp -d -- "$reports/run-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXXXX")
+export PROTON_LOG=1 PROTON_LOG_DIR="$report" VICTORY_TRACE_PIPELINES=1
+export WINEDEBUG=${WINEDEBUG:--all,+timestamp,+pid,+tid,+seh}
+(
+    cd -- "${binary%/*}"
+    sha256sum -- "${binary##*/}"
+    if [[ -f REVISION ]]; then
+        printf 'package_revision=%s\n' "$(<REVISION)"
+    elif [[ -d $script_dir/../.git || -f $script_dir/../.git ]]; then
+        revision=$(git -C "$script_dir/.." rev-parse HEAD 2>/dev/null) &&
+            printf 'launcher_checkout=%s\n' "$revision"
+    fi
+    if [[ -n $stage ]]; then
+        cd -- "$stage"
+        sha256sum -- d3d12.dll d3d12core.dll
+    fi
+) > "$report/build.txt"
+echo "Recording this run in $report"
+status=0
+trap ':' INT
+"${command[@]}" > "$report/launcher.log" 2>&1 || status=$?
+trap - INT
+printf '%s\n' "$status" > "$report/launcher-exit.txt"
+# Keep the raw logs if archiving fails, and publish only complete archives.
+if tar -czf "$report.tar.gz.part" -C "$report" .; then
+    mv -- "$report.tar.gz.part" "$report.tar.gz"
+    rm -rf -- "$report"
+    echo "Report: $report.tar.gz (launcher exit $status)"
+else
+    rm -f -- "$report.tar.gz.part"
+    echo "Could not pack the report. Logs are in $report (launcher exit $status)." >&2
+    if (( status == 0 )); then status=1; fi
+fi
+exit "$status"

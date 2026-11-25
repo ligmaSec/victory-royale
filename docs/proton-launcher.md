@@ -10,19 +10,14 @@ Model 6.6 through vkd3d-proton. World rendering also needs mesh shaders.
 Install Rust with rustup, a native C toolchain, and the x86-64 Linux UCRT
 distribution of LLVM-MinGW. Put its `bin` directory first on `PATH`.
 To embed the three GPU helper shaders, install the Linux DirectX Shader
-Compiler (`dxc`) and set `VICTORY_BUILD_DXC` to its absolute path before
-building. Run the following from the checkout.
+Compiler (`dxc`). The build command uses `dxc` on `PATH` or the compiler
+selected by `VICTORY_BUILD_DXC`. Run the following from the checkout.
 [LLVM-MinGW releases](https://github.com/mstorsjo/llvm-mingw/releases) ·
 [DirectX Shader Compiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases)
 
 ```sh
 rustup target add x86_64-pc-windows-gnullvm
-export CC_x86_64_pc_windows_gnullvm=x86_64-w64-mingw32-clang
-export AR_x86_64_pc_windows_gnullvm=llvm-ar
-if [ -z "${VICTORY_BUILD_DXC:-}" ] && dxc_path=$(command -v dxc); then
-    export VICTORY_BUILD_DXC="$dxc_path"
-fi
-cargo build --locked --release -p victory --target x86_64-pc-windows-gnullvm
+./scripts/victory-proton.sh --build
 ```
 
 The launcher finds the release executable in the Cargo target directory.
@@ -41,10 +36,11 @@ the checkout. Pass the Linux path to the title executable to the launcher.
 [UMU installation](https://github.com/Open-Wine-Components/umu-launcher#installation)
 
 ```sh
-./scripts/victory-proton.sh "/path/to/game/title.exe" --execute
+./scripts/victory-proton.sh --run "/path/to/game/title.exe"
 ```
 
-Omit `--execute` to check mapping and import binding first. The launcher
+Pass the title path alone to check mapping and import binding first.
+The original `TITLE.exe --execute` invocation also works. The launcher
 forwards other `victory run` options and arguments after `--`. To select a
 specific build, set `VICTORY_EXE` to its Linux path. By default the launcher
 looks beside itself for `victory.exe`, then under `${CARGO_TARGET_DIR:-target}`
@@ -62,6 +58,30 @@ of the checkout. `VKD3D_SHADER_CACHE_PATH` and `DXVK_STATE_CACHE_PATH`
 override these defaults. `VKD3D_SHADER_CACHE_PATH=0` disables the VKD3D cache
 without creating a directory. Empty or relative XDG base directories fall back
 to the standard directories under `$HOME`.
+
+## Capture a workstation run
+
+```sh
+./scripts/victory-proton.sh --report "/path/to/game/title.exe"
+```
+
+The launcher records UMU output, enables Proton exception logging and Victory
+pipeline tracing, and writes the launcher exit status and executable SHA-256.
+The package revision or launcher checkout revision is included when available.
+Each invocation prints its own archive path under
+`${XDG_DATA_HOME:-$HOME/.local/share}/victory/reports`. A failed launch also
+produces an archive once UMU has started. Logs can include personal paths and
+title output. Review them privately and use the contributor guide when
+summarizing a failure for a public issue.
+
+For a runtime comparison, rerun the same command with `--vkd3d-dir` before
+the title. Pass the x64 directory from the vkd3d-proton build being tested.
+The launcher stages the selected pair alongside a temporary copy of the
+same Victory executable and includes both DLL hashes in the report.
+
+```sh
+./scripts/victory-proton.sh --report --vkd3d-dir "/path/to/vkd3d-proton/x64" "/path/to/game/title.exe"
+```
 
 Set `VICTORY_TRACE_PIPELINES=1` to log the shader stages and hashes with the
 Windows thread ID when each host pipeline starts compiling. Match that ID to
