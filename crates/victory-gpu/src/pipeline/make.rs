@@ -36,6 +36,7 @@ pub(crate) struct Pending {
     made: OnceLock<Option<Arc<HostPipeline>>>,
     bindings: OnceLock<Vec<StructuredBinding>>,
     strides: Strides,
+    partial: bool,
     variants: Mutex<VecDeque<Arc<Pending>>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
@@ -70,6 +71,7 @@ impl Pending {
             made: OnceLock::new(),
             bindings: OnceLock::new(),
             strides: Vec::new(),
+            partial: false,
             variants: Mutex::new(VecDeque::new()),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
@@ -84,7 +86,7 @@ impl Pending {
                 let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
                 tracing::info!(tid = format_args!("{tid:04x}"), shaders = ?self.shaders, "starting host pipeline");
             }
-            if self.strides.is_empty() {
+            if self.strides.is_empty() && !self.partial {
                 let made = HostPipeline::new(&self.shaders, self.graphics.as_deref(), &[]);
                 if made.is_none()
                     && let Some(bindings) = self.find_stride_bindings()
@@ -130,11 +132,16 @@ impl Pending {
         self.shaders
             .iter()
             .map(|shader| {
-                if shader.translated.get().is_some_and(Option::is_some) {
+                if !self.partial && shader.translated.get().is_some_and(Option::is_some) {
                     return Some(shader.clone());
                 }
                 let accessed = std::cell::RefCell::new(BTreeSet::new());
-                let (host, mut used) = translate_with_view_strides(
+                let translate = if self.partial {
+                    victory_shader::emit::translate_partial_dispatch
+                } else {
+                    translate_with_view_strides
+                };
+                let (host, mut used) = translate(
                     &shader.container,
                     host.supports_wave32(),
                     &|binding, _| {
@@ -148,7 +155,7 @@ impl Pending {
                     },
                 )
                 .map_err(|error| {
-                    tracing::warn!(?shader, %error, "shader with bound structured views refused");
+                    tracing::warn!(?shader, %error, partial_dispatch = self.partial, "specialized shader refused");
                 })
                 .ok()?;
                 // Include exact slots absent from the console metadata so draw
@@ -273,11 +280,21 @@ pub(super) fn ready_with_strides(
         });
         return None;
     };
+    ready_variant(p, &strides, false)
+}
+
+/// Compilation uses the same frame wait budget and bounded variant cache as
+/// pipelines specialized for the currently bound structured-buffer strides.
+pub(super) fn ready_variant(
+    p: &Arc<Pending>,
+    strides: &[(StructuredBinding, u32)],
+    partial: bool,
+) -> Option<Arc<HostPipeline>> {
     let variant = {
         let mut variants = p.variants.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(i) = variants
             .iter()
-            .position(|variant| variant.strides == strides)
+            .position(|variant| variant.partial == partial && variant.strides == strides)
         {
             let variant = variants.remove(i).expect("a variant at this index");
             variants.push_back(variant.clone());
@@ -290,7 +307,8 @@ pub(super) fn ready_with_strides(
                 queue_state: AtomicU8::new(NOT_QUEUED),
                 made: OnceLock::new(),
                 bindings: OnceLock::new(),
-                strides,
+                strides: strides.to_vec(),
+                partial,
                 variants: Mutex::new(VecDeque::new()),
                 key: p.key.clone(),
                 used: AtomicBool::new(false),

@@ -504,7 +504,6 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
-    #[cfg(test)]
     pub(crate) fn has_dx_op(&self, name: &str, opcode: i64) -> bool {
         self.insts.iter().any(|inst| match &inst.op {
             Op::Call(fid, args) => {
