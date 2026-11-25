@@ -152,7 +152,7 @@ pub(crate) struct HostHeap {
     refreshes: Mutex<HashMap<u32, SlotRefresh>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    dynamic_slots: Mutex<super::DynamicSlots>,
     /// Leaf-only tracker of live SRV/UAV textures across title slots.
     tex_tracker: Mutex<TexTracker>,
 }
@@ -344,7 +344,7 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             refreshes: Mutex::new(HashMap::new()),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            dynamic_slots: Mutex::new(super::DynamicSlots::new(extra as usize)),
             tex_tracker: Mutex::new(TexTracker::new(sampler, count)),
         };
         // A slot never written is undefined: shaders reading one (a slot
@@ -456,20 +456,14 @@ impl HostHeap {
             });
             return None;
         }
-        let spare = self.spare as usize;
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let n = n as usize;
-        let found = super::find_free_run(taken, *next as usize, n);
-        let Some(first) = found else {
+        let mut slots = self.dynamic_slots.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(first) = slots.reserve(n as usize) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 tracing::warn!(n, "no free dynamic descriptor slots: a table is not made")
             });
             return None;
         };
-        taken[first..first + n].fill(true);
-        *next = ((first + n) % spare) as u32;
         Some(self.count + first as u32)
     }
 
@@ -487,11 +481,10 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = at.saturating_add(n).min(self.spare) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
-        }
+        self.dynamic_slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release(at as usize, n as usize);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the

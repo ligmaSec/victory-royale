@@ -13,6 +13,49 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 
+/// Dynamic descriptor reservations for one host heap. Lists hold their slots
+/// until their submissions finish. Between releases, free runs can only shrink.
+struct DynamicSlots {
+    taken: Vec<bool>,
+    cursor: usize,
+    /// No contiguous free range of this size or larger survived the last search.
+    first_miss: usize,
+}
+
+impl DynamicSlots {
+    fn new(capacity: usize) -> Self {
+        Self {
+            taken: vec![false; capacity],
+            cursor: 0,
+            first_miss: usize::MAX,
+        }
+    }
+
+    fn reserve(&mut self, n: usize) -> Option<usize> {
+        if n == 0 || n > self.taken.len() || n >= self.first_miss {
+            return None;
+        }
+        let Some(first) = find_free_run(&self.taken, self.cursor, n) else {
+            self.first_miss = n;
+            return None;
+        };
+        let end = first + n;
+        self.taken[first..end].fill(true);
+        self.cursor = if end == self.taken.len() { 0 } else { end };
+        Some(first)
+    }
+
+    fn release(&mut self, first: usize, n: usize) {
+        let end = first.saturating_add(n).min(self.taken.len());
+        if let Some(slots) = self.taken.get_mut(first..end)
+            && !slots.is_empty()
+        {
+            slots.fill(false);
+            self.first_miss = usize::MAX;
+        }
+    }
+}
+
 /// The first index of `n` (non-zero) consecutive free slots in `taken`,
 /// searching from `cursor` on and then from the start. A run may cross the
 /// cursor but not the end of `taken`.
@@ -878,6 +921,60 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    #[test]
+    fn a_failed_reservation_still_allows_smaller_tables_and_released_slots() {
+        let mut slots = DynamicSlots::new(8);
+        assert_eq!(slots.reserve(8), Some(0));
+        slots.release(2, 2);
+        slots.release(5, 2);
+        assert_eq!(slots.reserve(3), None);
+        assert_eq!(slots.first_miss, 3);
+        assert_eq!(slots.reserve(4), None);
+        assert_eq!(slots.reserve(2), Some(2));
+        assert_eq!(slots.first_miss, 3);
+        slots.release(4, 1);
+        assert_eq!(slots.reserve(3), Some(4));
+    }
+
+    /// Each sample represents one batch of table requests on a recording thread.
+    #[test]
+    #[ignore = "benchmark"]
+    fn dynamic_table_reservation_times() {
+        use std::{hint::black_box, time::Instant};
+
+        const CAPACITY: usize = 1 << 18;
+        for full in [false, true] {
+            let mut slots = DynamicSlots::new(CAPACITY);
+            if full {
+                assert_eq!(slots.reserve(CAPACITY), Some(0));
+            }
+            let mut times = Vec::new();
+            for _ in 0..40 {
+                // Give the full heap one short lived table every batch. A fresh
+                // miss then costs a search, as it would after a list retires.
+                if full {
+                    slots.release(0, 1);
+                    assert_eq!(slots.reserve(1), Some(0));
+                }
+                let start = Instant::now();
+                for _ in 0..128 {
+                    let got = black_box(&mut slots).reserve(black_box(4));
+                    if !full {
+                        slots.release(got.unwrap(), 4);
+                    } else {
+                        assert!(got.is_none());
+                    }
+                }
+                times.push(start.elapsed().as_nanos());
+            }
+            times.sort_unstable();
+            eprintln!(
+                "full={full} ns per 128 requests: median={} p95={} max={}",
+                times[20], times[37], times[39]
+            );
+        }
     }
 
     #[test]
