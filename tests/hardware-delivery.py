@@ -94,6 +94,33 @@ class RequestDelivery(unittest.TestCase):
                 with contextlib.redirect_stderr(io.StringIO()):
                     self.assertIsNone(keys.publication(7, "publisher", 22, comment)["registration"])
 
+    def test_exhausted_anonymous_api_quota_preserves_registration_verification(self):
+        gid = "a" * 32
+        other = "b" * 32
+        key = "age1" + "q" * 58
+        pages = {
+            "https://gist.github.com/requester?page=1":
+                f'<a href="/requester/{other}">1 file</a><a href="/requester/{other}">notes</a>'
+                '<a href="?page=2">Older</a>',
+            "https://gist.github.com/requester?page=2": f'<a href="/requester/{gid}">2 files</a>',
+            f"https://gist.github.com/{gid}.json": json.dumps({"owner": "requester", "public": True,
+                                                              "files": ["notes", keys.REGISTRATION]}),
+            f"https://gist.githubusercontent.com/requester/{gid}/raw/{keys.REGISTRATION}": key,
+        }
+        def api(path):
+            return requester if path == "users/requester" else self.github(path)
+        limit = keys.urllib.error.HTTPError("", 403, "rate limit exceeded", {}, None)
+        with mock.patch.object(keys, "public_gist", side_effect=limit), \
+                mock.patch.object(keys, "public_text", side_effect=pages.__getitem__), \
+                mock.patch.object(keys, "github", side_effect=api):
+            self.assertEqual(keys.publication(7, "publisher", 22, comment)["registration"],
+                             {"gist": gid, "key": key})
+            for field, replacement in (("owner", "publisher"), ("public", False)):
+                url = f"https://gist.github.com/{gid}.json"
+                meta = json.loads(pages[url])
+                with mock.patch.dict(pages, {url: json.dumps(dict(meta, **{field: replacement}))}):
+                    self.assertIsNone(keys.publication(7, "publisher", 22, comment)["registration"])
+
     def test_delegation_validates_the_request_comment_and_handles_no_key(self):
         self.assertEqual(keys.publication(7, "publisher", 22, comment),
                          {"requester": keys.account(requester), "registration": None})
