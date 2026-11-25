@@ -10,8 +10,7 @@ use super::host::{Dispatch, Draw, Host, Root, Stride, View};
 use super::valu_tests::ONE_AT_A_TIME;
 use super::{HostShader, lower, validator};
 use crate::native::{
-    ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, Usage,
-    UsedResource, VsInput,
+    ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
 use crate::{io, ir, resource, structure};
 
@@ -705,84 +704,7 @@ fn wave_prefix_sum_u32_reads_back() {
 /// executes both exclusive and inclusive `Op::AddF` prefix sums on GPU.
 #[test]
 fn wave_prefix_sum_f32_pixel_quad_all_backends() {
-    // Pass-through VS: POSITION0 (v4..v7) -> SV_Position.
-    let vs_code: Vec<u8> = [
-        0xF800_08CFu32, // exp pos0 v4, v5, v6, v7 done
-        0x0706_0504,
-        0xF800_0200, // exp param0 off, off, off, off
-        0,
-        S_ENDPGM,
-    ]
-    .iter()
-    .flat_map(|w| w.to_le_bytes())
-    .collect();
-    let vs_native = NativeProgram {
-        stage: HwStage::Vs,
-        wave64: false,
-        vgprs: 8,
-        layout: Vec::new(),
-        used: Vec::new(),
-        io: StageIo::Vs {
-            inputs: vec![VsInput {
-                usage: Usage::Generic,
-                row: 0,
-                vgpr: 4,
-                mask: 0xF,
-            }],
-            outputs: Vec::new(),
-        },
-        code: vs_code,
-    };
-    let vs_in = vec![SigElement {
-        name: "POSITION".into(),
-        index: 0,
-        kind: 0,
-        comp: 9,
-        interp: 0,
-        row: Some(0),
-        col: 0,
-        cols: 4,
-        usage: 0xF,
-        half: false,
-    }];
-    let vs_out = vec![SigElement {
-        name: "SV_Position".into(),
-        index: 0,
-        kind: 3,
-        comp: 9,
-        interp: 4,
-        row: Some(0),
-        col: 0,
-        cols: 4,
-        usage: 0xF,
-        half: false,
-    }];
-    let vp = ir::build(&vs_native.code, false, vs_native.vgprs).expect("vs ir");
-    let vst = structure::structure(&vp).expect("vs structure");
-    let vres = resource::track(&vp, &vs_native.layout, HwStage::Vs, Some(&vst)).expect("vs res");
-    let vio = io::raise(&vp, &vs_native).expect("vs io");
-    let vlow = lower::lower(&lower::Parts {
-        native: &vs_native,
-        p: &vp,
-        st: &vst,
-        io: &vio,
-        res: &vres,
-        inputs: vs_in,
-        outputs: vs_out,
-        prims: Vec::new(),
-        mesh_stride: 0,
-    })
-    .expect("vs lower");
-    let vs = HostShader {
-        stage: HwStage::Vs,
-        dxil: vlow.dxil,
-        user_data: vlow.user_data,
-        samplers: Vec::new(),
-        static_samplers: Vec::new(),
-        root_cbvs: Vec::new(),
-        root_srvs: Vec::new(),
-        root_uavs: Vec::new(),
-    };
+    let vs = super::host::position_vs();
 
     // PS: root constants s0..s3 hold terms cycled by active rank (`rank & 3`).
     // Entering the whole-wave section saves EXEC in s6; `s_bcnt1_i32_b32 s7, s6`
