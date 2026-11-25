@@ -151,7 +151,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    // Only the listed testing tools may use Python or Swift.
+    // Only the listed testing tools may use Python, Swift or HTML.
     // All size, magic, NUL and encoded-data checks still apply.
     let allowed = matches!(
         path,
@@ -161,6 +161,8 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
             | "scripts/hardware-test/run-test.py"
             | "scripts/hardware-test/prepare.py"
             | "scripts/hardware-test/report_ui.py"
+            | "scripts/hardware-test/observations.py"
+            | "scripts/hardware-test/observations.html"
             | "scripts/hardware-test/report_keys.py"
             | "scripts/hardware-test/report-inbox.py"
             | "tests/hardware-test.py"

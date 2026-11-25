@@ -116,7 +116,8 @@ class RequestDelivery(unittest.TestCase):
         with zipfile.ZipFile(out) as kit:
             data = kit.read("request.json")
             self.assertIn(hashlib.sha256(data).hexdigest(), kit.read("run-test.py").decode())
-            self.assertIn("report_keys.py", kit.namelist())
+            for name in ("report_keys.py", "observations.py", "observations.html"):
+                self.assertIn(name, kit.namelist())
         trusted = hashlib.sha256(data).hexdigest()
         request = json.loads(data)
         self.assertEqual(request["delivery"]["requester"], keys.account(requester))

@@ -15,6 +15,7 @@ import tempfile
 import textwrap
 import zipfile
 
+import observations
 import report_keys
 import report_ui
 
@@ -576,11 +577,12 @@ def review_result(filtered, kit, own_editor=False):
         files = work / "files"
         files.mkdir()
         with zipfile.ZipFile(filtered) as archive:
-            names = [name for name in OUTGOING if name in archive.namelist()]
+            names = [name for name in OUTGOING + observations.NOTES if name in archive.namelist()]
+            pictures = {name: archive.read(name) for name in observations.PICTURES if name in archive.namelist()}
             for name in names:
                 (files / name).write_bytes(archive.read(name))
         if not names:
-            print("All files were excluded. There is nothing to review.")
+            print("Use Describe what you saw to review or remove screenshots.")
             return
         helper = kit / "review" / REVIEWER
         if helper.is_file() and not own_editor:
@@ -601,7 +603,7 @@ def review_result(filtered, kit, own_editor=False):
                 "2. Edit text or delete a file to exclude it. Save and close your editor.",
                 "3. Return here and choose Apply edits. You decide whether to share afterward.",
                 "", "Working folder", str(files), "",
-                "Only summary.txt can be posted publicly. The CSV files can be sent encrypted.",
+                "Summary and observation text can be posted publicly. Manage screenshots under Describe what you saw.",
                 "Working copies are removed when you leave this screen. Your original logs stay local.",
             ]
             default_action = "o" if report_ui.terminal_available() else "b"
@@ -637,6 +639,8 @@ def review_result(filtered, kit, own_editor=False):
                 content = data.decode("utf-8").replace("\r\n", "\n")
                 if any(not ch.isprintable() and ch not in "\t\n" for ch in content):
                     raise ValueError(f"{name} contains hidden control characters. Use plain text.")
+                archive.writestr(zipfile.ZipInfo(name), data, compress_type=zipfile.ZIP_DEFLATED)
+            for name, data in pictures.items():
                 archive.writestr(zipfile.ZipInfo(name), data, compress_type=zipfile.ZIP_DEFLATED)
         os.replace(replacement, filtered)
         return True
@@ -689,26 +693,38 @@ def share_result(pr, filtered, kit, binding=None):
         except (OSError, ValueError, KeyError, subprocess.SubprocessError):
             reason = f"Private delivery unavailable. Could not verify @{login}’s published key. Keep this ZIP local."
     status = "Check for usernames, paths and credentials before sharing."
+    public_status = None
+    private_status = None
     try:
         while True:
             with zipfile.ZipFile(filtered) as archive:
                 names = archive.namelist()
                 report = archive.read("summary.txt").decode("utf-8") if "summary.txt" in names else ""
+                if report.strip():
+                    for side, note in zip(observations.SIDES, observations.NOTES):
+                        if note in names:
+                            text = archive.read(note).decode("utf-8").strip()
+                            if text:
+                                report += f"\n\n{side.capitalize()} observation\n{text}"
             folder_mode = not (kit / "review" / REVIEWER).is_file()
             actions = [("k", "Keep local and finish", "Close the report. Your ZIP stays in the temporary folder printed on exit.")]
             if names:
                 actions.append(("r", "Edit in my own editor" if folder_mode else "Review and edit files",
                                 "Edit or exclude outgoing files. Applying your edits saves them locally."))
+            actions.append(("o", "Describe what you saw", "Add main and candidate notes or paste screenshots in a local browser window."))
             if names and not folder_mode:
                 actions.append(("e", "Edit in my own editor", "Open working copies, edit or remove files, then apply locally."))
             if report.strip():
                 actions.append(("v", "Preview summary", "Read the exact summary that can appear on the public PR."))
-            if available and names:
+            if available and names and private_status is None:
                 actions.append(("i", f"Send encrypted diagnostics to @{login}",
                                 f"Send encrypted diagnostics to @{login}. Review the account and included files first."))
-            if report.strip() and account:
+            if report.strip() and account and public_status is None:
                 actions.append(("p", "Post public summary", "Preview and confirm the text before posting under your GitHub account."))
-            body = [status, "", *report_overview(report), "", f"{len(names)} outgoing files  ·  Raw logs stay local"]
+            body = [public_status or "Public summary: not posted", private_status or "Encrypted diagnostics: not sent",
+                    "", status, *report_overview(report), "",
+                    f"{len(names)} outgoing files  ·  Raw logs stay local",
+                    "Describe what you saw to add observations and screenshots."]
             if not available and (account or not binding or not binding["registration"]):
                 body.append(reason)
             if not account:
@@ -728,18 +744,29 @@ def share_result(pr, filtered, kit, binding=None):
             if action == "p":
                 confirmed = report_ui.choose("Post public summary?", context,
                     [f"Account: {account}", f"Public destination: https://github.com/{REPO}/pull/{pr}",
+                     "This posts text only. Screenshots and diagnostic files stay local until you send them privately.",
                      "", *report.splitlines()],
                     [("b", "Back to results", "Return without posting."),
+                     ("o", "Describe what you saw", "Add observations or paste a private screenshot before posting."),
                      ("y", "Post this summary", "Anyone who can see the PR can read this exact text.")], "b", "b")
-                if confirmed != "y":
+                if confirmed == "o":
+                    action = "o"
+                elif confirmed != "y":
                     continue
+            if action == "p":
                 try:
                     subprocess.run(["gh", "pr", "comment", str(pr), "-R", "github.com/" + REPO, "--body-file", "-"],
                                    input=report.encode("utf-8"), check=True)
-                    print(f"Posted the reviewed summary to PR #{pr}.")
+                    public_status = f"Public summary: posted to PR #{pr}"
                 except (OSError, subprocess.CalledProcessError):
-                    print("Public post unconfirmed. Check the PR before retrying.")
-                break
+                    public_status = "Public summary: posting unconfirmed. Check the PR."
+                continue
+            if action == "o":
+                try:
+                    observations.edit(filtered)
+                except (ValueError, OSError) as error:
+                    status = f"Could not open the observations editor. {error}"
+                continue
             if action == "i":
                 confirmed = report_ui.choose(f"Send encrypted diagnostics to @{login}", context,
                     [f"Recipient: @{login}", f"GitHub account: {account}", "", "Included files", *names, "",
@@ -751,6 +778,7 @@ def share_result(pr, filtered, kit, binding=None):
                     continue
                 try:
                     receipt = send_encrypted_report(filtered, binding)
+                    private_status = f"Encrypted diagnostics: uploaded for @{login}"
                     if receipt:
                         offer_collection(receipt, binding, context)
                 except (ValueError, KeyError):
@@ -758,12 +786,13 @@ def share_result(pr, filtered, kit, binding=None):
                     reason = "Private delivery unavailable. Key verification failed. Keep this ZIP local."
                     continue
                 except (OSError, subprocess.SubprocessError):
-                    print("Private delivery unconfirmed. Check your gists before retrying. GitHub CLI needs gist access.")
-                break
+                    private_status = "Encrypted diagnostics: delivery unconfirmed. Check your Gists."
+                continue
             break
     except (EOFError, KeyboardInterrupt):
         pass
-    print(f"Filtered diagnostics: {filtered}", flush=True)
+    print(public_status or "Public summary: not posted", private_status or "Encrypted diagnostics: not sent",
+          f"Filtered diagnostics: {filtered}", sep="\n", flush=True)
 
 
 def run_request(manifest, options):

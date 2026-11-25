@@ -334,7 +334,7 @@ class HardwareRequest(unittest.TestCase):
     def test_public_post_requires_preview_and_uses_only_summary(self):
         filtered = self.outgoing_zip("Previewed result")
         for tty, answers, posted in ((False, [], False), (True, [""], False),
-                                     (True, ["p", "", ""], False), (True, ["p", "y"], True)):
+                                     (True, ["p", "", ""], False), (True, ["p", "y", "k"], True)):
             output = io.StringIO()
             with mock.patch.object(sys.stdin, "isatty", return_value=tty), \
                     mock.patch("builtins.input", side_effect=answers), \
@@ -354,7 +354,7 @@ class HardwareRequest(unittest.TestCase):
                                          ("configured", True, "", False), ("configured", True, "i", True)):
             with mock.patch.object(sys.stdin, "isatty", return_value=True), mock.patch.object(keys, "verify"), \
                     mock.patch.object(subprocess, "check_output", side_effect=None if login else FileNotFoundError,
-                                      return_value="fixture-account"), mock.patch("builtins.input", side_effect=[choice, "y", ""]), \
+                                      return_value="fixture-account"), mock.patch("builtins.input", side_effect=[choice, "y", "", "k"]), \
                     mock.patch.object(runner, "send_encrypted_report") as send, contextlib.redirect_stdout(io.StringIO()) as output:
                 runner.share_result(7, safe, self.root, BINDING if key else None)
             self.assertEqual(send.called, sent)
@@ -375,7 +375,7 @@ class HardwareRequest(unittest.TestCase):
             return "a"
         for destination in ("i", "p"):
             self.outgoing_zip("original")
-            choices = iter(["r", None, destination, "y", "k"])
+            choices = iter(["r", None, destination, "y", "k", "k"])
             def choose(prompt):
                 return next(choices) or edit(prompt)
             with mock.patch.object(sys.stdin, "isatty", return_value=True), \
@@ -502,6 +502,52 @@ class HardwareRequest(unittest.TestCase):
         with zipfile.ZipFile(filtered) as archive:
             self.assertEqual(archive.namelist(), ["summary.txt"])
             self.assertEqual(archive.read("summary.txt"), b"Edited locally")
+
+    def test_observations_public_and_private_destinations(self):
+        import base64
+        import struct
+        import zlib
+        def chunk(kind, data):
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+        image = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+                 + chunk(b"tEXt", b"Comment\0private metadata")
+                 + chunk(b"IDAT", zlib.compress(bytes(4))) + chunk(b"IEND", b""))
+        filtered = self.outgoing_zip("timings")
+        draft = {"main": {"note": "Only lights", "image": base64.b64encode(image).decode()},
+                 "candidate": {"note": "Still only lights", "image": ""}}
+        def observe(path):
+            runner.observations.save_draft(path, draft)
+        with mock.patch.object(sys.stdin, "isatty", return_value=True), mock.patch.object(keys, "verify"), \
+                mock.patch("builtins.input", side_effect=["p", "o", "p", "y", "i", "y", "k"]), \
+                mock.patch.object(subprocess, "check_output", return_value="tester"), \
+                mock.patch.object(runner.observations, "edit", side_effect=observe), \
+                mock.patch.object(runner, "send_encrypted_report", return_value=None) as send, \
+                mock.patch.object(subprocess, "run") as post, contextlib.redirect_stdout(io.StringIO()) as screen:
+            runner.share_result(7, filtered, self.root, BINDING)
+        self.assertEqual(post.call_args.kwargs["input"], b"timings\n\nMain observation\nOnly lights"
+                         b"\n\nCandidate observation\nStill only lights")
+        send.assert_called_once_with(filtered, BINDING)
+        self.assertIn("Public summary: posted to PR #7", screen.getvalue())
+        self.assertIn("Encrypted diagnostics: uploaded for @", screen.getvalue())
+        with zipfile.ZipFile(filtered) as archive:
+            picture = archive.read("main-screenshot.png")
+            self.assertNotIn(b"private metadata", picture)
+            self.assertNotIn("candidate-screenshot.png", archive.namelist())
+            self.assertEqual(archive.read("main-events.csv"), b"private event row")
+        # Text review leaves the selected picture intact.
+        with mock.patch("builtins.input", return_value="a"), contextlib.redirect_stdout(io.StringIO()):
+            runner.review_result(filtered, self.root)
+        with zipfile.ZipFile(filtered) as archive:
+            self.assertEqual(archive.read("main-screenshot.png"), picture)
+        original = filtered.read_bytes()
+        draft["candidate"]["image"] = base64.b64encode(b"private non-image file").decode()
+        with self.assertRaises(ValueError):
+            runner.observations.save_draft(filtered, draft)
+        self.assertEqual(filtered.read_bytes(), original)
+        draft["main"]["image"] = draft["candidate"]["image"] = ""
+        runner.observations.save_draft(filtered, draft)
+        with zipfile.ZipFile(filtered) as archive:
+            self.assertFalse(set(archive.namelist()).intersection(runner.observations.PICTURES))
 
     def test_gist_only_receives_ciphertext_and_a_failed_mention_preserves_the_receipt(self):
         filtered = self.root / "report.zip"
