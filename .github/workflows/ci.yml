@@ -31,6 +31,8 @@ jobs:
       # components, so CI uses the same rustfmt as local builds.
       - name: Install the toolchain
         run: rustup toolchain install
+      - name: Documentation layout
+        run: bash tests/docs.sh
       - name: Check the formatting
         run: cargo fmt --all -- --check
       - name: Asset policy

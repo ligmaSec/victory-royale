@@ -4,10 +4,17 @@ What a change has to look like to merge. The first section is checked by CI;
 the rest is what review looks for. Each rule describes what the tree already
 does, so the nearest file is always a valid example.
 
+## Project language
+
+Write documentation, code comments, diagnostics, and contributor guidance in English.
+Keep setup instructions in the root `README.md` and link to it from other guides.
+Use each test directory’s README for instructions specific to that suite.
+
 ## Checked by CI
 
 | Check | Command | Where it runs |
 | --- | --- | --- |
+| Documentation layout | `bash tests/docs.sh` | Linux |
 | Formatting | `cargo fmt --all -- --check` | Linux |
 | Asset policy | `cargo xtask policy` | Linux, and again as a test |
 | Lints | `cargo clippy --workspace --all-targets --locked -- -D warnings` | Windows and Linux |

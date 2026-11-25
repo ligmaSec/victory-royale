@@ -45,6 +45,17 @@ Converting them ahead of time from files is only a warm-up.
 Everything except `victory-game` is platform-level and can be tested with
 any Xbox Series title.
 
+## Runtime terminology
+
+The **title** is the console executable and its DLLs. The **host** runs that
+code and provides the graphics device, through Windows or Proton. **Title
+memory** is memory the title addresses directly. On the console the GPU can
+read it in place. VIctory copies changed regions to host GPU resources.
+
+A shader **refusal** records why the translator could not translate a program.
+A **dropped draw** is a draw or dispatch the title submitted that the host
+did not execute. These counts measure different stages of a frame.
+
 ## Import resolution
 
 For every `dll!function` the title imports, in order:
@@ -97,3 +108,9 @@ the lanes take, from structurisation), and accessed with a non-uniform heap
 index in one pass. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
+
+## Converter cache
+
+A `victory-pipeline` converter produces the same output for the same input.
+Its cache key includes the converter ID, version, and input bytes. Bump the
+converter version when the output format or conversion result changes.

@@ -1,7 +1,5 @@
 # VIctory
 
-*Read this in: [English](README.md) | [Português](README.pt-BR.md) | [Bahasa Indonesia](languages/README.id.md)*
-
 Runs an Xbox Series X|S title natively on Windows, from files
 the user supplies.
 
@@ -82,6 +80,14 @@ the indirect-argument clamp. The Nix shell sets `VICTORY_BUILD_DXC` to embed
 these helpers during cross-builds. Runtime DXC is looked for in
 `VICTORY_DXC` (the DLL or its folder), beside the
 `dxil.dll` that shader validation finds, then the executable's folder and System32.
+
+Clone the private repository with a GitHub account that has access. Run the
+remaining commands from the checkout.
+
+```sh
+git clone https://github.com/ligmaSec/victory-standalone.git
+cd victory-standalone
+```
 
 To install Rust, use rustup (`winget install --id Rustlang.Rustup -e`, or
 the installer from https://rustup.rs). The first `cargo` command in this

@@ -1,6 +1,6 @@
 # Developing VIctory
 
-## The one rule
+## Game data
 
 Nothing from the game, or from any other proprietary title, enters this
 repository, an issue, a comment or a pull request. That covers game files,

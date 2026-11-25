@@ -1009,7 +1009,7 @@ mod tests {
             .to_string();
         assert!(err.contains("'\\t'"), "{err}");
         assert!(!err.contains("CRLF"), "{err}");
-        for ok in ["/games/title", "games with spaces", "~/jeux/été", ""] {
+        for ok in ["/games/title", "games with spaces", "~/games/café", ""] {
             assert!(ensure_no_control("x", Path::new(ok)).is_ok(), "{ok}");
         }
 
