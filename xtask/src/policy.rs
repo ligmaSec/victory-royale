@@ -13,8 +13,10 @@ use anyhow::{Context, Result, bail};
 const MAX_FILE_SIZE: usize = 512 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
+// Python and Swift are allowed only by the explicit tool paths in `check`.
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    "html",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -151,7 +153,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    // Only the listed testing tools may use Python, Swift or HTML.
+    // Only the listed testing tools may use Python or Swift.
     // All size, magic, NUL and encoded-data checks still apply.
     let allowed = matches!(
         path,
@@ -160,13 +162,13 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
             | "tests/metal/probe.swift"
             | "scripts/hardware-test/run-test.py"
             | "scripts/hardware-test/prepare.py"
-            | "scripts/hardware-test/report_ui.py"
             | "scripts/hardware-test/observations.py"
-            | "scripts/hardware-test/observations.html"
-            | "scripts/hardware-test/report_keys.py"
             | "scripts/hardware-test/report-inbox.py"
+            | "scripts/hardware-test/report_keys.py"
+            | "scripts/hardware-test/report_ui.py"
             | "tests/hardware-test.py"
             | "tests/hardware-delivery.py"
+            | "tools/linux-sweep/analyze.py"
     ) || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
@@ -270,8 +272,10 @@ mod tests {
         assert!(check("tests/metal/generate.py", b"import struct").is_empty());
         assert!(check("tests/metal/run.py", b"import subprocess").is_empty());
         assert!(check("tests/metal/probe.swift", b"import Metal").is_empty());
+        assert!(check("tools/linux-sweep/analyze.py", b"import re").is_empty());
 
         assert!(!check("other.py", b"pass").is_empty());
+        assert!(!check("other.py", b"MZ\x90\0").is_empty());
         assert!(!check("other.swift", b"import Metal").is_empty());
         assert!(!check("tests/metal/probe.swift", b"MZ\x00").is_empty());
         assert!(!check("tests/metal/run.py", &vec![b'a'; 800]).is_empty());
