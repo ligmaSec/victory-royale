@@ -38,6 +38,14 @@ fn element(name: &str, kind: u8, row: u32) -> SigElement {
 /// Translates a pixel program with the input VGPRs `input_addr`
 /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
 fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+    pixel_with_precision(words, input_addr, false)
+}
+
+fn pixel_with_precision(
+    words: &[u32],
+    input_addr: u32,
+    fp16: bool,
+) -> Result<HostShader, ShaderError> {
     let native = NativeProgram {
         stage: HwStage::Ps,
         wave64: false,
@@ -51,7 +59,7 @@ fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
                 mask: 0b1111,
                 attr: 0,
                 flat: false,
-                fp16: false,
+                fp16,
                 pack2: false,
                 row2: 0,
             }],
@@ -63,7 +71,8 @@ fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
     };
     let mut target = element("SV_Target", 16, 0);
     target.usage = 15;
-    let isg1 = container::signature(&[element("TEXCOORD", 0, 0)], true);
+    // Pruning the unused element must renumber the per-vertex and ordinary reads.
+    let isg1 = container::signature(&[element("SPARE", 0, 1), element("TEXCOORD", 0, 0)], true);
     let osg1 = container::signature(&[target], false);
     let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
     let c = Container::parse(&bytes).unwrap();
@@ -316,5 +325,160 @@ fn drawn_weights_are_the_hosts_vertex_weights() {
     }
     if ran == 0 {
         eprintln!("no device with barycentrics; nothing drawn");
+    }
+}
+
+/// Return both the saved intermediate (R and B) and the completed interpolation (G and A).
+fn live_pair(half: bool) -> HostShader {
+    let mut words = if half {
+        vec![0xD742_0002, 0x0002_0000]
+    } else {
+        vec![0xC808_0000]
+    };
+    words.push(0x7E06_0302); // v_mov_b32 v3, v2: save P0 + i * P10
+    if half {
+        // Replace v2's low half, leaving the intermediate's upper bits intact.
+        words.extend([0xD75A_0002, 0x040A_0200]);
+    } else {
+        words.push(0xC809_0001);
+    }
+    words.extend([0xF800_180F, 0x0203_0203, 0xBF81_0000]);
+    pixel_with_precision(&words, PERSP_CENTER, half).unwrap()
+}
+
+#[test]
+fn live_and_dead_interpolation_halves_have_distinct_requirements() {
+    for half in [false, true] {
+        let ps = live_pair(half);
+        assert!(ps.requirements().barycentrics);
+        let (_, inputs) = parts(&ps);
+        assert!(inputs.iter().any(|e| e.kind == 28));
+        validate(&ps);
+    }
+    let [e0, e1] = exp_mrt0(2);
+    let lone = pixel(&[0xC808_0000, e0, e1, 0xBF81_0000], PERSP_CENTER).unwrap();
+    assert!(lone.requirements().barycentrics);
+    validate(&lone);
+    let unread = pixel(
+        &[0xC808_0000, 0xC80C_0000, 0xC809_0001, e0, e1, 0xBF81_0000],
+        PERSP_CENTER,
+    )
+    .unwrap();
+    assert!(!unread.requirements().barycentrics);
+    validate(&unread);
+}
+
+#[cfg(windows)]
+#[test]
+fn live_pixel_interpolation_returns_partial_and_complete_values() {
+    use super::bitcode::{Attr, Term};
+    use super::host::{Draw, Host};
+    use super::shader::Shader;
+    // Pass POSITION and TEXCOORD through, with TEXCOORD in the same
+    // output row as the translated pixel shader's input signature.
+    let mut s = Shader::new(false);
+    s.inputs = vec![element("POSITION", 0, 0), element("TEXCOORD", 0, 1)];
+    for e in &mut s.inputs {
+        e.usage = 15;
+    }
+    s.outputs = vec![element("TEXCOORD", 0, 0), element("SV_Position", 3, 1)];
+    for (i, e) in s.outputs.iter_mut().enumerate() {
+        e.usage = 15;
+        e.interp = if i == 1 { 4 } else { 2 };
+    }
+    for row in 0..2 {
+        for col in 0..4 {
+            let args = [s.m.i32(row), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+            let v = s.op(s.entry, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+            let args = [s.m.i32(1 - row), s.m.i32(0), s.m.i8(col), v];
+            s.op(
+                s.entry,
+                "storeOutput.f32",
+                Attr::NoUnwind,
+                s.t.void,
+                5,
+                &args,
+            );
+        }
+    }
+    s.m.terminate(s.entry, Term::Ret);
+    let vs = HostShader {
+        stage: HwStage::Vs,
+        dxil: s.finish(),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+    };
+    validate(&vs);
+    // One triangle covers the 8×8 target. Each vertex has POSITION and TEXCOORD.
+    let mut vertices = [
+        -1.0, 1.0, 0.5, 1.0, 2.0, 0.0, 0.0, 0.0, -1.0, -3.0, 0.5, 1.0, 6.0, 0.0, 0.0, 0.0, 3.0,
+        1.0, 0.5, 1.0, 10.0, 0.0, 0.0, 0.0,
+    ];
+
+    let shaders = [live_pair(false), live_pair(true)];
+    for (name, warp) in [("default", false), ("WARP", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        if !barycentrics_supported(&host) {
+            eprintln!("{name}: barycentrics unavailable, skipping readback");
+            continue;
+        }
+        for (index, ps) in shaders.iter().enumerate() {
+            let (root, pipeline) = host.pipeline(&vs, ps).unwrap();
+            for (p0, p1, p2) in [(2.0f32, 6.0, 10.0), (-1.0, 2048.0, -1.0)] {
+                vertices[4] = p0;
+                vertices[12] = p1;
+                vertices[20] = p2;
+                let texels = host
+                    .draw(
+                        &root,
+                        &pipeline,
+                        &Draw {
+                            roots: vec![],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &vertices,
+                            stride: 32,
+                            size: (8, 8),
+                            mesh_groups: 0,
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(texels.len(), 64);
+                for (n, t) in texels.iter().enumerate() {
+                    let i = (n / 8) as f32 / 16.0 + 0.5 / 16.0;
+                    let j = (n % 8) as f32 / 16.0 + 0.5 / 16.0;
+                    // 2049 is halfway between two half floats. P10 rounds to even (2048).
+                    let p10 = if index == 1 && p1 - p0 == 2049.0 {
+                        2048.0
+                    } else {
+                        p1 - p0
+                    };
+                    let partial = p0 + i * p10;
+                    let full = partial + j * (p2 - p0);
+                    let result = if index == 0 {
+                        full.to_bits()
+                    } else {
+                        // All these positive normal values are exactly representable in f16.
+                        let f = full.to_bits();
+                        partial.to_bits() & 0xffff_0000
+                            | (((f >> 23) - 112) << 10)
+                            | ((f >> 13) & 0x3ff)
+                    };
+                    assert_eq!(
+                        t.map(f32::to_bits),
+                        [partial.to_bits(), result, partial.to_bits(), result],
+                        "{name}, pixel {n}"
+                    );
+                }
+            }
+            eprintln!(
+                "{name}: 128 texels matched for {}-bit interpolation",
+                if index == 0 { 32 } else { 16 }
+            );
+        }
     }
 }
