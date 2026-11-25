@@ -3846,9 +3846,10 @@ impl Host {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     for (shadow, ranges) in &dirty {
-                        let Some((staging, before, size)) = shadow.card_sides() else {
+                        let Some((staging, before, _)) = shadow.card_sides() else {
                             continue;
                         };
+                        let size = shadow.card_hash_size();
                         for &(a, b) in ranges {
                             list.CopyBufferRegion(
                                 &shadow.buffer,
@@ -3996,9 +3997,10 @@ impl Host {
                         work.differs.0.GetGPUVirtualAddress(),
                     );
                     for r in plan.ranges.iter().filter(|r| r.compared) {
-                        let Some((_, Some(before), size)) = r.shadow.card_sides() else {
+                        let Some((_, Some(before), _)) = r.shadow.card_sides() else {
                             continue;
                         };
+                        let size = r.shadow.card_hash_size();
                         let constants = [
                             r.span.first,
                             r.span.skew,
