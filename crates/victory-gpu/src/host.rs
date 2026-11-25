@@ -798,6 +798,17 @@ mod tests {
         assert!(d.declare_gpu_write(b, true));
     }
 
+    /// Filled scratch blocks are forgotten at a title write, with the
+    /// refreshes.
+    #[test]
+    fn filled_scratch_forgotten_when_title_written() {
+        let mut d = super::Deferred::default();
+        d.filled.insert((0x1000, 288), 0xAB00);
+        assert_eq!(d.filled.get(&(0x1000, 288)), Some(&0xAB00));
+        d.invalidate_refreshes();
+        assert!(d.filled.is_empty());
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -1958,6 +1969,9 @@ struct Deferred {
     /// memory (host copy, address, bytes): declaring them again would
     /// change nothing ([`Deferred::declare_gpu_write`]).
     gpu_written: std::collections::HashSet<(usize, usize, usize)>,
+    /// Scratch memory [`HostList::fill_scratch`] fills since the list last
+    /// wrote title memory (source, bytes): its host address.
+    filled: std::collections::HashMap<(usize, usize), u64>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// The numbered copies of title memory (`crate::memory`) the list
@@ -2016,6 +2030,7 @@ impl Deferred {
     fn invalidate_refreshes(&mut self) {
         self.refreshed.clear();
         self.gpu_written.clear();
+        self.filled.clear();
         self.raw_copies.read = 0;
     }
 
@@ -5886,6 +5901,22 @@ impl HostList {
             len,
         };
         self.deferred().append_fill(fill, fill_workers());
+    }
+
+    /// The host address of `len` bytes of scratch memory that hold the title
+    /// memory at `src` as of the list's submission: one scratch block and
+    /// fill per (source, bytes) until the list next writes title memory, so
+    /// a root constant buffer bound for many draws is filled once (up to 64
+    /// KiB each; after avatarmanz c96525d, from Belobug 84ea9c12).
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        if let Some(&gpu) = self.deferred().filled.get(&key) {
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        self.deferred().filled.insert(key, gpu);
+        Some(gpu)
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
