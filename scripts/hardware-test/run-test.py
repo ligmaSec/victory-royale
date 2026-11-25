@@ -280,10 +280,57 @@ def instruction_block(heading, message, path_line=None):
     print("\n".join(lines), end="\n\n", flush=True)
 
 
-def read_metrics(stream, frame_log, submission_log):
+STAGE = rb"(vertex|pixel|domain|hull|geometry|mesh|amplification|compute)"
+SHADER_REF = re.compile(rb'\bstage="?' + STAGE + rb'"? .*?\bhash=([0-9a-f]{16})\b')
+PIPELINE_REF = re.compile(STAGE + rb" ([0-9a-f]{16})\b")
+LOG_TIME = re.compile(rb"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?)Z\s")
+
+
+class Timeline:
+    """Run-relative timing and opaque shader numbers shared by the two builds."""
+    def __init__(self, output, shaders):
+        self.events = csv.writer(output)
+        self.events.writerow(("elapsed_ms", "event", "stage", "shader_id", "frame", "sample"))
+        self.shaders = shaders
+        self.start = None
+
+    def record(self, line, event, stage=b"", shader=None, frame="", sample=""):
+        elapsed = ""
+        stamp = LOG_TIME.match(line)
+        if stamp:
+            try:
+                now = datetime.fromisoformat(stamp[1].decode("ascii"))
+                if self.start is None:
+                    self.start = now
+                elapsed = round((now - self.start).total_seconds() * 1000)
+            except ValueError:
+                pass
+        shader_id = self.shaders.setdefault(shader, len(self.shaders) + 1) if shader else ""
+        self.events.writerow((elapsed, event, stage.decode("ascii"), shader_id, frame, sample))
+
+    def shader_event(self, raw):
+        line = ANSI.sub(b"", raw)
+        for marker, name in ((b"first bind pipeline=", "first bind"), (b"shader translated stage=", "translated"),
+                             (b"shader does not translate;", "translation refused")):
+            if marker in line:
+                ref = SHADER_REF.search(line)
+                if ref:
+                    frame = re.search(rb"\bframe=([0-9]{1,10})\b", line)
+                    self.record(line, name, *ref.groups(), frame=int(frame[1]) if frame else "")
+                    return True
+        pipeline = re.search(rb"\bhost (?:mesh )?pipeline( refused [^\n]*?)? shaders=\[([^\]]{1,256})\]", line)
+        if pipeline:
+            refs = PIPELINE_REF.findall(pipeline[2])
+            for stage, shader in refs:
+                self.record(line, "pipeline refused" if pipeline[1] else "pipeline ready", stage, shader)
+            return bool(refs)
+        return False
+
+
+def read_metrics(stream, frame_log, submission_log, timeline):
     """Count diagnostic messages and completed, non-overlapping present windows."""
-    frames = windows = slow = stalls = 0
-    submission_seen = False
+    frames = windows = slow = stalls = submissions = 0
+    shader_seen = False
     elapsed = longest = 0.0
     counts = {}
     vendor = None
@@ -298,6 +345,7 @@ def read_metrics(stream, frame_log, submission_log):
                                         float(worst), over100, over1000])
                     frames += n
                     windows += 1
+                    timeline.record(ANSI.sub(b"", raw), "present window", sample=windows)
                     elapsed += n * float(mean)
                     longest = max(longest, float(worst))
                     slow += over100
@@ -306,12 +354,16 @@ def read_metrics(stream, frame_log, submission_log):
             match = SUBMISSION.search(ANSI.sub(b"", raw).rstrip())
             if match:
                 submission_log.writerow([value.decode("ascii") for value in match.groups()])
-                submission_seen = True
+                submissions += 1
+                timeline.record(ANSI.sub(b"", raw), "submission sample", sample=submissions)
         elif b"host D3D12 device ready" in raw:
             match = re.search(rb"\bvendor=(0x[0-9a-f]{4})\b", ANSI.sub(b"", raw))
             if match:
                 vendor = VENDORS.get(match[1], "other")
         else:
+            if any(marker in raw for marker in (b"host pipeline", b"host mesh pipeline", b"first bind",
+                                                b"shader translated", b"shader does not translate;")):
+                shader_seen |= timeline.shader_event(raw)
             for marker, name in EVENTS.items():
                 if marker in raw:
                     counts[name] = counts.get(name, 0) + 1
@@ -324,10 +376,10 @@ def read_metrics(stream, frame_log, submission_log):
         rows.append("Frame timings: unavailable")
     if counts:
         rows.append("Log messages: " + ", ".join(f"{name}: {counts[name]}" for name in sorted(counts)))
-    return rows, bool(frames or submission_seen or counts or vendor)
+    return rows, bool(frames or submissions or counts or vendor or shader_seen)
 
 
-def side_metrics(results, side, windows, frame_log, submission_log):
+def side_metrics(results, side, windows, frame_log, submission_log, timeline):
     console = results / (side + ".log")
     if not console.is_file():
         return ["No console log recorded"]
@@ -345,17 +397,18 @@ def side_metrics(results, side, windows, frame_log, submission_log):
                     for name in ("steam-victory.log", *other_steam, "launcher.log"):
                         if name in logs:
                             with bundle.extractfile(logs[name]) as stream:
-                                rows, recognized = read_metrics(stream, frame_log, submission_log)
+                                rows, recognized = read_metrics(stream, frame_log, submission_log, timeline)
                             if recognized:
                                 return rows
             except (OSError, EOFError, tarfile.TarError):
                 pass
     with console.open("rb") as stream:
-        rows, _ = read_metrics(stream, frame_log, submission_log)
+        rows, _ = read_metrics(stream, frame_log, submission_log, timeline)
         return rows
 
 
 def diagnostic_summary(request, results, windows, complete, destination):
+    shader_ids = {}
     rows = [f"Series X hardware test | PR #{request['pr']} | " + ("Windows" if windows else "Linux/Proton"),
             "Comparison completed" if complete else "Partial comparison",
             "Timings cover all recorded phases, including menus."]
@@ -366,21 +419,24 @@ def diagnostic_summary(request, results, windows, complete, destination):
         code = str(int(status)) if re.fullmatch(rb"-?[0-9]{1,10}", status) else "unreported"
         frames_path = destination / (side + "-frames.csv")
         samples_path = destination / (side + "-submissions.csv")
+        events_path = destination / (side + "-events.csv")
         with frames_path.open("x", encoding="ascii", newline="") as frames, \
-                samples_path.open("x", encoding="ascii", newline="") as samples:
+                samples_path.open("x", encoding="ascii", newline="") as samples, \
+                events_path.open("x", encoding="ascii", newline="") as events:
             frame_log = csv.writer(frames)
             submission_log = csv.writer(samples)
             submission_log.writerow(SUBMISSION_COLUMNS)
             frame_log.writerow(["window", "intervals", "mean_ms", "median_ms", "p95_ms", "longest_ms",
                                 "over_100_ms", "over_1_s"])
-            rows += [f"Launcher exit: {code}", *side_metrics(results, side, windows, frame_log, submission_log)]
+            rows.append(f"Launcher exit: {code}")
+            rows.extend(side_metrics(results, side, windows, frame_log, submission_log, Timeline(events, shader_ids)))
     return "\n".join(rows) + "\n"
 
 
 def share_result(pr, report, filtered):
     print(report, flush=True)
     instruction_block("SHARE YOUR RESULT",
-                      "The filtered ZIP contains the summary above, frame timings and sampled GPU submission costs for each run. "
+                      "The filtered ZIP contains the summary above, frame timings, submission costs and a shader event timeline. "
                       "You can also send a written summary.", f"Filtered diagnostics: {filtered}")
     if not sys.stdin.isatty():
         return
@@ -466,7 +522,7 @@ def run_request(manifest, options):
                 filtered = share / (destination.name + "-diagnostics.zip")
                 with zipfile.ZipFile(filtered, "x", zipfile.ZIP_DEFLATED) as out:
                     for name in ("summary.txt", "main-frames.csv", "candidate-frames.csv",
-                                 "main-submissions.csv", "candidate-submissions.csv"):
+                                 "main-submissions.csv", "candidate-submissions.csv", "main-events.csv", "candidate-events.csv"):
                         # Fixed ZIP metadata avoids recording local times or file modes.
                         entry = zipfile.ZipInfo(name)
                         out.writestr(entry, (destination / name).read_bytes(), compress_type=zipfile.ZIP_DEFLATED)

@@ -84,7 +84,9 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
    For private sharing, the filtered ZIP also contains per-window mean, median,
    p95, longest frame time and stall counts for each build. Separate submission
    samples record time spent on CPU preparation, buffer and texture copies,
-   GPU waits and copy-back, alongside draw and pipeline-drop counts. You can open it
+   GPU waits and copy-back, alongside draw and pipeline-drop counts. The private
+   event timeline connects shader binds, translations and pipeline results to
+   those samples through elapsed times and shader numbers shared across the pair. You can open it
    locally before sending. Choose **i** for the private upload page and select
    the printed ZIP. Until a project inbox is configured, use the private destination
    supplied by the requester. The printed `share` folder contains just the filtered
@@ -92,7 +94,7 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
 
 **Raw logs may contain usernames, file paths, credentials or output from the title.**
 Keep `report.zip` local. Both sharing options use a fixed set of recognized
-fields. Unknown messages, command lines, hostnames, timestamps, screenshots and
+fields. Unknown messages, command lines, hostnames, wall-clock timestamps, screenshots and
 the request's free text are excluded. If the summary misses something, describe
 it in words. See the [asset policy](asset-policy.md).
 

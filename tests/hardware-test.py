@@ -193,7 +193,8 @@ class HardwareRequest(unittest.TestCase):
         self.assertEqual(list(filtered.parent.iterdir()), [filtered])
         with zipfile.ZipFile(filtered) as archive:
             self.assertEqual(set(archive.namelist()), {"summary.txt", "main-frames.csv", "candidate-frames.csv",
-                                                       "main-submissions.csv", "candidate-submissions.csv"})
+                                                       "main-submissions.csv", "candidate-submissions.csv",
+                                                       "main-events.csv", "candidate-events.csv"})
         with zipfile.ZipFile(report) as archive:
             self.assertEqual(set(archive.namelist()), {"request.json", "main.log", "candidate.log"})
 
@@ -307,6 +308,26 @@ class HardwareRequest(unittest.TestCase):
             else:
                 browser.assert_not_called()
                 self.assertIn("supplied by the requester", output.getvalue())
+
+    def test_private_timeline_correlates_builds_without_exporting_raw_identifiers(self):
+        import csv
+        shader = "0123456789abcdef"
+        for side, time in (("main", "2026-01-01T23:59:58"), ("candidate", "2026-03-04T12:00:06")):
+            outcome = "shader translated" if side == "candidate" else "shader does not translate; skipped"
+            logs = [f'{time}.100000Z first bind pipeline=0xabc frame=12 stage="compute" size=480 hash={shader}',
+                    f'{time}.350000Z {outcome} stage="compute" hash={shader} error=/home/private/file',
+                    f'{time}.400000Z starting host pipeline tid=ff shaders=[compute {shader}]',
+                    f'{time}.500000Z host pipeline \x1b[32mshaders\x1b[0m=[compute {shader}]']
+            (self.root / (side + ".log")).write_text("\n".join(logs))
+        body = runner.diagnostic_summary(self.request, self.root, True, True, self.root)
+        for side in ("main", "candidate"):
+            text = (self.root / (side + "-events.csv")).read_text()
+            rows = list(csv.DictReader(text.splitlines()))
+            self.assertEqual([(r["event"], r["elapsed_ms"], r["shader_id"]) for r in rows],
+                             [("first bind", "0", "1"), ("translated" if side == "candidate" else "translation refused",
+                               "250", "1"), ("pipeline ready", "400", "1")])
+            for forbidden in (shader, "2026-", "0xabc", "private"):
+                self.assertNotIn(forbidden, text + body)
 
     def test_platform_commands_and_cache_paths(self):
         for windows in (False, True):
