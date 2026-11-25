@@ -809,6 +809,17 @@ mod tests {
         assert!(d.filled.is_empty());
     }
 
+    /// A list's reset forgets the pipelines it kept, so a pipeline made
+    /// later at a freed address is kept again.
+    #[test]
+    fn bound_pipelines_forgotten_at_reset() {
+        let mut d = super::Deferred::default();
+        assert!(d.bound.insert(0x5000));
+        assert!(!d.bound.insert(0x5000));
+        d = super::Deferred::default();
+        assert!(d.bound.insert(0x5000));
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -1962,6 +1973,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The pipelines [`HostList::bind_pipeline`] kept, by address.
+    bound: std::collections::HashSet<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -5863,6 +5876,28 @@ impl HostList {
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());
         }
+    }
+
+    /// The list binds a pipeline: it and its root signature are kept until
+    /// the list is reset, and its name noted, the first time only. A kept
+    /// pipeline's address names no other until the reset (after avatarmanz
+    /// ab86ef7, from Belobug 92d353f8): two interface queries, three locks
+    /// and a name lookup less at every change of pipeline.
+    pub(crate) fn bind_pipeline(
+        &self,
+        name: &str,
+        pso: &ID3D12PipelineState,
+        root: &ID3D12RootSignature,
+    ) {
+        {
+            let mut deferred = self.deferred();
+            if !deferred.bound.insert(pso.as_raw() as usize) {
+                return;
+            }
+            deferred.kept.push(pso.clone().into());
+            deferred.kept.push(root.clone().into());
+        }
+        self.used_pipeline(name);
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
