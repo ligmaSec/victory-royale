@@ -202,6 +202,15 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    /// All the view it records is made from: records with equal keys
+    /// make equal views (of the same host texture).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn key(&self) -> (usize, [u32; 7]) {
+        let mut words = [self.described; 7];
+        words[1..].copy_from_slice(&self.desc);
+        (self.resource as usize, words)
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
@@ -1004,6 +1013,33 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// A render target cache may skip a set only when the views would be
+    /// the same: the key covers the resource, whether it is described, and
+    /// every description word.
+    #[test]
+    fn rtv_key_covers_resource_and_description() {
+        let base = RtvRecord {
+            tag: RTV_TAG,
+            described: 1,
+            resource: 0x1000 as This,
+            desc: [28, 4, 0, 0, 0, 0],
+        };
+        assert_eq!(base.key(), base.key());
+        let other_resource = RtvRecord {
+            resource: 0x2000 as This,
+            ..base
+        };
+        let undescribed = RtvRecord {
+            described: 0,
+            ..base
+        };
+        let mut other_mip = base;
+        other_mip.desc[2] = 1;
+        for changed in [other_resource, undescribed, other_mip] {
+            assert_ne!(base.key(), changed.key());
+        }
+    }
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.

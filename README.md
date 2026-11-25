@@ -366,6 +366,7 @@ compare.
 | Variable | Default | Effect when `0` |
 |----------|---------|-----------------|
 | `VICTORY_DECLARE_ONCE` | on | each dispatch declares the ranges its shaders write again, even unchanged since the list's last title write |
+| `VICTORY_BIND_CACHE` | on | render targets are set on the host list again even when it already has the same views |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
