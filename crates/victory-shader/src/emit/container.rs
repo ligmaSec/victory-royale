@@ -44,6 +44,7 @@ impl SigElement {
             18 => Some((68, "SV_DepthLessEqual")),
             19 => Some((67, "SV_DepthGreaterEqual")),
             20 => Some((69, "SV_StencilRef")),
+            28 => Some((23, "SV_Barycentrics")),
             30 => Some((25, "SV_CullPrimitive")),
             _ => None,
         }
