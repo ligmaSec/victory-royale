@@ -5,6 +5,9 @@
 Runs an Xbox Series X|S title natively on Windows, from files
 the user supplies.
 
+This repository continues Linux and Proton development independently. It started from
+[Project Flamingo’s November 25 snapshot](https://github.com/JMAN730/project-flamingo/commit/8cfe46d5b17a61e962b495192e866022200c5f50).
+
 The title's x86-64 code runs unchanged inside our process; VIctory supplies
 the platform underneath it and converts the title's data, ahead of time where
 it can and on first use where it must (shaders). See

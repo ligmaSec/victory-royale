@@ -1,8 +1,5 @@
 name: CI
 
-# Not on description edits: those run `pr-description.yml` alone. A run of
-# this workflow on an edit would post its code checks again, skipped, which
-# GitHub counts as passed over an earlier failure on the same revision.
 on:
   pull_request:
   push:

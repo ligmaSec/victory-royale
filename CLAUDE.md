@@ -103,8 +103,8 @@ converter version when output changes.
 
 ## Conventions
 
-Full rules are in `docs/code-standards.md`; the contribution flow and the planning map are in
-`CONTRIBUTING.md`; domain vocabulary is in `GLOSSARY.md`.
+See `docs/code-standards.md` for code standards, `CONTRIBUTING.md` for setup and checks,
+and `GLOSSARY.md` for domain vocabulary.
 
 - Known approximations are marked `// shortcut:` (never TODO or FIXME).
 - Workspace lints: `unsafe_op_in_unsafe_fn` and `unused_must_use` deny; clippy `all` and

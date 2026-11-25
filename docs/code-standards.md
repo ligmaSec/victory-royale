@@ -13,7 +13,6 @@ does, so the nearest file is always a valid example.
 | Lints | `cargo clippy --workspace --all-targets --locked -- -D warnings` | Windows and Linux |
 | Lints, diagnostics build | the same with `--all-features` | Windows |
 | Tests | `cargo test --workspace --locked` | Windows and Linux |
-| Description | text under `## What` and `## Tested` | every pull request |
 
 The toolchain is the one pinned in `rust-toolchain.toml`. Formatting follows
 `rustfmt.toml` (2024 edition, Unix newlines, field-init and `?` shorthand)
@@ -161,9 +160,8 @@ in the change that closes the gap.
   allocations in unbounded static caches that only insert; tie every
   allocation to an explicit owner, eviction budget, or title-unmap/release
   hook.
-- Changes touching CPU, memory, OS, or GPU boundaries should note under
-  `## Tested` which hardware and OS tiers were exercised and which remain
-  untested.
+- Changes touching CPU, memory, OS, or GPU boundaries should document which hardware
+  and operating systems were tested.
 
 ## Commits
 

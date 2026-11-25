@@ -74,11 +74,11 @@ Escolha uma pasta para o projeto (por exemplo, a sua pasta de usuário) e rode:
 
 ```powershell
 cd $HOME
-git clone https://github.com/Marvisak/VIctory.git
-cd VIctory
+git clone https://github.com/ligmaSec/victory-standalone.git
+cd victory-standalone
 ```
 
-A partir daqui, todos os comandos são rodados **dentro da pasta `VIctory`**.
+A partir daqui, todos os comandos são rodados **dentro da pasta `victory-standalone`**.
 
 ## 4. Compile e rode os testes
 
@@ -116,7 +116,7 @@ O resultado fica em `target\release\victory.exe`.
 
 Esta etapa só é necessária para rodar o jogo.
 
-1. Crie uma pasta **fora** da pasta `VIctory` para os seus arquivos, por
+1. Crie uma pasta **fora** da pasta `victory-standalone` para os seus arquivos, por
    exemplo `D:\victory-data\game`. O VIctory se recusa a usar caminhos dentro
    do repositório, para que nenhum arquivo do jogo acabe enviado por engano.
 2. Crie o seu arquivo de configuração a partir do exemplo:
@@ -177,7 +177,7 @@ cargo build --release -p victory
 
 ## Como relatar um problema
 
-Abra uma issue em <https://github.com/Marvisak/VIctory/issues> e inclua:
+Abra uma issue em <https://github.com/ligmaSec/victory-standalone/issues> e inclua:
 
 - o que você fez e o que aconteceu;
 - processador, placa de vídeo, versão do driver e versão do Windows;
