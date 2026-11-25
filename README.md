@@ -1,9 +1,9 @@
-# VIctory
+# Victory Royale
 
-Runs an Xbox Series X|S title natively on Windows, from files
-the user supplies.
+Victory Royale continues development of VIctory, which runs an Xbox Series X|S
+title on Windows or under Proton on Linux using files you supply.
 
-This repository continues Linux and Proton development independently. It started from
+This independent repository started from
 [Project Flamingo’s November 25 snapshot](https://github.com/JMAN730/project-flamingo/commit/8cfe46d5b17a61e962b495192e866022200c5f50).
 
 The title's x86-64 code runs unchanged inside our process; VIctory supplies
@@ -12,8 +12,8 @@ it can and on first use where it must (shaders). See
 [docs/architecture.md](docs/architecture.md).
 
 The Windows executable can also be launched under Proton on x86-64 Linux. See
-[Running with the Proton launcher](docs/proton-launcher.md). Private builds and checksums are
-available from [successful main CI runs](docs/testing.md#ci-and-private-builds).
+[Running with the Proton launcher](docs/proton-launcher.md). Builds and checksums are
+available from [successful main CI runs](docs/testing.md#ci-and-build-downloads).
 
 ## Status
 
@@ -30,12 +30,11 @@ shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`). On x86-64 Linux, follow the
 [Proton guide](docs/proton-launcher.md) to build and launch the Windows executable.
 
-Clone the private repository with a GitHub account that has access. Run the
-remaining commands from the checkout.
+Clone the repository and run the remaining commands from the checkout.
 
 ```sh
-git clone https://github.com/ligmaSec/victory-standalone.git
-cd victory-standalone
+git clone https://github.com/ligmaSec/victory-royale.git
+cd victory-royale
 ```
 
 To install Rust, use rustup (`winget install --id Rustlang.Rustup -e`, or

@@ -1,6 +1,6 @@
 # Repository guide
 
-Use the private `ligmaSec/victory-standalone` repository for issues and changes.
+Use the `ligmaSec/victory-royale` repository for issues and changes.
 
 Follow the [code standards](docs/code-standards.md) and [asset policy](docs/asset-policy.md).
 The [development guide](CONTRIBUTING.md) covers setup and checks. See the [architecture guide](docs/architecture.md)

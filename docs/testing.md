@@ -14,7 +14,7 @@ contention for the graphics driver. Both jobs run Clippy. See the
 The workspace suite includes the [asset-policy check](asset-policy.md).
 Run `cargo xtask install-hooks` to enable it on commit.
 
-## CI and private builds
+## CI and build downloads
 
 Every pull request and push to `main` runs the documentation and asset checks.
 Changes limited to project guides and test READMEs finish there. Code, workflow,
@@ -35,7 +35,7 @@ threads, memory, DLL loading, and expected title return codes. Failed runs retai
 the synthetic case logs and summary for three days. Game rendering and
 the full UMU/Proton runtime still require a separate workstation test.
 
-Successful main builds deliver a private Actions artifact named
+Successful main builds deliver an Actions artifact named
 `victory-proton-x86_64-<commit>` for 14 days. Download it from the CI run,
 unzip the Actions download, and run the following in the extracted directory.
 
