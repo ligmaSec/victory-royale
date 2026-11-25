@@ -91,7 +91,8 @@ Run the [hardware kit workflow](../.github/workflows/hardware-request.yml) on
 `main` with the PR number and a short Series X scenario. Specify where to start,
 what to observe and when to close each run. Once it succeeds, send the tester the
 checkout command for their OS with the PR number appended, plus the private report
-destination. The menu also lists the request. If the PR head changes or the kit
+destination. Add the `tester wanted` label to the PR while the request is open.
+The menu also lists the request. If the PR head changes or the kit
 expires, publish a fresh kit for the current revision.
 
 For testers without a checkout, share the kit ZIP. To prepare one locally with a
