@@ -623,19 +623,21 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if crate::texture::title_written(from) {
                 crate::texture::upload(&list, src, from);
             }
-            if let Some(format) = crate::resource::packed_copy_format(dst, src)
-                && packed_transfer(this, dst, |list| {
+            if let Some(format) = crate::resource::packed_copy_format(dst, src) {
+                if packed_transfer(this, dst, |list| {
                     crate::packed_copy::record(list, to, from, format, || {
                         ensure_state(list, dst, COPY_DEST);
                         ensure_state(list, src, COPY_SOURCE);
                     })
-                })
-            {
-                #[cfg(feature = "diagnostics")]
-                list.note_op(|| format!("copy packed resource {src:?} to {dst:?}"));
-                return;
-            }
-            if crate::resource::skip_mixed_packed_copy("CopyResource", to, from) {
+                }) {
+                    #[cfg(feature = "diagnostics")]
+                    list.note_op(|| format!("copy packed resource {src:?} to {dst:?}"));
+                } else {
+                    static WARN: std::sync::Once = std::sync::Once::new();
+                    WARN.call_once(|| {
+                        tracing::warn!(format, "packed resource copy conversion failed")
+                    });
+                }
                 return;
             }
             ensure_state(&list, dst, COPY_DEST);
@@ -861,7 +863,14 @@ extern "system" fn copy_texture_region(
                 return;
             };
             // Only the copied rectangle needs a host staging footprint.
-            let Ok(row_bytes_u32) = u32::try_from(region.row_bytes) else {
+            let packed = crate::resource::PACKED_16.contains(&host_format)
+                && crate::resource::widened_packed_format(src.resource) == Some(host_format);
+            let host_row_bytes = if packed {
+                u64::from(extent[0]) * 4
+            } else {
+                region.row_bytes
+            };
+            let Ok(row_bytes_u32) = u32::try_from(host_row_bytes) else {
                 return;
             };
             let Some(host_pitch) = row_bytes_u32.checked_next_multiple_of(256) else {
@@ -870,7 +879,7 @@ extern "system" fn copy_texture_region(
             let staging_lines = u64::from(extent[2]) * region.lines;
             let Some(staging_bytes) = u64::from(host_pitch)
                 .checked_mul(staging_lines - 1)
-                .and_then(|n| n.checked_add(region.row_bytes))
+                .and_then(|n| n.checked_add(host_row_bytes))
             else {
                 return;
             };
@@ -883,7 +892,11 @@ extern "system" fn copy_texture_region(
             let mut to_location = dst;
             to_location.resource = buffer.as_raw().cast_const().cast();
             to_location.footprint.offset = 0;
-            to_location.footprint.format = host_format;
+            to_location.footprint.format = if packed {
+                crate::resource::RGBA8_UNORM
+            } else {
+                host_format
+            };
             [
                 to_location.footprint.width,
                 to_location.footprint.height,
@@ -928,10 +941,10 @@ extern "system" fn copy_texture_region(
                 list.defer_readback(
                     target.wrapping_add(to as usize),
                     staging.wrapping_add(from as usize),
-                    dst_pitch as usize,
-                    host_pitch as usize,
+                    (dst_pitch as usize, host_pitch as usize),
                     region.lines as usize,
                     region.row_bytes as usize,
+                    packed.then_some(host_format),
                 );
             }
             mark_work(this);
@@ -985,10 +998,12 @@ extern "system" fn copy_texture_region(
                 }) {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| format!("copy packed texture region {region:?}"));
-                    return;
+                } else {
+                    static WARN: std::sync::Once = std::sync::Once::new();
+                    WARN.call_once(|| {
+                        tracing::warn!(format, "packed region copy conversion failed")
+                    });
                 }
-            }
-            if crate::resource::skip_mixed_packed_copy("CopyTextureRegion", to, texture) {
                 return;
             }
             ensure_state(&list, src.resource, COPY_SOURCE);
@@ -1200,14 +1215,14 @@ extern "system" fn resolve(
             crate::resource::host_resource(src),
         )
     {
-        if let Some(logical) = crate::resource::packed_copy_format(dst, src)
-            && packed_resolve(this, dst, dst_sub, src, src_sub, logical)
-        {
-            #[cfg(feature = "diagnostics")]
-            list.note_op(|| format!("resolve packed {src:?} to {dst:?} format {logical}"));
-            return;
-        }
-        if crate::resource::skip_mixed_packed_copy("ResolveSubresource", to, from) {
+        if let Some(logical) = crate::resource::packed_copy_format(dst, src) {
+            if packed_resolve(this, dst, dst_sub, src, src_sub, logical) {
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| format!("resolve packed {src:?} to {dst:?} format {logical}"));
+            } else {
+                static WARN: std::sync::Once = std::sync::Once::new();
+                WARN.call_once(|| tracing::warn!(logical, "packed resolve conversion failed"));
+            }
             return;
         }
         use windows::Win32::Foundation::RECT;

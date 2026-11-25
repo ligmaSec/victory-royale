@@ -377,8 +377,13 @@ pub(crate) fn widened_packed_format(this: This) -> Option<u32> {
 #[cfg(windows)]
 pub(crate) fn bound_view_format(this: This, view: u32) -> u32 {
     let view = pc_format(view);
-    if view == 67 {
-        return 10;
+    if view == 67
+        && let Some(host) = host_resource(this)
+    {
+        // SAFETY: the live resource owns this description.
+        if unsafe { host.GetDesc() }.Format.0 == 10 {
+            return 10;
+        }
     }
     if PACKED_16.contains(&view) && widened_packed_format(this) == Some(view) {
         RGBA8_UNORM
@@ -411,14 +416,14 @@ fn unpack_16(format: u32, packed: u16) -> [u8; 4] {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(windows, test))]
 fn quantize_unorm(v: u8, max: u16) -> u16 {
     (u16::from(v) * max + 127) / 255
 }
 
 /// Packs one `R8G8B8A8_UNORM` texel into DXGI `B5G5R5A1_UNORM` (86) or
 /// `B4G4R4A4_UNORM` (115).
-#[cfg(test)]
+#[cfg(any(windows, test))]
 fn pack_16(format: u32, rgba: [u8; 4]) -> u16 {
     let [r, g, b, a] = rgba;
     match format {
@@ -456,7 +461,7 @@ pub(crate) fn expand_packed16(format: u32, src: &[u8], dst: &mut [u8]) {
 
 /// Packs `src` (`R8G8B8A8_UNORM`, 4 bytes per texel) into `dst`
 /// (`B5G5R5A1_UNORM` 86 or `B4G4R4A4_UNORM` 115, 2 bytes per texel).
-#[cfg(test)]
+#[cfg(any(windows, test))]
 pub(crate) fn pack_rgba8_to_16(format: u32, src: &[u8], dst: &mut [u8]) {
     if !PACKED_16.contains(&format) {
         return;
@@ -555,44 +560,6 @@ pub(crate) fn packed_copy_format(to: This, from: This) -> Option<u32> {
         )
     };
     (formats == (format, RGBA8_UNORM) || formats == (RGBA8_UNORM, format)).then_some(format)
-}
-
-/// Whether a GPU-to-GPU copy or resolve between `to` and `from` mixes a
-/// native packed 16-bit texture with a widened (or different) format, logging
-/// once per packed format so callers can skip the command before recording
-/// barriers or marking the destination written.
-#[cfg(windows)]
-pub(crate) fn skip_mixed_packed_copy(
-    op: &str,
-    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-) -> bool {
-    use std::sync::Once;
-    // SAFETY: live host resources.
-    let (to_fmt, from_fmt) =
-        unsafe { (to.GetDesc().Format.0 as u32, from.GetDesc().Format.0 as u32) };
-    if to_fmt == from_fmt {
-        return false;
-    }
-    let Some(packed) = [from_fmt, to_fmt]
-        .into_iter()
-        .find(|f| PACKED_16.contains(f))
-    else {
-        return false;
-    };
-    static ONCE: [Once; 2] = [Once::new(), Once::new()];
-    if let Some(i) = PACKED_16.iter().position(|&f| f == packed) {
-        ONCE[i].call_once(|| {
-            tracing::warn!(
-                op,
-                packed_format = packed,
-                to_format = to_fmt,
-                from_format = from_fmt,
-                "skipping GPU copy between packed 16-bit texture and widened R8G8B8A8_UNORM target"
-            );
-        });
-    }
-    true
 }
 
 /// The typeless format of a format's family (itself if it has none).
@@ -3432,6 +3399,58 @@ void main() {
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn packed_color_targets_keep_requested_write_flags() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAGS;
+        if crate::host::host().is_none() {
+            return;
+        }
+        for format in [28, 115, 86] {
+            for flags in [0, 1, 5] {
+                let desc = ResourceDesc {
+                    dimension: 3,
+                    alignment: 0,
+                    width: 16,
+                    height: 16,
+                    depth_or_array_size: 1,
+                    mip_levels: 1,
+                    format,
+                    sample_count: 1,
+                    sample_quality: 0,
+                    layout: 0,
+                    flags,
+                };
+                let mut out = std::ptr::null();
+                assert_eq!(
+                    create_committed(
+                        std::ptr::null(),
+                        &PROPERTIES,
+                        0,
+                        &desc,
+                        0,
+                        std::ptr::null(),
+                        &RESOURCE_IIDS[0],
+                        &mut out
+                    ),
+                    S_OK
+                );
+                // SAFETY: the guest resource retains its live D3D12 texture.
+                let physical = unsafe { host_resource(out).unwrap().GetDesc() };
+                assert_eq!(slot::<Release>(out, 0x10)(out), 0);
+                assert!(
+                    physical.Flags.contains(D3D12_RESOURCE_FLAGS(flags as i32)),
+                    "logical {format} flags {flags}, physical {} flags {}",
+                    physical.Format.0,
+                    physical.Flags.0
+                );
+                if flags == 0 || format == 28 {
+                    assert_eq!(physical.Format.0 as u32, format);
+                }
+            }
+        }
+    }
+
     #[test]
     fn r9g9b9e5_target_format_substitutes_rgba16f() {
         assert_eq!(pc_format(67), 67);
@@ -3693,6 +3712,58 @@ void main() {
             assert_eq!(got, expected_host_format, "flags {flags}");
             assert_eq!(view_format(out), None, "flags {flags}");
             assert_eq!(slot::<Release>(out, 0x10)(out), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packed_title_readback_preserves_neighbours_and_alpha() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let mut cmd = packed_test::GuestCmd::new();
+        for format in PACKED_16 {
+            for flags in [1, 5] {
+                let texture = cmd.make_texture(3, 2, format, flags, 1, 1, 1);
+                let buffer = cmd.make_buffer(768);
+                let (data, _) = buffer_bytes(buffer).unwrap();
+                // SAFETY: the title buffer owns 768 bytes until cmd is dropped.
+                unsafe { data.write_bytes(0xa5, 768) };
+                let rgba = [1.0, 0.0, 1.0, 0.0];
+                cmd.clear_rtv(texture, None, &rgba, &[]);
+                let footprint = PlacedFootprint {
+                    offset: 0,
+                    format,
+                    width: 4,
+                    height: 3,
+                    depth: 1,
+                    row_pitch: 256,
+                };
+                let to = packed_test::CopyLocation {
+                    resource: buffer,
+                    kind: 1,
+                    footprint,
+                };
+                let from = packed_test::CopyLocation {
+                    resource: texture,
+                    kind: 0,
+                    footprint: PlacedFootprint {
+                        offset: 0,
+                        ..footprint
+                    },
+                };
+                cmd.copy_region(&to, 1, 1, 0, &from, Some(&[1, 0, 0, 3, 2, 1]));
+                cmd.execute();
+                cmd.reset();
+                let pixel: u16 = if format == 86 { 0x7c1f } else { 0x0f0f };
+                let mut expected = [0xa5; 768];
+                for start in [258, 514] {
+                    expected[start..start + 4].copy_from_slice(&pixel.to_le_bytes().repeat(2));
+                }
+                // SAFETY: GPU execution and texture copy-back completed.
+                let actual = unsafe { std::slice::from_raw_parts(data, 768) };
+                assert_eq!(actual, expected, "format {format} flags {flags}");
+            }
         }
     }
 

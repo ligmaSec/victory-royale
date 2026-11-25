@@ -853,6 +853,7 @@ struct Readback {
     src_pitch: usize,
     lines: usize,
     row_bytes: usize,
+    pack_to: Option<u32>,
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -1200,7 +1201,21 @@ impl Host {
         }
         for list in runs {
             for rb in &list.deferred().readbacks {
-                let written = if rb.dst_pitch == rb.row_bytes && rb.src_pitch == rb.row_bytes {
+                let written = if let Some(format) = rb.pack_to {
+                    let mut packed = vec![0; rb.row_bytes];
+                    for line in 0..rb.lines {
+                        let from = rb.src + line * rb.src_pitch;
+                        let to = rb.dst + line * rb.dst_pitch;
+                        // SAFETY: each packed texel has four bytes in the mapped host row.
+                        let rgba = unsafe {
+                            std::slice::from_raw_parts(from as *const u8, rb.row_bytes * 2)
+                        };
+                        crate::resource::pack_rgba8_to_16(format, rgba, &mut packed);
+                        crate::watch::writing(to, rb.row_bytes);
+                        write_mapped(to as *mut u8, packed.as_ptr(), packed.len());
+                    }
+                    rb.lines * rb.row_bytes
+                } else if rb.dst_pitch == rb.row_bytes && rb.src_pitch == rb.row_bytes {
                     let total = rb.lines * rb.row_bytes;
                     crate::watch::writing(rb.dst, total);
                     write_mapped(rb.dst as *mut u8, rb.src as *const u8, total);
@@ -2049,10 +2064,10 @@ impl HostList {
         &self,
         dst: *mut u8,
         src: *const u8,
-        dst_pitch: usize,
-        src_pitch: usize,
+        (dst_pitch, src_pitch): (usize, usize),
         lines: usize,
         row_bytes: usize,
+        pack_to: Option<u32>,
     ) {
         self.mark_work();
         self.deferred().readbacks.push(Readback {
@@ -2062,6 +2077,7 @@ impl HostList {
             src_pitch,
             lines,
             row_bytes,
+            pack_to,
         });
     }
 
