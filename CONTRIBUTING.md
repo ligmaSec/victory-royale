@@ -25,6 +25,13 @@ hardware, and result. A successful run on a machine where a fix needed checking
 is worth posting too. For a new failure, open **one issue per distinct symptom**
 using the [test report form](https://github.com/ligmaSec/victory-royale/issues/new?template=test-report.yml).
 
+## Help by reviewing pull requests
+
+Security reviews of [open pull requests](https://github.com/ligmaSec/victory-royale/pulls)
+are especially welcome. Even a review of one changed function helps. In a review
+comment, point to the relevant lines and explain what could go wrong and under
+what conditions. If you have a suggested fix or regression test, share it too.
+
 ## Game data
 
 Nothing from the game, or from any other proprietary title, enters this
