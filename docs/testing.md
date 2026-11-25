@@ -80,8 +80,12 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
 2. The **candidate** opens next. Repeat the same steps with the same settings and window
    size. The runner gives each build its own fresh translation cache.
 3. After the runs, the **Hardware test results** screen shows each build’s timings.
-   Missing samples are shown as unavailable. These timings include menus. Tell the
-   requester what you saw in the opening scene. Use **↑/↓** to highlight an action,
+   Missing samples are shown as unavailable. These timings include menus. Choose **Describe what you saw** to open a local
+   browser form. Describe each build separately. Click its screenshot box and paste
+   with **Ctrl+V**, or choose an image. Inspect the preview for names and overlays.
+   You can replace or remove either image. **Save locally** returns you to the terminal
+   to choose what to share. Closing the tab leaves edits unsaved. Use Ctrl+C in the
+   terminal to leave an abandoned editor. Use **↑/↓** to highlight an action,
    **Enter** to select and **Esc** to go back. **PgUp/PgDn** scroll longer details.
 4. Choose **Preview summary** to read the public text. **Review and edit files**
    opens the built-in editor when supplied. Use **↑/↓** to pick a file, **Space**
@@ -92,6 +96,10 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
    discards those edits. The folder option also works with older kits.
 5. Choose **Keep local and finish** to print the saved ZIP path. **Post public
    summary** previews the exact text and names the signed-in account and PR.
+   Public posts include the reviewed observations alongside timings. Screenshots go
+   only in the filtered ZIP. After posting or sending, the results screen shows each
+   destination’s status. You can choose the other destination before finishing.
+   Older extracted kits retain their original interface.
    For private sharing, the filtered ZIP also contains per-window mean, median,
    p95, longest frame time and stall counts for each build. Separate submission
    samples record time spent on CPU preparation, buffer and texture copies,

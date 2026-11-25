@@ -117,7 +117,8 @@ def prepare():
             runner = runner.replace(b"PUBLISHED_SHA256 = None", f'PUBLISHED_SHA256 = "{stamp}"'.encode(), 1)
         out.writestr("run-test.py", runner)
         out.write(ROOT / "report_keys.py", "report_keys.py")
-        out.write(ROOT / "report_ui.py", "report_ui.py")
+        for name in ("report_ui.py", "observations.py", "observations.html"):
+            out.write(ROOT / name, name)
         out.write(ROOT.parents[1] / "LICENSE", "LICENSE")
         out.write(ROOT / "README.txt", "README.txt")
         out.writestr("request.json", manifest)
