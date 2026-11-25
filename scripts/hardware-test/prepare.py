@@ -19,17 +19,19 @@ def api(path):
     return json.loads(raw)
 
 
-def find_build(event, commit, prefix):
-    runs = api(f"actions/workflows/ci.yml/runs?event={event}&status=success&head_sha={commit}&per_page=100")
+def find_build(source, commit, prefix):
+    baseline = source == "main"
+    query = "branch=main" if baseline else "event=pull_request"
+    runs = api(f"actions/workflows/ci.yml/runs?{query}&status=success&head_sha={commit}&per_page=100")
     for run in runs["workflow_runs"]:
-        if event == "push" and run["head_branch"] != "main":
+        if baseline and (run["event"] not in ("push", "workflow_dispatch") or run["head_branch"] != "main"):
             continue
         for artifact in api(f"actions/runs/{run['id']}/artifacts?per_page=100")["artifacts"]:
             match = re.fullmatch(re.escape(prefix) + r"([0-9a-f]{40})", artifact["name"])
             if not match or artifact["expired"]:
                 continue
             revision = match[1]
-            if event == "push":
+            if baseline:
                 if revision != commit:
                     continue
                 base = None
@@ -48,7 +50,7 @@ def find_build(event, commit, prefix):
                 if checks != [digest, PACKAGE]:
                     raise ValueError("Package checksum mismatch.")
             return {"run": run["id"], "revision": revision, "sha256": digest}, base, package
-    raise ValueError(f"No unexpired successful {event} CI package for {commit[:12]}. "
+    raise ValueError(f"No unexpired successful {source} CI package for {commit[:12]}. "
                      "Refresh the matched builds before asking a tester.")
 
 
@@ -65,7 +67,7 @@ def prepare():
         raise ValueError("The PR must target this repository's main branch.")
     candidate, base, candidate_bytes = find_build("pull_request", pull["head"]["sha"],
                                  f"victory-proton-x86_64-pr-{args.pr}-")
-    main, _, main_bytes = find_build("push", base, "victory-proton-x86_64-")
+    main, _, main_bytes = find_build("main", base, "victory-proton-x86_64-")
     request = {"version": 1, "pr": args.pr, "scenario": args.scenario, "main": main, "candidate": candidate}
     with zipfile.ZipFile(args.output, "x", zipfile.ZIP_DEFLATED) as out:
         for build, package in ((main, main_bytes), (candidate, candidate_bytes)):

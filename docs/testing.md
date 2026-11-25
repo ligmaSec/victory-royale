@@ -108,7 +108,10 @@ python3 scripts/hardware-test/prepare.py PR_NUMBER --output test-kit.zip \
 ```
 
 The packager matches the successful PR build to its tested main parent and checks
-both artifact digests. If either build has expired, refresh the pair first.
+both artifact digests. A documentation-only push can pass CI without packaging a
+build. If the tested parent is the current head of `main`, run
+`gh workflow run ci.yml --ref main`. Wait for CI to finish, then prepare the kit
+again. If either revision has moved or expired, refresh the matched pair first.
 Post the tested revisions, configuration and observed differences on the PR. For
 performance comparisons, include frame times and stalls alongside average or median FPS.
 
