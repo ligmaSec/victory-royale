@@ -478,6 +478,71 @@ fn drained() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn indirect_draws_without_a_pipeline_leave_budget_for_a_later_record() {
+        use crate::object::{self, S_OK};
+        use crate::pipeline::{PIPELINE_IIDS, Pipeline, hand_out};
+        use victory_shader::native::{ComputeIo, StageIo};
+        use victory_shader::{HwStage, NativeProgram};
+
+        let _scope = crate::host::isolated_retire_scope();
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let create = |shaders| {
+            let mut pipeline = std::ptr::null();
+            assert_eq!(
+                hand_out(shaders, None, &PIPELINE_IIDS[0], &mut pipeline),
+                S_OK
+            );
+            // Resolve the synthetic PSOs before recording so this budget test
+            // is independent of the async compiler's frame deadline.
+            crate::pipeline::pipeline(pipeline).host.make();
+            pipeline
+        };
+        let missing = create(vec![]); // no vertex or mesh stage
+        let compute = create(vec![Shader::test_compute(NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 1,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code: 0xBF81_0000u32.to_le_bytes().to_vec(), // s_endpgm
+        })]);
+        let list = host.new_list().unwrap();
+        // Two skipped draws could consume the whole list budget. The last
+        // record dispatches three groups through a working host pipeline.
+        let records = [[1u32 << 24, 4, 0, 0], [1 << 24, 4, 0, 0], [3, 1, 1, 0]];
+        let start = records.as_ptr() as u64;
+        crate::shadow::register(start as usize, start, size_of_val(&records) as u64);
+        let mut state = crate::draw::State::default();
+        state.set_pipeline(missing);
+        let mut dropped = "";
+        let ran_draw = state.execute_indirect(&list, (0, 16, 2), start, None, &mut dropped);
+        state.set_pipeline(compute);
+        let dispatch = start + 32;
+        let mut reason = "";
+        let ran_dispatch = state.execute_indirect(&list, (2, 16, 1), dispatch, None, &mut reason);
+        list.close();
+        host.execute(&[&list]);
+        let copy = crate::shadow::find(dispatch, 4).unwrap();
+        let groups = u32::from_le_bytes(copy.bytes(dispatch, 4).unwrap().try_into().unwrap());
+        crate::shadow::unregister(start as usize, start);
+        object::release_boxed::<Pipeline>(missing);
+        object::release_boxed::<Pipeline>(compute);
+        assert!(!ran_draw);
+        assert_eq!(dropped, "no host pipeline");
+        assert!(ran_dispatch, "{reason}");
+        assert_eq!(
+            groups, 3,
+            "skipped draws exhausted the following dispatch budget"
+        );
+    }
+
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
     #[test]

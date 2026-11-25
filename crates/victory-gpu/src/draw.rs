@@ -634,6 +634,16 @@ impl State {
         let Some(p) = self.bound_pipeline(false) else {
             return false;
         };
+        self.prepare_graphics(list, indexed, mesh, &p)
+    }
+
+    fn prepare_graphics(
+        &mut self,
+        list: &HostList,
+        indexed: bool,
+        mesh: bool,
+        p: &HostPipeline,
+    ) -> bool {
         if p.compute || p.mesh != mesh {
             once!(
                 mesh,
@@ -645,7 +655,7 @@ impl State {
             once!("a rectangle pipeline drawn with another topology");
             return false;
         }
-        if !self.bind(list, &p, false) {
+        if !self.bind(list, p, false) {
             return false;
         }
         let l = &list.list;
@@ -987,7 +997,7 @@ impl State {
         let host = heap.host()?;
         // The console forms this byte offset with a 32-bit shift by five.
         let Some(read) = heap.selected_buffer(selected & (u32::MAX >> 5)) else {
-            return Some([self.raw_slot(host, key, RawAccess::Read, None)?, 0, 0]);
+            return Some([self.raw_slot(host, key, RawAccess::Read, None)? << 4, 0, 0]);
         };
         let offset = read.shadow.offset(read.address);
         let bias = offset % 16;
@@ -1005,7 +1015,9 @@ impl State {
         };
         read.shadow
             .refresh_as(list, read.address, read.bytes, state);
-        Some([index, read.stride, bias as u32])
+        // VIEW_HEAP_LIMIT leaves room for the four-bit alignment bias.
+        const { assert!(victory_shader::emit::VIEW_HEAP_LIMIT <= 1 << 28) };
+        Some([(index << 4) | bias as u32, read.stride, read.bytes as u32])
     }
 
     /// Bind a raw view of the remaining host buffer. A writable view, its
@@ -2177,6 +2189,20 @@ impl State {
             );
             return false;
         };
+        // Clamping charges the list budget and can empty subsequent records.
+        // Only record it after the target pipeline is available.
+        let Some(p) = self.bound_pipeline(kind == DISPATCH) else {
+            *dropped = "no host pipeline";
+            #[cfg(feature = "diagnostics")]
+            {
+                self.frame_op("indirect", kind == DISPATCH, false);
+                crate::pipeline::note_why(format!(
+                    "indirect kind {kind}: {}",
+                    crate::pipeline::drop_reason(self.pipeline as This)
+                ));
+            }
+            return false;
+        };
         args.refresh_as(list, arguments, len, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
@@ -2197,38 +2223,23 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
-            DISPATCH => match self.bound_pipeline(true) {
-                Some(p) if p.compute => self.bind(list, &p, true),
-                _ => false,
-            },
+            DRAW | INDEXED | MESH => self.prepare_graphics(list, kind == INDEXED, kind == MESH, &p),
+            DISPATCH => p.compute && self.bind(list, &p, true),
             _ => false,
         };
         #[cfg(feature = "diagnostics")]
         self.frame_op("indirect", kind == DISPATCH, ran);
         if !ran {
-            let p = self.bound_pipeline(kind == DISPATCH);
-            *dropped = if p.is_none() {
-                "no host pipeline"
-            } else if kind == DISPATCH {
+            *dropped = if kind == DISPATCH {
                 "prepare/bind failed (compute)"
             } else {
                 "prepare/bind failed"
             };
             #[cfg(feature = "diagnostics")]
-            match &p {
-                // Named so the frame's table says which drops are indirect
-                // executions, and which shader keeps them from running.
-                None => crate::pipeline::note_why(format!(
-                    "indirect kind {kind}: {}",
-                    crate::pipeline::drop_reason(self.pipeline as This)
-                )),
-                Some(p) => why(&format!(
-                    "prepare failed (compute {}, mesh {})",
-                    p.compute, p.mesh
-                )),
-            }
+            why(&format!(
+                "prepare failed (compute {}, mesh {})",
+                p.compute, p.mesh
+            ));
             return false;
         }
         #[cfg(feature = "diagnostics")]
@@ -4902,7 +4913,7 @@ mod structured_alias_tests {
         let desc = HeapDesc {
             desc: D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 4,
+                NumDescriptors: 6,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             },
@@ -4927,8 +4938,9 @@ mod structured_alias_tests {
         resource[0] = 1;
         resource[4] = 256;
         // The first view starts at byte 12 and has stride 12. The second starts
-        // at byte 32 and has stride 32. The last contains only one record.
-        for (slot, stride, count) in [(1, 12, 2), (2, 32, 2), (3, 16, 1)] {
+        // at byte 32 and has stride 32. The last two test reads starting just
+        // past a view and reads straddling its final dword.
+        for (slot, stride, count) in [(1, 12, 2), (2, 32, 2), (3, 16, 1), (4, 20, 1), (5, 8, 2)] {
             let mut words = [0u32; 16];
             words[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
             words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -4944,7 +4956,7 @@ mod structured_alias_tests {
                 heap.start + slot * 32,
             );
         }
-        let (buffer, mapped) = host.readback_buffer(48).unwrap();
+        let (buffer, mapped) = host.readback_buffer(64).unwrap();
         let mut state = State::default();
         state.set_heaps(&[views]);
         let list = host.new_list().unwrap();
@@ -4953,6 +4965,8 @@ mod structured_alias_tests {
             (1, 1),
             (2, 1),
             (3, 1),
+            (4, 1),
+            (5, 1),
             (99, 1),
             (2, 0x0800_0001),
             (1, 0x1555_5555),
@@ -4980,14 +4994,16 @@ mod structured_alias_tests {
         }
         list.close();
         host.execute(&[&list]);
-        // SAFETY: the submission completed, and the mapped buffer holds six pairs of dwords.
-        let got = unsafe { mapped.cast::<[[u32; 2]; 6]>().read_unaligned() };
+        // SAFETY: the submission completed, and the mapped buffer holds eight pairs of dwords.
+        let got = unsafe { mapped.cast::<[[u32; 2]; 8]>().read_unaligned() };
         assert_eq!(
             got,
             [
                 [backing[7], backing[8]],
                 [backing[17], backing[18]],
                 [0; 2],
+                [0; 2],
+                [backing[5], 0],
                 [0; 2],
                 [0; 2],
                 [0; 2]

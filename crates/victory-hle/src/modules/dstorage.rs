@@ -8,7 +8,7 @@
 //! console's hardware runs them: in parallel, started in queue order,
 //! queues served by weighted round robin over their priorities (about 10x
 //! per level, counted in bytes), with at most the staging buffer's worth of
-//! compressed source in flight. Each request reads its source (a file or
+//! buffered source in flight. Each request reads its source (a file or
 //! memory), inflates zlib data and/or unpacks BCPack data, and writes the
 //! destination (an address, or physical pages). Completion is what stays
 //! in order: a status entry is written once every request enqueued before
@@ -651,15 +651,40 @@ impl Lane {
 }
 
 /// Staging bytes a request holds while it runs: what it buffers between
-/// the file and the destination. Raw reads go straight to their
-/// destination, memory sources need none (as on the console).
+/// the source and the destination, charged against the staging buffer so
+/// the requests in flight together cannot allocate more than the title
+/// asked for.
+///
+/// A memory source needs none, as on the console: it is read in place. A
+/// request that inflates, unpacks, or writes physical pages holds its whole
+/// source. A plain file read into a title address is copied in from a side
+/// buffer of at most [`BOUNCE_CHUNK`] bytes (see `execute`), so a large one
+/// costs a constant.
+// shortcut: a memory source into physical pages that are not consecutive
+// pages of one allocation buffers the destination and is charged nothing;
+// whether it buffers is only known once the pages are looked up, after the
+// charge is made.
 fn staging_bytes(request: &Request) -> u64 {
-    let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
-    if buffered && request.options & MEMORY_SOURCE == 0 {
-        u64::from(request.source_size)
-    } else {
-        0
+    let options = request.options;
+    if options & MEMORY_SOURCE != 0 {
+        return 0;
     }
+    if options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0 {
+        return u64::from(request.source_size);
+    }
+    bounce_bytes(request.source_size as usize) as u64
+}
+
+/// The most a bouncing plain read buffers at once, as `files::fread`
+/// bounds its own chunks. Every worker can hold one, so the pool's side
+/// buffers stay within a staging buffer of the console's default size.
+const BOUNCE_CHUNK: usize = 1 << 20;
+
+/// The side buffer a bouncing plain read of `source_size` bytes allocates.
+/// [`staging_bytes`] charges this and [`bounce_into`] allocates it, so the
+/// charge cannot under-report the allocation.
+fn bounce_bytes(source_size: usize) -> usize {
+    source_size.min(BOUNCE_CHUNK)
 }
 
 /// Ends a queue: what was enqueued but not submitted is dropped, and this
@@ -881,8 +906,20 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
-            .map_err(|hr| fail(hr, "copying"));
+        // A file read into a title address is the kernel's write, and the
+        // kernel does not fault into the GPU side's guard. A block guarded
+        // again between `kernel_will_write` and the read made the read fail
+        // with ERROR_INVALID_USER_BUFFER, and the title stopped at the failed
+        // request. Read beside and copy in: the copy is a user-mode write
+        // like the title's own stores.
+        let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
+        return into_destination(request, size, |out| {
+            if !bounce {
+                return read_into(request, out).map(|()| size);
+            }
+            bounce_into(request, out).map(|()| size)
+        })
+        .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 {
         Some(bcpack_tables()?)
@@ -993,6 +1030,12 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         });
         return Ok(());
     }
+    read_file_into(request, out, request.offset)
+}
+
+/// Fills `out` from the request's file, `at` bytes in, repeating short
+/// reads; a read that returns nothing has run off the end.
+fn read_file_into(request: &Request, out: &mut [u8], at: u64) -> Result<(), HRESULT> {
     // SAFETY: a file object we created; the title keeps it open.
     let file = &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
@@ -1003,7 +1046,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         if done == out.len() {
             break Ok(());
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+        match file.seek_read(&mut out[done..], at + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
             Err(error) => break Err(from_win32(&error)),
@@ -1011,6 +1054,25 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
+}
+
+/// Fills `out` from the request's file beside the destination, a chunk at
+/// a time, copying each chunk in. `execute` asks for the source size, so
+/// the side buffer is the [`bounce_bytes`] the scheduler charged this
+/// request, and a read of any size holds no more staging than that. A read
+/// that fails part way leaves the destination as a direct read would: the
+/// bytes before the failure landed, the rest did not.
+fn bounce_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
+    let mut beside = vec![0u8; bounce_bytes(out.len())];
+    let bound = beside.len();
+    let mut done = 0;
+    while done < out.len() {
+        let chunk = &mut beside[..(out.len() - done).min(bound)];
+        read_file_into(request, chunk, request.offset + done as u64)?;
+        out[done..done + chunk.len()].copy_from_slice(chunk);
+        done += chunk.len();
+    }
+    Ok(())
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
@@ -1025,8 +1087,10 @@ fn into_destination(
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
         if request.options & (ZLIB | BCPACK) == 0 {
-            // Raw reads are bounded by the OS file read and do not need a
-            // second potentially large buffer.
+            // Raw reads copy in from a side buffer of one chunk (see
+            // `bounce_into`) and do not need a second buffer the size of the
+            // destination; their blocks are opened once for the whole range,
+            // so each chunk's copy lands without faulting.
             victory_gpu::kernel_will_write(request.destination as usize, len);
             // SAFETY: the title's destination holds `destination_size` bytes,
             // at least `len`, and the worker owns this request until completion.
@@ -1556,20 +1620,70 @@ mod tests {
         l.lanes.insert(0, Lane::new(0, 64).unwrap());
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, ZLIB, 60);
-        read(&mut l, 0, 0, 1000); // raw: straight to its destination
         l.submit(0);
         let first = l.start().unwrap();
+        assert_eq!(first.staging, 60);
         assert!(l.start().is_none(), "60 + 60 > 100");
         l.finish(&first, None);
         let second = l.start().unwrap();
-        let raw = l.start().unwrap();
-        assert_eq!((second.staging, raw.staging), (60, 0));
-        // Alone, a request larger than the buffer still runs.
-        read(&mut l, 0, ZLIB, 500);
+        assert_eq!(second.staging, 60);
+        // A plain file read into a title address copies in from a side
+        // buffer, so it is charged too and does not fit beside the
+        // compressed one.
+        read(&mut l, 0, 0, 1000);
         l.submit(0);
-        assert!(l.start().is_none());
+        assert!(l.start().is_none(), "60 + 1000 > 100");
         l.finish(&second, None);
-        assert!(l.start().is_some());
+        // Alone, a request larger than the buffer still runs, holding what
+        // it allocates, and nothing starts beside it.
+        let plain = l.start().unwrap();
+        assert_eq!(plain.staging, 1000);
+        read(&mut l, 0, ZLIB, 10);
+        l.submit(0);
+        assert!(l.start().is_none(), "1000 is already over the budget");
+        l.finish(&plain, None);
+        assert_eq!(l.staged, 0);
+        assert_eq!(l.start().unwrap().staging, 10);
+    }
+
+    /// A plain read charges its side buffer, which is capped at one chunk,
+    /// so reads far larger than the staging buffer still run together.
+    #[test]
+    fn staging_charges_a_bouncing_plain_read_its_chunk_bound() {
+        let mut l = lanes(4 << 20);
+        l.lanes.insert(0, Lane::new(0, 64).unwrap());
+        let huge = (BOUNCE_CHUNK * 8) as u32;
+        read(&mut l, 0, 0, huge);
+        read(&mut l, 0, 0, huge);
+        read(&mut l, 0, 0, 1024); // smaller than the bound: charged in full
+        l.submit(0);
+        let jobs: Vec<Job> = (0..3).map(|_| l.start().unwrap()).collect();
+        let charged: Vec<u64> = jobs.iter().map(|j| j.staging).collect();
+        let chunk = BOUNCE_CHUNK as u64;
+        assert_eq!(charged, [chunk, chunk, 1024], "the bound, then the size");
+        assert_eq!(l.staged, 2 * chunk + 1024);
+        assert!(l.staged <= l.staging, "16 MiB of reads in a 4 MiB buffer");
+        jobs.iter().for_each(|job| l.finish(job, None));
+        assert_eq!(l.staged, 0, "every finish releases its charge");
+    }
+
+    /// What a request buffers is what it is charged: a memory source is
+    /// read in place and charged nothing, whatever its destination, while a
+    /// file source that inflates or writes pages holds its whole source.
+    #[test]
+    fn staging_charges_only_what_a_request_buffers() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64).unwrap());
+        let big = (BOUNCE_CHUNK * 4) as u32;
+        read(&mut l, 0, MEMORY_SOURCE, big);
+        read(&mut l, 0, ZLIB | MEMORY_SOURCE, big);
+        read(&mut l, 0, PAGE_DESTINATION | MEMORY_SOURCE, big);
+        read(&mut l, 0, ZLIB, 700);
+        read(&mut l, 0, PAGE_DESTINATION, 700);
+        l.submit(0);
+        let charged: Vec<u64> = (0..5).map(|_| l.start().unwrap().staging).collect();
+        assert_eq!(charged, [0, 0, 0, 700, 700]);
+        assert_eq!(l.staged, 1400);
     }
 
     #[test]
@@ -1759,6 +1873,38 @@ mod tests {
         void(queue, 0x40);
         assert_eq!(result(array, 0), S_OK);
         assert!(out == data);
+    }
+
+    /// A plain read longer than the side buffer is read and copied in a
+    /// chunk at a time, from the right offsets and including a short last
+    /// chunk; one that runs off the end still fails as a single read does.
+    #[test]
+    fn a_plain_read_longer_than_the_bounce_chunk_arrives_whole() {
+        let data = pattern(2 * BOUNCE_CHUNK + 4321);
+        let (_dir, file) = file_with(&data);
+        let (queue, array) = (new_queue(0), status_array(2));
+        let mut out = vec![0u8; data.len() - 77];
+        let len = out.len();
+        enqueue(
+            queue,
+            &request(0, out.as_mut_ptr().cast(), len, file, 77, len),
+        );
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert!(out == data[77..], "every chunk from its own offset");
+
+        let mut past = vec![0u8; BOUNCE_CHUNK + 16];
+        let len = past.len();
+        let offset = (data.len() - BOUNCE_CHUNK) as u64;
+        enqueue(
+            queue,
+            &request(0, past.as_mut_ptr().cast(), len, file, offset, len),
+        );
+        enqueue_status(queue, array, 1);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 1), END_OF_FILE);
+        void(queue, 0x40);
     }
 
     #[test]

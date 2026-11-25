@@ -2778,6 +2778,62 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
+        if name == "ds_bpermute_b32" {
+            self.cross_lane(false)?;
+            let address = self.vgprs(inst, addr.as_ref().ok_or("a lane gather index")?, 1)?[0];
+            let value = self.vgprs(inst, data.first().ok_or("a lane gather source")?, 1)?[0];
+            // RDNA 2 section 10.4.4: byte address plus offset0, within the
+            // reader's 32-lane half. Disabled sources contribute zero.
+            let me = self.lane_index();
+            let addend = self.s.m.i32(u32::from(*offset0));
+            let address = self.s.m.bin(c, Bin::Add, address, addend);
+            let two = self.s.m.i32(2);
+            let index = self.s.m.bin(c, Bin::LShr, address, two);
+            let mask = self.s.m.i32(31);
+            let local = self.s.m.bin(c, Bin::And, index, mask);
+            let enabled = guard.unwrap_or_else(|| self.s.m.bool(true));
+            let words = self
+                .s
+                .m
+                .named_struct("dx.types.fouri32", vec![self.s.t.i32; 4]);
+            let ballot = self.s.op(
+                c,
+                "waveActiveBallot",
+                Attr::NoUnwind,
+                words,
+                116,
+                &[enabled],
+            );
+            let low = self.s.m.extract(c, ballot, 0);
+            let (source, active) = if self.s.wave_size == Some(64) {
+                let upper_bit = self.s.m.i32(32);
+                let half = self.s.m.bin(c, Bin::And, me, upper_bit);
+                let upper = self.s.m.cmp(c, pred::EQ, half, upper_bit);
+                let high = self.s.m.extract(c, ballot, 1);
+                (
+                    self.s.m.bin(c, Bin::Or, half, local),
+                    self.s.m.select(c, upper, high, low),
+                )
+            } else {
+                (local, low)
+            };
+            let bits = self.s.m.bin(c, Bin::LShr, active, local);
+            let one = self.s.m.i32(1);
+            let bit = self.s.m.bin(c, Bin::And, bits, one);
+            let live = self.s.m.cmp(c, pred::EQ, bit, one);
+            // WaveReadLaneAt is undefined for an inactive host lane.
+            let safe = self.s.m.select(c, live, source, me);
+            let gathered = self.read_lane(value, safe);
+            let zero = self.s.m.i32(0);
+            let result = self.s.m.select(c, live, gathered, zero);
+            self.write(
+                inst,
+                Reg::V(dst_reg.ok_or("a lane gather result")?),
+                result,
+                guard,
+            );
+            return Ok(());
+        }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
@@ -8289,7 +8345,6 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let mut byte_count = None;
         let mut remaining = None;
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
@@ -8316,11 +8371,16 @@ impl<'a> Lower<'a> {
                 .flatten();
             let binding = if index.is_some() && !uav && used.is_none() {
                 if let Some((slot, word)) = selector {
-                    Some(self.selected_buffer(slot, word)?)
+                    let [packed, stride, length] = self.selected_buffer(slot, word)?;
+                    let four = self.s.m.i32(4);
+                    let low = self.s.m.i32(15);
+                    let alias = self.s.m.bin(c, Bin::LShr, packed, four);
+                    let bias = self.s.m.bin(c, Bin::And, packed, low);
+                    Some([alias, stride, bias, length])
                 } else if self.dynamic_buffer(src) {
                     let [alias, stride, bias, records] = self.buffer_record(src)?;
-                    byte_count = Some(self.s.m.bin(c, Bin::Mul, stride, records));
-                    Some([alias, stride, bias])
+                    let length = self.s.m.bin(c, Bin::Mul, stride, records);
+                    Some([alias, stride, bias, length])
                 } else {
                     None
                 }
@@ -8328,7 +8388,7 @@ impl<'a> Lower<'a> {
                 None
             };
             match (index, binding) {
-                (Some(index), Some([alias, stride, bias])) => {
+                (Some(index), Some([alias, stride, bias, length])) => {
                     let start = self.s.m.bin(c, Bin::Mul, index, stride);
                     let offset = self.s.m.bin(c, Bin::Add, start, off);
                     let byte = self.s.m.bin(c, Bin::Add, offset, bias);
@@ -8337,23 +8397,14 @@ impl<'a> Lower<'a> {
                     let zero = self.s.m.i32(0);
                     let product_wrapped = self.s.m.cmp(c, pred::NE, high, zero);
                     let offset_wrapped = self.s.m.cmp(c, pred::IULT, offset, start);
-                    let bias_wrapped = self.s.m.cmp(c, pred::IULT, byte, offset);
                     let wrapped = self.s.m.bin(c, Bin::Or, product_wrapped, offset_wrapped);
-                    let overflow = self.s.m.bin(c, Bin::Or, wrapped, bias_wrapped);
-                    // The host leaves this final block outside every alias. All
-                    // four component addresses still fit in a 32-bit offset.
+                    // The host leaves the final 16-byte block outside every alias.
+                    // Any offset within length still fits after adding the bias.
                     let invalid = self.s.m.i32(u32::MAX - 15);
-                    let in_last_block = self.s.m.cmp(c, pred::IUGE, byte, invalid);
-                    let invalid_address = self.s.m.bin(c, Bin::Or, overflow, in_last_block);
-                    let invalid_address = if let Some(len) = byte_count {
-                        let outside = self.s.m.cmp(c, pred::IUGE, offset, len);
-                        let invalid = self.s.m.bin(c, Bin::Or, invalid_address, outside);
-                        let available = self.s.m.bin(c, Bin::Sub, len, offset);
-                        remaining = Some(self.s.m.select(c, invalid, zero, available));
-                        invalid
-                    } else {
-                        invalid_address
-                    };
+                    let outside = self.s.m.cmp(c, pred::IUGE, offset, length);
+                    let invalid_address = self.s.m.bin(c, Bin::Or, wrapped, outside);
+                    let bytes = self.s.m.bin(c, Bin::Sub, length, offset);
+                    remaining = Some(self.s.m.select(c, invalid_address, zero, bytes));
                     let byte = self.s.m.select(c, invalid_address, invalid, byte);
                     let per_lane = matches!(src, Source::Loaded { load, .. } if self.x.res.waterfall.loads.contains(load));
                     let h = self.s.heap_handle(c, alias, false, per_lane, (11, 0));
@@ -8394,6 +8445,7 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = *data else {
             return Err("a buffer result");
         };
+        // A vector raw load may span the logical end of an aligned view.
         let component = |this: &mut Self, k: u32| {
             let value = this.s.m.extract(c, r, k);
             if let Some(bytes) = remaining {
@@ -11047,18 +11099,19 @@ mod wave_size_tests {
         threads: [u32; 3],
         rsrc2_extra: u32,
     ) -> (super::super::HostShader, (u32, u32)) {
-        compile_wave64_cs_mode(words, threads, rsrc2_extra, true)
+        compile_cs_mode(words, threads, rsrc2_extra, true, true)
     }
 
-    fn compile_wave64_cs_mode(
+    fn compile_cs_mode(
         words: &[u32],
         threads: [u32; 3],
         rsrc2_extra: u32,
+        wave64: bool,
         allow_wave32: bool,
     ) -> (super::super::HostShader, (u32, u32)) {
         let native = NativeProgram {
             stage: HwStage::Cs,
-            wave64: true,
+            wave64,
             vgprs: 8,
             layout: vec![RootParam {
                 root: RootType::Table,
@@ -11086,7 +11139,7 @@ mod wave_size_tests {
         };
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
-        let p = crate::ir::build(&native.code, true, native.vgprs).unwrap();
+        let p = crate::ir::build(&native.code, wave64, native.vgprs).unwrap();
         let st = crate::structure::structure(&p).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
         let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
@@ -11173,7 +11226,11 @@ mod wave_size_tests {
     }
 
     #[cfg(windows)]
-    fn run_cs_uav(shader: &super::super::HostShader, dwords: u32) -> Vec<(&'static str, Vec<u32>)> {
+    fn run_cs_uav(
+        shader: &super::super::HostShader,
+        dwords: u32,
+        wave: u32,
+    ) -> Vec<(&'static str, Vec<u32>)> {
         use super::super::host::{Dispatch, Host, Root, View};
         use windows::Win32::Graphics::Direct3D12::*;
         let _one = super::super::valu_tests::ONE_AT_A_TIME
@@ -11195,12 +11252,10 @@ mod wave_size_tests {
             }
             .is_ok()
                 && opts1.WaveOps.as_bool()
-                && (opts1.WaveLaneCountMin..=opts1.WaveLaneCountMax).contains(&32);
+                && (opts1.WaveLaneCountMin..=opts1.WaveLaneCountMax).contains(&wave);
             if !supported {
-                // WARP reports WaveLaneCountMin/Max = 4, so fixed WaveSize(32)
-                // pipelines are only executable on hardware Wave32 devices.
                 eprintln!(
-                    "{label}: skipped WaveSize(32) execution (device supports {}..{})",
+                    "{label}: skipped WaveSize({wave}) execution (device supports {}..{})",
                     opts1.WaveLaneCountMin, opts1.WaveLaneCountMax
                 );
                 continue;
@@ -11227,6 +11282,49 @@ mod wave_size_tests {
     }
 
     #[test]
+    fn lane_gather_wraps_in_its_half_and_honors_exec() {
+        for (wave, threads) in [(32, 32), (32, 19), (64, 64), (64, 45)] {
+            let wide = wave == 64;
+            let words = [
+                0xBE81_0380, // s_mov_b32 s1, 0
+                0xF408_0200,
+                0xFA00_0000,                                  // load raw UAV into s[8:11]
+                0x340C_0082,                                  // v6 = lane's byte address
+                0x4A02_0081,                                  // v1 = thread index + 1
+                0x7E08_02C1,                                  // v4 = -1 before disabling lane 11
+                0x7D8A_008B,                                  // v_cmp_ne_u32 vcc, 11, v0
+                if wide { 0xBE8C_246A } else { 0xBE8C_3C6A }, // save EXEC and mask it with VCC
+                0xDACC_0087,
+                0x0400_0106, // ds_bpermute_b32 v4, v6, v1 offset:135
+                if wide { 0xBEFE_040C } else { 0xBEFE_030C }, // restore saved EXEC
+                0xE070_1000,
+                0x8002_0406, // store v4 at byte address v6
+                S_ENDPGM,
+            ];
+            let (shader, bounds) = compile_cs_mode(&words, [threads, 1, 1], 0, wide, true);
+            assert_eq!(bounds, (wave, wave));
+            let _ = &shader;
+            #[cfg(windows)]
+            for (label, data) in run_cs_uav(&shader, threads, wave) {
+                let expected: Vec<_> = (0..threads)
+                    .map(|lane| {
+                        let source = (lane & !31) + ((lane + 1) & 31);
+                        if lane == 11 {
+                            u32::MAX
+                        } else if source == 11 || source >= threads {
+                            0
+                        } else {
+                            source + 1
+                        }
+                    })
+                    .collect();
+                assert_eq!(data, expected, "{label}, wave {wave}, {threads} threads");
+                eprintln!("{label}: matched {threads} gathered values on Wave{wave}");
+            }
+        }
+    }
+
+    #[test]
     fn small_wave64_whole_wave_reduction_emits_wave32_and_runs() {
         for (threads, setup_2d, rsrc2_extra, expected_sum) in [
             ([32, 1, 1], false, 0, 32 * 33 / 2),
@@ -11239,7 +11337,7 @@ mod wave_size_tests {
             #[cfg(windows)]
             {
                 let count = threads.iter().product::<u32>();
-                for (label, data) in run_cs_uav(&shader, count) {
+                for (label, data) in run_cs_uav(&shader, count, 32) {
                     assert_eq!(
                         data,
                         vec![expected_sum; count as usize],
@@ -11269,7 +11367,7 @@ mod wave_size_tests {
         let _ = &shader;
         assert_eq!(wave_bounds, (32, 32));
         #[cfg(windows)]
-        for (label, data) in run_cs_uav(&shader, 32) {
+        for (label, data) in run_cs_uav(&shader, 32, 32) {
             let want: Vec<u32> = (0..32).map(|i| if i < 8 { 36 } else { 0 }).collect();
             assert_eq!(data, want, "{label} divergent");
         }
@@ -11312,7 +11410,7 @@ mod wave_size_tests {
 
         // On adapters that only support 64-lane waves (`allow_wave32 = false`),
         // an otherwise eligible <=32-thread reduction keeps WaveSize(64).
-        let (_, bounds) = compile_wave64_cs_mode(&base, [32, 1, 1], 0, false);
+        let (_, bounds) = compile_cs_mode(&base, [32, 1, 1], 0, true, false);
         assert_eq!(bounds, (64, 64));
     }
 
@@ -11363,7 +11461,7 @@ mod wave_size_tests {
             "33-thread variant must stay out of the Wave32 reduction path"
         );
         #[cfg(windows)]
-        for (label, data) in run_cs_uav(&shader, 32) {
+        for (label, data) in run_cs_uav(&shader, 32, 32) {
             let expected: Vec<u32> = (0..32)
                 .map(|i| if i % 2 == 0 { 16.0f32.to_bits() } else { 0 })
                 .collect();

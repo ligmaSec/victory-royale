@@ -471,14 +471,47 @@ pub extern "system" fn ReadFile(
     done
 }
 
-/// The host CRT reads large requests straight into the caller's buffer.
+/// The host CRT reads large requests straight into the caller's buffer
+/// through the kernel, whose write fails on a guarded block instead of
+/// faulting into the guard. So the bytes are read beside, a chunk at a time,
+/// announced as a host write, copied in from user mode, and the guard is put
+/// back; this is the same read-modify-write the title's own stores take.
+/// Returns the items read, as the CRT does; the bytes of a partial last item
+/// are copied too, as the CRT leaves them.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
-    let n = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
-        buffer, size, count, stream,
-    );
-    victory_gpu::kernel_wrote(buffer as usize, size.saturating_mul(count));
-    n
+    let read = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize);
+    let total = size.saturating_mul(count);
+    if buffer.is_null() || stream.is_null() || total == 0 {
+        // The CRT's own checks and answer (EINVAL, or nothing to read).
+        return read(buffer, size, count, stream);
+    }
+    const CHUNK: usize = 1 << 20;
+    let mut beside = vec![0u8; total.min(CHUNK)];
+    let lock = host!("ucrtbase.dll", "_lock_file": extern "C" fn(File));
+    let unlock = host!("ucrtbase.dll", "_unlock_file": extern "C" fn(File));
+    let read_chunk =
+        host!("ucrtbase.dll", "_fread_nolock": extern "C" fn(*mut u8, usize, usize, File) -> usize);
+    // The CRT serializes a complete fread on this FILE, including every
+    // chunk copied into the title's destination.
+    lock(stream);
+    let mut done = 0;
+    while done < total {
+        let want = (total - done).min(CHUNK);
+        let n = read_chunk(beside.as_mut_ptr(), 1, want, stream);
+        if n > 0 {
+            victory_gpu::kernel_will_write(buffer as usize + done, n);
+            // SAFETY: the caller's buffer holds `size * count` bytes, and
+            // `done + n` is at most that.
+            unsafe { std::ptr::copy_nonoverlapping(beside.as_ptr(), buffer.add(done), n) };
+            victory_gpu::kernel_wrote(buffer as usize + done, n);
+            done += n;
+        }
+        if n < want {
+            break;
+        }
+    }
+    unlock(stream);
+    done / size
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
@@ -675,6 +708,52 @@ mod tests {
 
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().chain([0]).collect()
+    }
+
+    #[test]
+    fn simultaneous_fread_calls_each_take_one_contiguous_region() {
+        use std::io::Write;
+        use std::sync::{Arc, Barrier};
+        const MIB: usize = 1 << 20;
+        const HALF: usize = 24;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sequence.bin");
+        let mut file = std::fs::File::create(&path).unwrap();
+        for n in 0..HALF * 2 {
+            file.write_all(&vec![n as u8; MIB]).unwrap();
+        }
+        drop(file);
+        let fclose = host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32);
+        for _ in 0..3 {
+            let stream = _wfopen(w(&path.to_string_lossy()).as_ptr(), w("rb").as_ptr());
+            assert!(!stream.is_null());
+            let addr = stream as usize;
+            let start = Arc::new(Barrier::new(2));
+            let read = || {
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    let mut out = vec![0; HALF * MIB];
+                    start.wait();
+                    assert_eq!(
+                        fread(out.as_mut_ptr(), 1, out.len(), addr as File),
+                        out.len()
+                    );
+                    out.chunks(MIB).map(|block| block[0]).collect::<Vec<_>>()
+                })
+            };
+            let a = read();
+            let b = read();
+            let mut results = [a.join().unwrap(), b.join().unwrap()];
+            fclose(stream);
+            results.sort();
+            assert_eq!(
+                results,
+                [
+                    (0..HALF as u8).collect::<Vec<_>>(),
+                    (HALF as u8..(HALF * 2) as u8).collect()
+                ]
+            );
+        }
     }
 
     #[test]
@@ -890,5 +969,40 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
+    }
+
+    /// Reads larger than a chunk are staged beside the destination, and a
+    /// partial last item still has its bytes copied in.
+    #[test]
+    fn fread_reads_beside_in_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        let bytes: Vec<u8> = (0..(5 << 19) + 1)
+            .map(|i| (i * 7 + i / 251) as u8)
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let fclose = host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32);
+        let open = || {
+            let f = _wfopen(w(&path.to_string_lossy()).as_ptr(), w("rb").as_ptr());
+            assert!(!f.is_null());
+            f
+        };
+
+        let f = open();
+        let mut out = vec![0xaau8; bytes.len() + 64];
+        let items = fread(out.as_mut_ptr(), 3, out.len() / 3, f);
+        assert_eq!(items, bytes.len() / 3);
+        assert_eq!(&out[..bytes.len()], &bytes[..]);
+        assert!(out[bytes.len()..].iter().all(|&b| b == 0xaa));
+        fclose(f);
+
+        let f = open();
+        let mut a = vec![0u8; 1000];
+        let mut b = vec![0u8; (1 << 20) + 5];
+        assert_eq!(fread(a.as_mut_ptr(), 1000, 1, f), 1);
+        assert_eq!(fread(b.as_mut_ptr(), 1, b.len(), f), b.len());
+        assert_eq!(a, bytes[..1000]);
+        assert_eq!(b, bytes[1000..1000 + b.len()]);
+        fclose(f);
     }
 }

@@ -1,33 +1,61 @@
-VIctory hardware comparison
+Run this Series X comparison
 
-From the repo root, run this to choose a published Series X test:
+Extract the whole kit. Open a terminal in the folder containing this file.
+Use the command for your system.
 
-  python3 scripts/hardware-test/run-test.py
+  Linux/Proton    python3 run-test.py
+  Windows         py run-test.py
 
-If the requester gave you a PR number, add it to the command. On Windows,
-use py in place of python3. To preview a test, add --plan.
+Select your game's .exe when prompted. Before each launch, read WHAT TO DO.
+Run the scenario on main, close the game as instructed, then repeat on the
+candidate with the same settings and window size. Each build gets a fresh
+translation cache. Add --plan to preview the instructions and build revisions.
 
-If you downloaded a kit ZIP, pass its path instead of the PR number.
-You can also extract the ZIP and run from the extracted folder:
+====================================================================
+WARNING: LOGS MAY CONTAIN SENSITIVE INFORMATION
+====================================================================
+Raw logs may include usernames, file paths, credentials and game output.
+Keep the full archive local. Review the filtered ZIP before choosing to share.
+After the runs, use the full-screen results menu. Use Up/Down to highlight a
+choice, Enter to select, Esc to go back and PgUp/PgDn to scroll the details.
+Choose Describe what you saw to write notes for main and candidate in your browser.
+Click either screenshot box and paste with Ctrl+V, or choose an image. Review its
+preview for sensitive details. Save locally returns you to the terminal. Closing
+the tab discards unsaved changes. Press Ctrl+C in the terminal to leave the editor.
+Preview summary shows the timings and notes eligible for public posting. Review and edit
+files opens the bundled editor: Enter edits a file, Space includes/excludes it,
+Ctrl+F searches, Esc returns to the list and Ctrl+S applies your edits locally.
+To use your own editor, choose Edit in my own editor, then Open folder.
+Save edits or delete files, then select Apply edits. Back without applying
+discards those working copies. Your original logs stay local.
 
-  Linux/Proton:  python3 run-test.py
-  Windows:       py run-test.py
+Keep local and finish prints the filtered ZIP location. Post public summary
+previews the account, PR and text. After posting, return to the results menu
+to send diagnostics separately. Screenshots are only included in the reviewed ZIP. Send encrypted diagnostics lists the account,
+verified requester and reviewed files. Confirm Encrypt and send to deliver the ZIP. Sending
+requires GitHub CLI signed in to github.com with gist access. The runner names
+your account before sending. It downloads a checksum-verified age tool, encrypts
+the filtered ZIP and returns an unlisted GitHub Gist receipt. GitHub sees your
+account, upload time and size. Anyone with the receipt can retrieve the encrypted
+file. The requester receives a GitHub notification and decrypts the ZIP locally.
+After sending, Finish privately is the default. Publish encrypted receipt lets
+the requester collect your ZIP automatically. Your username and posting time
+will be public on their key Gist. The link and diagnostics stay encrypted.
+When the kit has no verified requester key, or the key has changed, keep your
+diagnostics local and ask for a fresh kit. Offline runs still
+save a shareable ZIP with frame times, submission costs and shader events.
+Keep the raw report.zip local. Tell the requester what you saw on each build.
 
-Select your game executable when prompted. Both runs use Series X and fresh
-translation caches. Follow the WHAT TO DO instructions shown before each
-launch. After the second run, send the ZIP at the printed Upload path
-privately to the requester. The ZIP stays in a new folder under your
-system's temporary directory after the runner exits. Send it before that
-directory is cleaned.
+Both verified CI builds are included. You need Python 3.9 or newer. Linux
+also needs Bash and UMU (umu-run) and may download pinned vkd3d-proton on
+first use. Keep the game executable outside the VIctory checkout.
 
-To see the plan without starting, add --plan. To supply the game directly
-instead of choosing a file, add --title "path to your game.exe". To use a
-different report folder, add --output-dir and the folder path. You can reuse
-this runner with a new request by passing the new JSON file as its argument.
+From a repository checkout, use python3 scripts/hardware-test/run-test.py
+(or py on Windows) to choose a test. Requests with a kit from main can run directly. Other
+requests labeled "tester wanted" link to the PR instructions. The menu requires a
+signed-in GitHub CLI. You can also pass the PR number, a downloaded kit ZIP
+or a request JSON. A JSON without bundled packages needs GitHub CLI to
+download the builds.
 
-Requires Python 3.9+. Linux also needs bash and umu-run. Both verified CI
-packages are included. The Proton launcher may download its pinned
-vkd3d-proton runtime on first use. If you received only a JSON request,
-the runner uses a signed-in GitHub CLI to fetch missing CI packages.
-Keep your usual driver, game settings and window size. Temporary build
-files are removed after the test.
+Use --title "path to your game.exe" to skip the chooser, or --output-dir
+"path to folder" to choose where the runner creates its report folder.

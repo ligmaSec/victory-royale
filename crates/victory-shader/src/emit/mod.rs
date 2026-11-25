@@ -262,7 +262,8 @@ impl HostShader {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
     /// The root constant selects a heap buffer. At `index` the host supplies
-    /// its bounded raw SRV slot, element stride in bytes and alignment bias.
+    /// the raw SRV slot shifted left four bits with its byte bias in the low
+    /// bits, followed by the element stride and the logical length in bytes.
     pub indexed_buffer: bool,
     /// Dword in the user-data buffer (the console's user-data index).
     pub index: u32,
