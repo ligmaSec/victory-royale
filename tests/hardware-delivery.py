@@ -121,6 +121,16 @@ class RequestDelivery(unittest.TestCase):
                 with mock.patch.dict(pages, {url: json.dumps(dict(meta, **{field: replacement}))}):
                     self.assertIsNone(keys.publication(7, "publisher", 22, comment)["registration"])
 
+            page = "https://gist.github.com/requester?page=1"
+            second = f"https://gist.github.com/{other}.json"
+            with mock.patch.dict(pages, {page: pages[page].replace("notes</a>", keys.REGISTRATION + "</a>"),
+                                         second: pages[f"https://gist.github.com/{gid}.json"]}), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertIsNone(keys.publication(7, "publisher", 22, comment)["registration"])
+            with mock.patch.object(keys, "github", side_effect=lambda path: publisher if path == "users/requester" else api(path)), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertIsNone(keys.publication(7, "publisher", 22, comment)["registration"])
+
     def test_delegation_validates_the_request_comment_and_handles_no_key(self):
         self.assertEqual(keys.publication(7, "publisher", 22, comment),
                          {"requester": keys.account(requester), "registration": None})

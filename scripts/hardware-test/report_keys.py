@@ -176,6 +176,7 @@ def publication(pr, actor, actor_id, comment):
         except urllib.error.HTTPError as error:
             if error.code not in (403, 429):
                 raise
+            error.close()
             pinned = directory_registration(owner)
     except ValueError as error:
         print(f"Private delivery unavailable for @{owner['login']}: {error}", file=sys.stderr)
