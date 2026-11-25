@@ -230,6 +230,24 @@ pub(crate) const SFI0_RESOURCE_HEAP: u64 = 0x200_0000;
 pub(crate) const SFI0_SAMPLER_HEAP: u64 = 0x400_0000;
 
 impl HostShader {
+    /// The compute group dimensions recorded in our emitted PSV runtime info.
+    /// This also works for shaders loaded from the on-disk translation cache.
+    pub fn compute_threads(&self) -> Option<[u32; 3]> {
+        if self.stage != HwStage::Cs {
+            return None;
+        }
+        let container = Container::parse(&self.dxil).ok()?;
+        let psv = container.part(FourCC::PSV0)?.data;
+        let size = crate::dxbc::u32_at(psv, 0).ok()? as usize;
+        let info = psv.get(4..)?.get(..size)?;
+        let dims = info.get(36..48)?.as_chunks::<4>().0;
+        Some([
+            u32::from_le_bytes(dims[0]),
+            u32::from_le_bytes(dims[1]),
+            u32::from_le_bytes(dims[2]),
+        ])
+    }
+
     /// Whether the shader indexes a descriptor heap directly
     /// (`ResourceDescriptorHeap` / `SamplerDescriptorHeap`), which its root
     /// signature must then allow. A container without readable feature
@@ -301,7 +319,7 @@ pub fn translate_with_wave32(
     container: &[u8],
     allow_wave32: bool,
 ) -> Result<HostShader, ShaderError> {
-    translate_program(container, allow_wave32, None).map(|(shader, _)| shader)
+    translate_program::<false>(container, allow_wave32, None).map(|(shader, _)| shader)
 }
 
 /// Translates using matching structured views for statically addressed table
@@ -313,7 +331,20 @@ pub fn translate_with_view_strides(
     allow_wave32: bool,
     view_stride: ViewStride<'_>,
 ) -> Result<(HostShader, Vec<crate::UsedResource>), ShaderError> {
-    translate_program(container, allow_wave32, Some(view_stride))
+    translate_program::<false>(container, allow_wave32, Some(view_stride))
+}
+
+/// A host-supplied extent in threads for a partial compute group.
+pub const DISPATCH_THREADS: RootType = RootType::Other(0x104);
+
+/// Translate a compute shader whose last group may be incomplete. Each
+/// supplied extent is bound through the emitted user-data metadata.
+pub fn translate_partial_dispatch(
+    container: &[u8],
+    allow_wave32: bool,
+    view_stride: ViewStride<'_>,
+) -> Result<(HostShader, Vec<crate::UsedResource>), ShaderError> {
+    translate_program::<true>(container, allow_wave32, Some(view_stride))
 }
 
 /// A precompiled compute module (`FSPX`): only GFX10 code, no DXIL to start from.
@@ -322,7 +353,7 @@ const FSPX_UNSUPPORTED: ShaderError = ShaderError::Unsupported {
     what: "FSPX compute module",
 };
 
-fn translate_program(
+fn translate_program<const PARTIAL: bool>(
     container: &[u8],
     allow_wave32: bool,
     view_stride: Option<ViewStride<'_>>,
@@ -350,7 +381,7 @@ fn translate_program(
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
-    let shader = translate_native(&c, &native, allow_wave32, None, view_stride)?;
+    let shader = translate_native::<PARTIAL>(&c, &native, allow_wave32, None, view_stride)?;
     Ok((shader, native.used))
 }
 
@@ -378,10 +409,10 @@ pub fn translate_mesh_for_pixel(
     if let Some(dxil) = pixel_dxil {
         pixel_inputs = signature_part(&Container::parse(dxil)?, FourCC::ISG1)?;
     }
-    translate_native(c, native, true, Some(&pixel_inputs), None).map(Some)
+    translate_native::<false>(c, native, true, Some(&pixel_inputs), None).map(Some)
 }
 
-fn translate_native(
+fn translate_native<const PARTIAL: bool>(
     c: &Container<'_>,
     native: &NativeProgram,
     allow_wave32: bool,
@@ -410,7 +441,7 @@ fn translate_native(
         io: &io,
         res: &res,
     };
-    emit_with_options(parts, allow_wave32, pixel_inputs, view_stride)
+    emit_with_options::<PARTIAL>(parts, allow_wave32, pixel_inputs, view_stride)
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -444,7 +475,7 @@ pub fn emit_with_wave32(
         io,
         res,
     };
-    emit_with_options(parts, allow_wave32, None, None)
+    emit_with_options::<false>(parts, allow_wave32, None, None)
 }
 
 struct Emission<'a> {
@@ -462,10 +493,10 @@ fn emit_with_view_strides(
     allow_wave32: bool,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<HostShader, ShaderError> {
-    emit_with_options(parts, allow_wave32, None, view_stride)
+    emit_with_options::<false>(parts, allow_wave32, None, view_stride)
 }
 
-fn emit_with_options(
+fn emit_with_options<const PARTIAL: bool>(
     parts: Emission<'_>,
     allow_wave32: bool,
     pixel_inputs: Option<&[container::SigElement]>,
@@ -474,7 +505,7 @@ fn emit_with_options(
     let Emission {
         c, native, p, st, ..
     } = parts;
-    let original = emit_program(parts, allow_wave32, pixel_inputs, view_stride);
+    let original = emit_program::<PARTIAL>(parts, allow_wave32, pixel_inputs, view_stride);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -488,7 +519,7 @@ fn emit_with_options(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(
+    emit_program::<PARTIAL>(
         Emission {
             c,
             native,
@@ -503,7 +534,7 @@ fn emit_with_options(
     )
 }
 
-fn emit_program(
+fn emit_program<const PARTIAL: bool>(
     parts: Emission<'_>,
     allow_wave32: bool,
     pixel_inputs: Option<&[container::SigElement]>,
@@ -596,7 +627,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower_with_wave32(
+    let l = lower::lower_with_wave32::<PARTIAL>(
         &lower::Parts {
             native,
             p,
@@ -879,7 +910,7 @@ mod tests {
             },
             code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
         };
-        let host = translate_native(&c, &native, true, None, None).unwrap();
+        let host = translate_native::<false>(&c, &native, true, None, None).unwrap();
         let c = Container::parse(&host.dxil).unwrap();
         let inputs = signature_part(&c, FourCC::ISG1).unwrap();
         let outputs = signature_part(&c, FourCC::OSG1).unwrap();
@@ -923,7 +954,7 @@ mod tests {
             },
             code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
         };
-        let host = translate_native(&c, &native, true, None, None).unwrap();
+        let host = translate_native::<false>(&c, &native, true, None, None).unwrap();
         let c = Container::parse(&host.dxil).unwrap();
         let inputs = signature_part(&c, FourCC::ISG1).unwrap();
         assert!(inputs.iter().all(|e| e.kind != 14), "{inputs:?}");
@@ -978,7 +1009,7 @@ mod tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         assert!(matches!(
-            translate_native(&c, &native, true, None, None),
+            translate_native::<false>(&c, &native, true, None, None),
             Err(ShaderError::Unsupported {
                 what: "a mesh output signature beyond the host's size limit",
                 ..
@@ -1026,7 +1057,7 @@ mod tests {
             .collect(),
             ..native.clone()
         };
-        let ps = translate_native(
+        let ps = translate_native::<false>(
             &Container::parse(&pixel_bytes).unwrap(),
             &pixel,
             true,
@@ -1068,7 +1099,7 @@ mod tests {
             .chain(words.last())
             .flat_map(|w| w.to_le_bytes())
             .collect();
-        let standalone = translate_native(&c, &position_only, true, None, None).unwrap();
+        let standalone = translate_native::<false>(&c, &position_only, true, None, None).unwrap();
         let host = Container::parse(&standalone.dxil).unwrap();
         assert_eq!(signature_part(&host, FourCC::OSG1).unwrap().len(), 1);
         assert!(signature_part(&host, FourCC::PSG1).unwrap().is_empty());
