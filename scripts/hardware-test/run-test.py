@@ -40,14 +40,18 @@ def read_request(path):
     return request
 
 
-def download(request, side, folder):
+def stage_build(request, side, folder, packages):
     build = request[side]
     prefix = "" if side == "main" else f"pr-{request['pr']}-"
     artifact = f"victory-proton-x86_64-{prefix}{build['revision']}"
     folder.mkdir()
-    subprocess.run(["gh", "run", "download", str(build["run"]), "-R", REPO,
-                    "-n", artifact, "-D", str(folder)], check=True)
-    archive = folder / PACKAGE
+    archive = packages / (build["sha256"] + ".tar.gz")
+    if not archive.is_file():
+        if not shutil.which("gh"):
+            raise ValueError("The request is missing its packages. Extract the entire kit or install GitHub CLI.")
+        subprocess.run(["gh", "run", "download", str(build["run"]), "-R", REPO,
+                        "-n", artifact, "-D", str(folder)], check=True)
+        archive = folder / PACKAGE
     if digest(archive) != build["sha256"]:
         raise ValueError(f"{side} package checksum differs from the request.")
     # Copy known distribution members only. Never unpack arbitrary paths or links.
@@ -140,7 +144,7 @@ def run():
     windows = sys.platform == "win32"
     if not windows and not sys.platform.startswith("linux"):
         raise ValueError("This kit supports Windows and Linux/Proton.")
-    for binary in (["gh"] if windows else ["gh", "bash", "umu-run"]):
+    for binary in ([] if windows else ["bash", "umu-run"]):
         if not shutil.which(binary):
             raise ValueError(f"Missing {binary}. See the requirements in README.txt.")
     title = (options.title or choose_title()).expanduser().resolve()
@@ -154,8 +158,8 @@ def run():
             raise ValueError("Use a game, temporary directory and report destination outside the VIctory checkout.")
     with tempfile.TemporaryDirectory(prefix="victory-builds-") as work:
         for side in ("main", "candidate"):
-            print(f"Downloading and checking {side}…", flush=True)
-            download(request, side, Path(work) / side)
+            print(f"Checking {side}…", flush=True)
+            stage_build(request, side, Path(work) / side, manifest.resolve().parent / "packages")
         results = Path(work) / "results"
         results.mkdir()
         shutil.copyfile(manifest, results / "request.json")

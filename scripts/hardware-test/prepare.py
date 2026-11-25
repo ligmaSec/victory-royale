@@ -42,11 +42,12 @@ def find_build(event, commit, prefix):
             with tempfile.TemporaryDirectory() as folder:
                 subprocess.run(["gh", "run", "download", str(run["id"]), "-R", REPO,
                                 "-n", artifact["name"], "-D", folder], check=True)
-                digest = hashlib.sha256((Path(folder) / PACKAGE).read_bytes()).hexdigest()
+                package = (Path(folder) / PACKAGE).read_bytes()
+                digest = hashlib.sha256(package).hexdigest()
                 checks = (Path(folder) / "SHA256SUMS").read_text().split()
                 if checks != [digest, PACKAGE]:
                     raise ValueError("Package checksum mismatch.")
-            return {"run": run["id"], "revision": revision, "sha256": digest}, base
+            return {"run": run["id"], "revision": revision, "sha256": digest}, base, package
     raise ValueError(f"No unexpired successful {event} CI package for {commit[:12]}. "
                      "Refresh the matched builds before asking a tester.")
 
@@ -62,11 +63,13 @@ def prepare():
     pull = api(f"pulls/{args.pr}")
     if pull["base"]["ref"] != "main" or pull["base"]["repo"]["full_name"] != REPO:
         raise ValueError("The PR must target this repository's main branch.")
-    candidate, base = find_build("pull_request", pull["head"]["sha"],
+    candidate, base, candidate_bytes = find_build("pull_request", pull["head"]["sha"],
                                  f"victory-proton-x86_64-pr-{args.pr}-")
-    main, _ = find_build("push", base, "victory-proton-x86_64-")
+    main, _, main_bytes = find_build("push", base, "victory-proton-x86_64-")
     request = {"version": 1, "pr": args.pr, "scenario": args.scenario, "main": main, "candidate": candidate}
     with zipfile.ZipFile(args.output, "x", zipfile.ZIP_DEFLATED) as out:
+        for build, package in ((main, main_bytes), (candidate, candidate_bytes)):
+            out.writestr(f"packages/{build['sha256']}.tar.gz", package, compress_type=zipfile.ZIP_STORED)
         out.write(ROOT / "run-test.py", "run-test.py")
         out.write(ROOT.parents[1] / "LICENSE", "LICENSE")
         out.write(ROOT / "README.txt", "README.txt")

@@ -42,6 +42,8 @@ class HardwareRequest(unittest.TestCase):
                 member = tarfile.TarInfo("victory/" + name)
                 member.size = len(data)
                 bundle.addfile(member, io.BytesIO(data))
+        self.packages = self.root / "packages"
+        self.packages.mkdir()
         self.build = {"run": 12, "revision": self.revision,
                       "sha256": hashlib.sha256(self.package.read_bytes()).hexdigest()}
         self.request = {"version": 1, "pr": 7, "scenario": "Close the window.",
@@ -56,18 +58,25 @@ class HardwareRequest(unittest.TestCase):
         self.assertEqual(args[:6], ["gh", "run", "download", "12", "-R", runner.REPO])
         shutil.copy(self.package, Path(args[-1]) / runner.PACKAGE)
 
+    def test_bundled_build_offline(self):
+        shutil.copy(self.package, self.packages / (self.build["sha256"] + ".tar.gz"))
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError), \
+                mock.patch.object(shutil, "which", side_effect=AssertionError):
+            runner.stage_build(self.request, "main", self.root / "main", self.packages)
+
     def test_verify_both_packages(self):
-        with mock.patch.object(subprocess, "run", side_effect=self.fake_download) as gh:
+        with mock.patch.object(subprocess, "run", side_effect=self.fake_download) as gh, \
+                mock.patch.object(shutil, "which", return_value="gh"):
             for side in ("main", "candidate"):
-                runner.download(self.request, side, self.root / side)
+                runner.stage_build(self.request, side, self.root / side, self.packages)
                 self.assertEqual((self.root / side / "REVISION").read_text(), self.revision)
             self.assertIn("pr-7-", gh.call_args.args[0][7])
             self.request["main"]["sha256"] = "0" * 64
             with self.assertRaisesRegex(ValueError, "checksum"):
-                runner.download(self.request, "main", self.root / "bad")
+                runner.stage_build(self.request, "main", self.root / "bad", self.packages)
             self.request["candidate"]["revision"] = "b" * 40
             with self.assertRaisesRegex(ValueError, "different revision"):
-                runner.download(self.request, "candidate", self.root / "wrong")
+                runner.stage_build(self.request, "candidate", self.root / "wrong", self.packages)
 
     def test_preview_offline(self):
         with mock.patch.object(sys, "argv", ["runner", str(self.manifest), "--plan"]), \

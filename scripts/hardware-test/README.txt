@@ -17,7 +17,9 @@ instead of choosing a file, add --title "path to your game.exe". To use a
 different report folder, add --output-dir and the folder path. You can reuse
 this runner with a new request by passing the new JSON file as its argument.
 
-Requires Python 3.9+ and GitHub CLI signed in with access to download CI
-artifacts. Linux also needs bash and umu-run. The Proton launcher may download
-its pinned vkd3d-proton runtime on first use. Keep your usual driver, game
-settings and window size. Temporary build files are removed after the test.
+Requires Python 3.9+. Linux also needs bash and umu-run. Both verified CI
+packages are included. The Proton launcher may download its pinned
+vkd3d-proton runtime on first use. If you received only a JSON request,
+the runner uses a signed-in GitHub CLI to fetch missing CI packages.
+Keep your usual driver, game settings and window size. Temporary build
+files are removed after the test.
