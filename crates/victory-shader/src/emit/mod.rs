@@ -933,6 +933,70 @@ mod tests {
     }
 
     #[test]
+    fn mesh_reads_a_reused_scalar_only_after_its_guard() {
+        use crate::native::MeshIo;
+
+        let mut position = varying("SV_Position", 0, 0);
+        position.kind = 3;
+        let outputs = container::signature(&[position], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &outputs)]);
+        let container = Container::parse(&bytes).unwrap();
+        let build = |read_mask: bool| {
+            let words = [
+                0x7E04_0505,                        // s2 = mesh group id
+                0xBF06_8002,                        // s_cmp_eq_u32 s2, 0
+                0xBF85_0003,                        // go to scalar assignment
+                0xBE90_047E,                        // s_mov_b64 s[16:17], exec
+                0xBE93_0380 | u32::from(read_mask), // s19 = 0 or 1 on the mask edge
+                0xBF82_0002,                        // join
+                0xBE91_03AA,                        // s17 = 42
+                0xBE93_0381,                        // s19 = 1
+                0xBF06_8113,                        // s_cmp_eq_u32 s19, 1
+                0xBF84_0003,                        // skip export on a false guard
+                0x7E02_0211,                        // v_mov_b32 v1, s17
+                0xF800_00CF,
+                0x0101_0101, // exp pos0 v1, v1, v1, v1
+                0xBF81_0000, // s_endpgm
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Ms,
+                wave64: true,
+                vgprs: 8,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ms(MeshIo {
+                    outputs: vec![],
+                    clip_cntl: 0,
+                    threads: 128,
+                    max_vertices: 128,
+                    max_primitives: 128,
+                    topology: 2,
+                    lds_bytes: 0,
+                }),
+                code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+            };
+            translate_native(&container, &native, true, None, None)
+        };
+        let host = build(false).expect("register holds scalar data at the export");
+        assert_eq!(host.stage, HwStage::Ms);
+        #[cfg(windows)]
+        if let Some(mut v) = validator::Validator::for_test() {
+            v.validate(&mut host.dxil.clone()).unwrap();
+        }
+        let refusal = build(true).expect_err("the mask edge now reaches the export");
+        assert!(
+            matches!(
+                refusal,
+                ShaderError::Unsupported {
+                    what: "a lane mask read as data",
+                    ..
+                }
+            ),
+            "{refusal}"
+        );
+    }
+
+    #[test]
     fn oversized_mesh_keeps_only_exports_needed_by_its_pixel_shader() {
         use crate::native::{MeshIo, Usage, VsOutput};
 

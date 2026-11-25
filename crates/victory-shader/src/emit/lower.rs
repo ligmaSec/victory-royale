@@ -8857,6 +8857,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let mut missing_masks = Vec::new();
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
@@ -8880,6 +8881,14 @@ impl<'a> Lower<'a> {
                         } else {
                             self.s.m.undef(self.s.t.i32)
                         }
+                    }
+                    (Some(Val::Missing(LANE_MASK)), false)
+                        if self.s.mesh.is_some() && self.read_phis.contains(&phi.value) =>
+                    {
+                        // A later branch can establish that the register holds scalar data.
+                        // Check all uses after the sibling phis have their incoming values.
+                        missing_masks.push((phi.value, v, self.block[b].unwrap(), qb));
+                        self.s.m.undef(self.s.t.i32)
                     }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));
@@ -8918,6 +8927,11 @@ impl<'a> Lower<'a> {
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);
+        }
+        for (value, phi, block, pred) in missing_masks {
+            if !self.s.m.unused_on_phi_edge(phi, block, pred) {
+                return Err(Stop::Retry(value, LANE_MASK));
+            }
         }
         Ok(())
     }
