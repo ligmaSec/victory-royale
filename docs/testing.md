@@ -84,7 +84,13 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
    frame intervals and counts of recognized diagnostic messages. Timing covers all
    completed reporting windows, including menus. A run without timing samples
    says so. Tell the requester what you saw in the opening scene on each build.
-4. Press Enter to keep everything local, or choose a destination. Public sharing
+4. Choose **r — Review/edit** to see each file queued for sharing. Use ↑/↓ to pick a
+   file, **Enter** to edit and **Space** to exclude or include it. In the editor,
+   **Ctrl+F** searches the current file, **F3** finds the next match and **Esc**
+   returns to the file list. **Ctrl+S** applies your edits to the outgoing ZIP
+   and returns to the sharing menu. The original logs stay in the local report.
+   A kit without the bundled editor offers a temporary folder you can edit yourself.
+5. Press Enter to keep everything local, or choose a destination. Public sharing
    previews the exact text and confirms the signed-in GitHub account and PR.
    For private sharing, the filtered ZIP also contains per-window mean, median,
    p95, longest frame time and stall counts for each build. Separate submission
@@ -93,7 +99,7 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
    event timeline connects shader binds, translations and pipeline results to
    those samples through elapsed times and shader numbers shared across the pair.
    You can inspect the filtered ZIP in the printed temporary `share` folder.
-5. For **Send encrypted report**, install GitHub CLI and sign in to github.com
+6. For **Send encrypted report**, install GitHub CLI and sign in to github.com
    with permission to create gists (`gh auth login --hostname github.com --scopes gist`).
    For an existing CLI login, `gh auth refresh --hostname github.com --scopes gist`
    adds the scope. The runner shows the account and maintainer. Choose **i**
@@ -106,7 +112,7 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
    Keep the receipt if notification fails. You can delete the gist from your account.
 
 **Raw logs may contain usernames, file paths, credentials or output from the title.**
-Keep `report.zip` local. Both sharing options use a fixed set of recognized
+Keep `report.zip` local. The initial export uses a fixed set of recognized
 fields. Unknown messages, command lines, hostnames, wall-clock timestamps, screenshots and
 the request's free text are excluded. If the summary misses something, describe
 it in words. See the [asset policy](asset-policy.md).
@@ -131,6 +137,10 @@ the number of the PR.
 python3 scripts/hardware-test/prepare.py PR_NUMBER --output test-kit.zip \
   --scenario "Wait ten seconds at the menu. Enter the opening scene. Close each run at the first subtitle."
 ```
+
+Official kits bundle the native review editor for x86-64 Windows and Linux.
+When preparing a kit locally, pass `--review-dir` with both built executables
+to include the editor. Kits prepared without them use the manual folder review.
 
 The packager matches the successful PR build to its tested main parent and checks
 both artifact digests. A documentation-only push can pass CI without packaging a

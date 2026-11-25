@@ -26,6 +26,9 @@ AGE_PACKAGES = {
     "win32": ("windows-amd64.zip", "f48d8f8f9ebe903ab5027ed067652f2cc1db94bc206976430133b905dcd8e8c7"),
 }
 ROOT = Path(__file__).resolve().parent
+OUTGOING = ("summary.txt", "main-frames.csv", "candidate-frames.csv", "main-submissions.csv",
+            "candidate-submissions.csv", "main-events.csv", "candidate-events.csv")
+REVIEWER = "victory-report-review" + (".exe" if sys.platform == "win32" else "")
 PRIVACY_HEADING = "WARNING: LOGS MAY CONTAIN SENSITIVE INFORMATION"
 LOG_PRIVACY = "Raw logs can include your username, file paths, credentials, or output from the game."
 
@@ -272,6 +275,10 @@ def run():
                     raise ValueError(f"Cannot find {path}. Pass a PR number or an existing kit ZIP or request JSON.")
                 manifest = unpack_kit(path, folder, options.plan) if path.suffix.lower() == ".zip" else path
         if manifest is not None:
+            # Execute tools only from our runner's directory or the official discovery path.
+            # A supplied JSON or ZIP may describe game builds but cannot select an editor.
+            from_picker = argument is None or re.fullmatch(r"#?[1-9][0-9]*", argument)
+            options.review_kit = folder if from_picker and manifest.parent == folder else ROOT
             run_request(manifest, options)
 
 
@@ -509,12 +516,63 @@ def send_encrypted_report(filtered, recipient):
         print(f"Notification posted for @{REPORT_MAINTAINER}.")
 
 
-def share_result(pr, report, filtered):
-    print(report, flush=True)
-    instruction_block(PRIVACY_HEADING, LOG_PRIVACY + " Keep the raw archive local. Review the summary and "
-                      "filtered ZIP before you share. The encrypted option sends the summary, frame timings, "
-                      "submission costs and shader events to the maintainer. You can send a written summary "
-                      "or press Enter to keep everything local.", f"Filtered diagnostics: {filtered}")
+def review_result(filtered, kit):
+    """Edit temporary copies. Replace the outgoing ZIP only after an explicit apply."""
+    with tempfile.TemporaryDirectory(prefix="victory-review-", dir=filtered.parent) as temporary:
+        work = Path(temporary)
+        files = work / "files"
+        files.mkdir()
+        with zipfile.ZipFile(filtered) as archive:
+            names = [name for name in OUTGOING if name in archive.namelist()]
+            for name in names:
+                (files / name).write_bytes(archive.read(name))
+        if not names:
+            print("All files were excluded. There is nothing to review.")
+            return
+        helper = kit / "review" / REVIEWER
+        if helper.is_file():
+            # GitHub artifact extraction can clear execute permissions.
+            exe = work / REVIEWER
+            shutil.copyfile(helper, exe)
+            expected = (kit / "review" / (REVIEWER + ".sha256")).read_text(encoding="ascii").strip()
+            if digest(exe) != expected:
+                raise ValueError("The review tool failed its checksum.")
+            exe.chmod(0o700)
+            result = subprocess.run([str(exe), *names], cwd=files)
+            if result.returncode == 2:
+                return
+            result.check_returncode()
+        else:
+            print(f"Open this folder in your editor: {files}")
+            print("Edit the text or delete files to exclude them. Close your editor when finished.")
+            if input("[a] Apply edits locally   [Enter] Cancel: ").strip().lower() != "a":
+                return
+        replacement = work / "reviewed.zip"
+        with zipfile.ZipFile(replacement, "x") as archive:
+            for name in names:
+                path = files / name
+                if path.is_symlink():
+                    raise ValueError("Reviewed files must be regular text files.")
+                if not path.exists():
+                    continue
+                if not path.is_file():
+                    raise ValueError("Reviewed files must be regular text files.")
+                data = path.read_bytes()
+                content = data.decode("utf-8").replace("\r\n", "\n")
+                if any(not ch.isprintable() and ch not in "\t\n" for ch in content):
+                    raise ValueError(f"{name} contains hidden control characters. Use plain text.")
+                archive.writestr(zipfile.ZipInfo(name), data, compress_type=zipfile.ZIP_DEFLATED)
+        os.replace(replacement, filtered)
+        print("Applied to the local ZIP. Choose a destination when ready.")
+
+
+def share_result(pr, filtered, kit):
+    instruction_block(PRIVACY_HEADING, LOG_PRIVACY + " Review the outgoing files for personal information, "
+                      "including anything you add. Keep the raw archive local. You can reply with a written summary or press Enter to finish locally.",
+                      f"Filtered diagnostics: {filtered}")
+    with zipfile.ZipFile(filtered) as archive:
+        if "summary.txt" in archive.namelist():
+            print(archive.read("summary.txt").decode("utf-8"), flush=True)
     if not sys.stdin.isatty():
         return
     private = ""
@@ -529,7 +587,22 @@ def share_result(pr, report, filtered):
                   f"Only the holder of @{REPORT_MAINTAINER}'s report key can decrypt it.")
             private = "   [i] Send encrypted report"
     try:
-        choice = input(f"[Enter] Keep local{private}   [p] Public summary on PR #{pr}: ").strip().lower()
+        while True:
+            with zipfile.ZipFile(filtered) as archive:
+                names = archive.namelist()
+                report = archive.read("summary.txt").decode("utf-8") if "summary.txt" in names else ""
+            if not names:
+                print("All files excluded. Nothing to send.")
+                return
+            public = f"   [p] Public summary on PR #{pr}" if report.strip() else ""
+            choice = input(f"[r] Review/edit   [Enter] Keep local{private}{public}: ").strip().lower()
+            if choice != "r":
+                break
+            try:
+                review_result(filtered, kit)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                print(f"Review could not be applied: {error}")
+                return
         if choice == "i" and private:
             try:
                 send_encrypted_report(filtered, REPORT_RECIPIENT)
@@ -540,15 +613,16 @@ def share_result(pr, report, filtered):
             return
     except (EOFError, KeyboardInterrupt):
         return
-    if choice != "p":
+    if choice != "p" or not public:
         return
     try:
         account = subprocess.check_output(["gh", "api", "--hostname", "github.com", "user", "--jq", ".login"],
                                           text=True, stderr=subprocess.DEVNULL).strip()
+        print(report, flush=True)
         answer = input(f"Post the summary above as {account} to https://github.com/{REPO}/pull/{pr}? [y/N] ")
         if answer.strip().lower() == "y":
             subprocess.run(["gh", "pr", "comment", str(pr), "-R", "github.com/" + REPO, "--body-file", "-"],
-                           input=report, text=True, check=True)
+                           input=report.encode("utf-8"), check=True)
     except (EOFError, KeyboardInterrupt):
         return
     except (OSError, subprocess.CalledProcessError):
@@ -609,12 +683,11 @@ def run_request(manifest, options):
                 share.mkdir()
                 filtered = share / (destination.name + "-diagnostics.zip")
                 with zipfile.ZipFile(filtered, "x", zipfile.ZIP_DEFLATED) as out:
-                    for name in ("summary.txt", "main-frames.csv", "candidate-frames.csv",
-                                 "main-submissions.csv", "candidate-submissions.csv", "main-events.csv", "candidate-events.csv"):
+                    for name in OUTGOING:
                         # Fixed ZIP metadata avoids recording local times or file modes.
                         entry = zipfile.ZipInfo(name)
                         out.writestr(entry, (destination / name).read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
-                share_result(request["pr"], report, filtered)
+                share_result(request["pr"], filtered, options.review_kit)
 
 
 if __name__ == "__main__":

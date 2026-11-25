@@ -16,7 +16,12 @@ WARNING: LOGS MAY CONTAIN SENSITIVE INFORMATION
 ====================================================================
 Raw logs may include usernames, file paths, credentials and game output.
 Keep the full archive local. Review the filtered ZIP before choosing to share.
-At REPORT READY or TEST INTERRUPTED, review the on-screen summary. Press Enter
+At REPORT READY or TEST INTERRUPTED, choose [r] Review/edit. Use the arrow keys
+to choose a file, Enter to edit it and Space to include or exclude it. Ctrl+F
+searches the file. Esc returns to the file list. Ctrl+S applies your edits to
+the local outgoing ZIP. Only summary.txt can be posted publicly. Check any text
+you add for sensitive information. If the kit has no editor, the runner prints
+a temporary folder to edit and asks whether to apply your changes. Press Enter
 to keep it local. You can post the summary to the PR under your GitHub account
 or press [i] to send detailed diagnostics encrypted to the maintainer. Sending
 requires GitHub CLI signed in to github.com with gist access. The runner names

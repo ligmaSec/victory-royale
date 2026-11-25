@@ -54,11 +54,31 @@ def find_build(source, commit, prefix):
                      "Refresh the matched builds before asking a tester.")
 
 
+def review_notices(out):
+    """Include upstream license text and attribution from the locked editor dependencies."""
+    tree = subprocess.check_output(["cargo", "tree", "--locked", "-p", "victory-report-review",
+                                    "--target", "all", "--edges", "normal", "--prefix", "none"], text=True)
+    linked = {tuple(line.split()[:2]) for line in tree.splitlines()}
+    packages = json.loads(subprocess.check_output(["cargo", "metadata", "--locked", "--format-version", "1"]))
+    index = []
+    for package in packages["packages"]:
+        name, version = package["name"], package["version"]
+        if not package["source"] or (name, "v" + version) not in linked:
+            continue
+        folder = Path(package["manifest_path"]).parent
+        index.append(f"{name} {version} | {package['license']} | {package['repository']}")
+        for path in sorted(folder.iterdir()):
+            if path.is_file() and path.name.upper().startswith(("LICENSE", "LICENCE", "NOTICE", "COPYING", "COPYRIGHT")):
+                out.writestr(f"review/licenses/{name}-{version}/{path.name}", path.read_bytes())
+    out.writestr("review/licenses/INDEX.txt", "\n".join(sorted(index)) + "\n")
+
+
 def prepare():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pr", type=int)
     parser.add_argument("--scenario", required=True, help="what to do in each run and when to close it")
     parser.add_argument("--output", required=True, type=Path, help="new request ZIP")
+    parser.add_argument("--review-dir", type=Path, help="directory containing both native review executables")
     args = parser.parse_args()
     if args.pr < 1 or not args.scenario.strip() or not args.scenario.isprintable():
         parser.error("Use a positive PR number and a single plain-text scenario.")
@@ -72,6 +92,12 @@ def prepare():
     with zipfile.ZipFile(args.output, "x", zipfile.ZIP_DEFLATED) as out:
         for build, package in ((main, main_bytes), (candidate, candidate_bytes)):
             out.writestr(f"packages/{build['sha256']}.tar.gz", package, compress_type=zipfile.ZIP_STORED)
+        if args.review_dir:
+            review_notices(out)
+            for name in ("victory-report-review", "victory-report-review.exe"):
+                data = (args.review_dir / name).read_bytes()
+                out.writestr("review/" + name, data)
+                out.writestr("review/" + name + ".sha256", hashlib.sha256(data).hexdigest())
         out.write(ROOT / "run-test.py", "run-test.py")
         out.write(ROOT.parents[1] / "LICENSE", "LICENSE")
         out.write(ROOT / "README.txt", "README.txt")
