@@ -1,6 +1,7 @@
 """Account-owned public registrations and pinned age tools for hardware reports."""
 import contextlib
 import hashlib
+from html.parser import HTMLParser
 import json
 from pathlib import Path
 import re
@@ -9,6 +10,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.error
+import urllib.request
 import zipfile
 
 REPO = "ligmaSec/victory-royale"
@@ -33,6 +36,91 @@ def github(endpoint, payload=None, method=None):
     return json.loads(result.stdout)
 
 
+def public_gist(endpoint):
+    # Actions uses an installation token for repository reads. Gists live
+    # outside that installation, and public registrations need no token.
+    request = urllib.request.Request("https://api.github.com/" + endpoint,
+                                     headers={"Accept": "application/vnd.github+json",
+                                              "User-Agent": "victory-hardware-request"})
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.load(response)
+
+
+class GistDirectory(HTMLParser):
+    """Read public Gist links and file counts from one account's directory."""
+    def __init__(self, login, page):
+        super().__init__()
+        self.login = login
+        self.links = {}
+        self.older = {f"?page={page + 1}", f"https://gist.github.com/{login}?page={page + 1}"}
+        self.next_page = False
+        self.href = None
+        self.label = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self.href = dict(attrs).get("href")
+            self.label = []
+
+    def handle_data(self, data):
+        if self.href:
+            self.label.append(data)
+
+    def handle_endtag(self, tag):
+        if tag != "a" or not self.href:
+            return
+        label = "".join(self.label).strip()
+        match = re.fullmatch(rf"/{re.escape(self.login)}/([0-9a-f]{{32}})", self.href)
+        if match:
+            self.links.setdefault(match[1], set()).add(label)
+        elif self.href in self.older and label == "Older":
+            self.next_page = True
+        self.href = None
+
+
+def public_text(url):
+    request = urllib.request.Request(url, headers={"User-Agent": "victory-hardware-request"})
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return response.read().decode("utf-8")
+
+
+def directory_registration(owner):
+    login = owner["login"]
+    found = []
+    page = 1
+    while True:
+        directory = GistDirectory(login, page)
+        directory.feed(public_text(f"https://gist.github.com/{login}?page={page}"))
+        for gid, labels in directory.links.items():
+            if "1 file" in labels and REGISTRATION not in labels:
+                continue
+            # The profile supplies candidates only. GitHub's embed identifies
+            # the Gist owner, visibility and complete file list independently.
+            meta = json.loads(public_text(f"https://gist.github.com/{gid}.json"))
+            if meta["owner"] == login and meta["public"] is True and REGISTRATION in meta["files"]:
+                if gid not in found:
+                    found.append(gid)
+        if not directory.next_page:
+            break
+        page += 1
+    if len(found) > 1:
+        raise ValueError("Multiple public report keys are registered. Keep one registration.")
+    if not found:
+        return None
+    gid, = found
+    raw = public_text(f"https://gist.githubusercontent.com/{login}/{gid}/raw/{REGISTRATION}")
+    if account(github("users/" + login)) != owner:
+        raise ValueError("The public registration no longer belongs to the requester.")
+    return {"gist": gid, "key": checked_key(raw)}
+
+
+def checked_key(content):
+    key = content.strip()
+    if not re.fullmatch(r"age1[023456789acdefghjklmnpqrstuvwxyz]{58}", key):
+        raise ValueError("The registration must contain one native age public key.")
+    return key
+
+
 def account(user):
     if (type(user["id"]) is not int or user["id"] < 1 or user.get("type") != "User"
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", user["login"])):
@@ -40,31 +128,31 @@ def account(user):
     return {"id": user["id"], "login": user["login"]}
 
 
-def registration(owner, gist_id):
+def registration(owner, gist_id, *, read=None):
     if not re.fullmatch("[0-9a-f]{32}", gist_id):
         raise ValueError("Invalid key registration ID.")
-    gist = github("gists/" + gist_id)
+    gist = (read or github)("gists/" + gist_id)
     if gist["id"] != gist_id or gist["public"] is not True or account(gist["owner"]) != owner:
         raise ValueError("The public registration does not belong to the requester.")
     entry = gist["files"].get(REGISTRATION, {})
-    key = entry.get("content", "").strip()
-    if entry.get("truncated") or not re.fullmatch(r"age1[023456789acdefghjklmnpqrstuvwxyz]{58}", key):
-        raise ValueError("The registration must contain one native age public key.")
-    return {"gist": gist_id, "key": key}
+    if entry.get("truncated"):
+        raise ValueError("The public key file is truncated.")
+    return {"gist": gist_id, "key": checked_key(entry.get("content", ""))}
 
 
-def find_registration(owner):
+def find_registration(owner, *, read=None):
+    read = read or github
     found = []
     page = 1
     while True:
-        rows = github(f"users/{owner['login']}/gists?per_page=100&page={page}")
+        rows = read(f"users/{owner['login']}/gists?per_page=100&page={page}")
         found.extend(row["id"] for row in rows if row["public"] and REGISTRATION in row["files"])
         if len(rows) < 100:
             break
         page += 1
     if len(found) > 1:
         raise ValueError("Multiple public report keys are registered. Keep one registration.")
-    return registration(owner, found[0]) if found else None
+    return registration(owner, found[0], read=read) if found else None
 
 
 def publication(pr, actor, actor_id, comment):
@@ -83,7 +171,13 @@ def publication(pr, actor, actor_id, comment):
         if owner["id"] != actor_id:
             raise ValueError("The dispatch actor no longer matches this GitHub account.")
     try:
-        pinned = find_registration(owner)
+        try:
+            pinned = find_registration(owner, read=public_gist)
+        except urllib.error.HTTPError as error:
+            if error.code not in (403, 429):
+                raise
+            error.close()
+            pinned = directory_registration(owner)
     except ValueError as error:
         print(f"Private delivery unavailable for @{owner['login']}: {error}", file=sys.stderr)
         pinned = None
