@@ -1,5 +1,6 @@
-"""Run the two builds in an unpacked VIctory hardware test request. Python 3.9+."""
+"""Find and run a Series X hardware comparison for VIctory. Python 3.9+."""
 import argparse
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -124,15 +125,125 @@ def launch(side, folder, title, results, windows):
     print(f"{side} exited ({status}).", flush=True)
 
 
+def github_rows(endpoint, query):
+    if not shutil.which("gh"):
+        raise ValueError("Published requests need GitHub CLI. Install gh and run gh auth login, "
+                         "or pass a downloaded kit ZIP to this command.")
+    result = subprocess.run(["gh", "api", "--paginate", f"repos/{REPO}/{endpoint}", "--jq", query],
+                            capture_output=True, encoding="utf-8")
+    if result.returncode:
+        raise ValueError(f"GitHub lookup failed: {result.stderr.strip()}\n"
+                         "Check gh auth status and your connection, or use a downloaded kit ZIP.")
+    return [json.loads(line) for line in result.stdout.splitlines() if line]
+
+
+def published_requests(number):
+    pulls = github_rows("pulls?state=open&base=main&per_page=100",
+                        ".[] | {number, title, head: .head.sha}")
+    open_prs = {pr["number"]: pr for pr in pulls if number is None or pr["number"] == number}
+    if not open_prs:
+        return {}
+    # The workflow retains kits for seven days. Trust successful dispatches on main.
+    since = (datetime.now(timezone.utc) - timedelta(days=8)).date().isoformat()
+    runs = github_rows("actions/workflows/hardware-request.yml/runs?branch=main&event=workflow_dispatch"
+                       f"&status=success&created=>={since}&per_page=100", ".workflow_runs[] | .id")
+    available = {}
+    for run_id in sorted(runs, reverse=True):
+        artifacts = github_rows(f"actions/runs/{run_id}/artifacts?per_page=100",
+                                '.artifacts[] | select(.expired == false) | {name}')
+        for artifact in artifacts:
+            match = re.fullmatch(r"victory-series-x-pr-([1-9][0-9]*)", artifact["name"])
+            if match:
+                pr = int(match[1])
+                if pr in open_prs and pr not in available:
+                    available[pr] = (open_prs[pr], run_id, artifact["name"])
+        if len(available) == len(open_prs):
+            break
+    return available
+
+
+def select_published(number, list_only, folder):
+    available = published_requests(number)
+    if number is None:
+        if not available:
+            print("There are no published Series X requests for open PRs.")
+            return None
+        print("Available Series X hardware tests:")
+        for pr, (pull, _, _) in sorted(available.items()):
+            print(f"  #{pr}  {pull['title']}")
+        if list_only or not sys.stdin.isatty():
+            print("To run one, pass its PR number to this command.")
+            return None
+        choice = input("PR number (Enter to cancel): ").strip().lstrip("#")
+        if not choice:
+            return None
+        if not choice.isascii() or not choice.isdecimal() or int(choice) not in available:
+            raise ValueError("Choose one of the listed PR numbers.")
+        number = int(choice)
+    if number not in available:
+        raise ValueError(f"No published kit for open PR #{number}. Ask the requester to publish a fresh kit.")
+    pull, run_id, artifact = available[number]
+    print(f"Downloading the Series X test for PR #{number}…", flush=True)
+    subprocess.run(["gh", "run", "download", str(run_id), "-R", REPO, "-n", artifact, "-D", str(folder)],
+                   check=True)
+    manifest = folder / "request.json"
+    if not manifest.is_file():
+        raise ValueError("The published kit is missing its request.json.")
+    request = read_request(manifest)
+    if request["pr"] != number:
+        raise ValueError("The published kit names a different PR.")
+    parents = github_rows("git/commits/" + request["candidate"]["revision"], ".parents[] | {sha}")
+    if [parent["sha"] for parent in parents] != [request["main"]["revision"], pull["head"]]:
+        raise ValueError(f"PR #{number} changed after this kit was built. Ask the requester to publish a fresh kit.")
+    return manifest
+
+
+def unpack_kit(path, folder, plan):
+    manifest = folder / "request.json"
+    with zipfile.ZipFile(path) as kit:
+        if "request.json" not in kit.namelist():
+            raise ValueError("This ZIP has no hardware test request.json.")
+        manifest.write_bytes(kit.read("request.json"))
+        request = read_request(manifest)
+        if not plan:
+            packages = folder / "packages"
+            packages.mkdir()
+            for checksum in {request[side]["sha256"] for side in ("main", "candidate")}:
+                name = checksum + ".tar.gz"
+                with kit.open("packages/" + name) as source, (packages / name).open("wb") as target:
+                    shutil.copyfileobj(source, target)
+    return manifest
+
+
 def run():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("request", nargs="?", type=Path, default=ROOT / "request.json",
-                        help="request JSON from the maintainer")
+    parser.add_argument("request", nargs="?", help="PR number, test kit ZIP or request JSON")
+    parser.add_argument("--list", action="store_true", help="list published Series X requests")
     parser.add_argument("--output-dir", type=Path, help="parent directory for the unique report")
-    parser.add_argument("--plan", action="store_true", help="show the request without downloading or launching")
+    parser.add_argument("--plan", action="store_true", help="preview the selected test without launching")
     parser.add_argument("--title", type=Path, help="use this executable instead of the file chooser")
     options = parser.parse_args()
-    manifest = options.request
+    if options.list and options.request:
+        parser.error("--list takes no request")
+    with tempfile.TemporaryDirectory(prefix="victory-request-") as temporary:
+        folder = Path(temporary)
+        argument = options.request
+        manifest = ROOT / "request.json"
+        if options.list or (argument is None and not manifest.is_file()):
+            manifest = select_published(None, options.list, folder)
+        elif argument is not None:
+            if re.fullmatch(r"#?[1-9][0-9]*", argument):
+                manifest = select_published(int(argument.lstrip("#")), False, folder)
+            else:
+                path = Path(argument).expanduser()
+                if not path.is_file():
+                    raise ValueError(f"Cannot find {path}. Pass a PR number or an existing kit ZIP or request JSON.")
+                manifest = unpack_kit(path, folder, options.plan) if path.suffix.lower() == ".zip" else path
+        if manifest is not None:
+            run_request(manifest, options)
+
+
+def run_request(manifest, options):
     request = read_request(manifest)
     print(f"VIctory PR #{request['pr']} | Series X | two launches\n{request['scenario']}")
     for side in ("main", "candidate"):
@@ -183,5 +294,5 @@ def run():
 if __name__ == "__main__":
     try:
         run()
-    except (OSError, ValueError, TypeError, KeyError, EOFError, subprocess.CalledProcessError, tarfile.TarError) as error:
+    except (OSError, ValueError, TypeError, KeyError, EOFError, subprocess.CalledProcessError, tarfile.TarError, zipfile.BadZipFile) as error:
         sys.exit(str(error))
