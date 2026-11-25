@@ -396,8 +396,11 @@ fn show(resource: Option<object::Held>) {
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
-    if crate::capture::listed(frame) {
-        crate::capture::dump_targets(frame);
+    {
+        crate::capture::frame_drew(frame, crate::draw::drawn());
+        if crate::capture::listed(frame) {
+            crate::capture::dump_targets(frame);
+        }
     }
     #[cfg(windows)]
     if let Some(resource) = resource.as_ref().map(object::Held::get)

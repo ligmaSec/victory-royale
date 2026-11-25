@@ -29,9 +29,54 @@ pub(crate) fn listed(n: u64) -> bool {
     .contains(&n)
 }
 
+/// Whether world capture is requested: the switch is on and frames are saved.
+fn world_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_CAPTURE_WORLD"))
+}
+
+/// The first presented frame that ran 500 draws or more.
+static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// At the present of `frame`, with the draws run by the host so far: record
+/// the first frame of the world, and log it when world capture is requested.
+pub(crate) fn frame_drew(frame: u64, drawn: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let before = LAST.swap(drawn, Relaxed);
+    if world_frame(frame, before, drawn, world_on()).is_some()
+        && WORLD
+            .compare_exchange(u64::MAX, frame, Relaxed, Relaxed)
+            .is_ok()
+    {
+        let (plus2, plus6) = world_offsets(frame);
+        tracing::info!(frame, plus2, plus6, "the first frame of 500 draws or more");
+    }
+}
+
+/// The frame to record when `drawn` grew by at least 500 since `before`.
+fn world_frame(frame: u64, before: u64, drawn: u64, enabled: bool) -> Option<u64> {
+    (enabled && drawn.saturating_sub(before) >= 500).then_some(frame)
+}
+
+/// The two captured offsets from the world's first frame.
+fn world_offsets(first: u64) -> (u64, u64) {
+    (first + 2, first + 6)
+}
+
+/// Whether frame `n` is the world's first frame or one of its two offsets.
+fn world_wanted(n: u64, first: u64) -> bool {
+    if first == u64::MAX {
+        return false;
+    }
+    let (plus2, plus6) = world_offsets(first);
+    n == first || n == plus2 || n == plus6
+}
+
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
-    folder().is_some() && (n.is_power_of_two() || listed(n))
+    let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
+    folder().is_some() && (n.is_power_of_two() || listed(n) || world_wanted(n, first))
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -675,6 +720,28 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    /// Menus draw under 500 per frame; the world crosses the threshold.
+    #[test]
+    fn a_frame_only_counts_as_the_world_after_five_hundred_draws() {
+        assert_eq!(super::world_frame(10, 100, 599, true), None);
+        assert_eq!(super::world_frame(10, 100, 600, true), Some(10));
+        // The switch must matter: no marker when capture world is off.
+        assert_eq!(super::world_frame(10, 100, 600, false), None);
+        // Counters are monotonic, but a reset must not be read as a huge jump.
+        assert_eq!(super::world_frame(10, 900, 1, true), None);
+    }
+
+    /// The qualifying frame and its two offsets are saved, not its neighbours.
+    #[test]
+    fn world_capture_selects_the_first_frame_and_two_offsets() {
+        assert!(super::world_wanted(10, 10));
+        assert!(super::world_wanted(12, 10));
+        assert!(super::world_wanted(16, 10));
+        assert!(!super::world_wanted(11, 10));
+        assert!(!super::world_wanted(13, 10));
+        assert!(!super::world_wanted(10, u64::MAX));
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
