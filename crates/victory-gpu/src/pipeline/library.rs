@@ -4,9 +4,8 @@
 //! 1. Every host pipeline goes into the host's pipeline library, named by
 //!    a hash of all that its host description holds (the translated
 //!    shaders' code, which changes when a translation does, our root
-//!    signature, the graphics state). The library is saved under the cache
-//!    folder under an adapter-specific directory; the host refuses a library of another driver, and
-//!    an entry whose description differs, so neither is ever used.
+//!    signature, the graphics state). Each adapter has a cache directory.
+//!    D3D12 checks the driver and pipeline description before reuse.
 //! 2. The title pipelines a run drew or dispatched with are listed by a key
 //!    known when the title creates them (their shader containers and
 //!    graphics state); the next run hands those to the workers at
