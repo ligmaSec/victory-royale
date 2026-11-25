@@ -90,15 +90,15 @@ def layout(title, context, lines, options, selected, offset, width, height, colo
     def wrap(line):
         return textwrap.wrap(clean(line), inner, replace_whitespace=False, drop_whitespace=True) or [""]
 
-    header = [ink(("  VIctory  /  " + context)[:width], "1;96"),
-              ink(("  " + title)[:width], "1;97")]
+    header = [ink(("  VIctory  /  " + context)[:width], "1;96")]
+    header.extend(ink("  " + part, "1;97") for part in wrap(title))
     header.extend(ink(("  " + part).ljust(width)[:width], "1;97;41") for part in wrap(WARNING))
     detail = ["  " + part for part in wrap(options[selected][2])]
     footer = "↑↓ Choose   Enter Select   Esc Back"
     # A wide window keeps results beside the actions. At smaller sizes commands
     # move below the content, with the active choice always visible.
-    wide = width >= 88 and height >= len(header) + len(options) + len(detail) + 4
-    right_width = 32
+    right_width = max(32, max(len(label) + 6 for _, label, _ in options))
+    wide = width >= max(88, right_width + 45) and height >= len(header) + len(options) + len(detail) + 4
     left_width = width - right_width - 1
     body_width = left_width - 4 if wide else inner
     body = [part for line in lines for part in
