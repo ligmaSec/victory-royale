@@ -5632,6 +5632,32 @@ impl<'a> Lower<'a> {
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
                 self.s.flags |= flags::WAVE_OPS;
+                // Only mapped compute waves have the console's lane numbering
+                // and width. A ballot or reduction on a narrower host wave can
+                // miss the first enabled console lane.
+                if let Some(enabled) = guard.filter(|_| self.console_lanes) {
+                    // Prefer the lowest enabled lane. If none are enabled, the
+                    // first live host lane supplies the fallback (lane zero in
+                    // a converged wave), as with WaveReadLaneFirst.
+                    let lane = self.lane_index();
+                    let disabled = self.s.m.i32(1 << 31);
+                    let behind = self.s.m.bin(c, Bin::Or, lane, disabled);
+                    let order = self.s.m.select(c, enabled, lane, behind);
+                    let min = self.s.m.i8(2);
+                    let unsigned = self.s.m.i8(1);
+                    let first = self.s.op(
+                        c,
+                        "waveActiveOp.i32",
+                        Attr::NoUnwind,
+                        self.s.t.i32,
+                        119,
+                        &[order, min, unsigned],
+                    );
+                    let mask = self.s.m.i32(!(1 << 31));
+                    let source = self.s.m.bin(c, Bin::And, first, mask);
+                    let value = self.read_lane(a, source);
+                    return int(self, value);
+                }
                 let r = self.s.op(
                     c,
                     "waveReadLaneFirst.i32",
@@ -11143,6 +11169,47 @@ mod wave_size_tests {
             out.push((label, res[0].clone()));
         }
         out
+    }
+
+    #[test]
+    fn guarded_first_lane_in_a_mapped_compute_wave() {
+        for (wave, threads, narrow, expected) in [
+            (32, 4, 0xBF80_0000, 1),   // unchanged EXEC
+            (32, 4, 0x7DA6_0082, 3),   // only lanes 2 and 3 active
+            (32, 4, 0x7DA4_00A0, 1),   // empty EXEC reads lane 0
+            (64, 64, 0x7DA6_00A8, 41), // only lanes 40..63 active
+        ] {
+            let wide = wave == 64;
+            let words = [
+                0xBE81_0380,
+                0xF408_0200,
+                0xFA00_0000, // raw UAV
+                0x340C_0082, // v6 = thread index * 4
+                0x4A02_0081, // v1 = thread index + 1
+                0xD760_0012,
+                0x0001_0101, // read lane zero into s18; requires console lane order
+                if wide { 0xBE8C_047E } else { 0xBE8C_037E }, // save EXEC
+                narrow,
+                0x7E06_0501, // v_readfirstlane_b32 s3, v1
+                if wide { 0xBEFE_040C } else { 0xBEFE_030C }, // restore EXEC
+                0x7E08_0203, // broadcast s3 to v4
+                0xE070_1000,
+                0x8002_0406, // store v4 at byte address v6
+                S_ENDPGM,
+            ];
+            let (shader, bounds) = compile_cs_mode(&words, [threads, 1, 1], 0, wide, true);
+            assert_eq!(bounds, (wave, wave));
+            let _ = (&shader, expected);
+            #[cfg(windows)]
+            for (label, data) in run_cs_uav(&shader, threads, wave) {
+                assert_eq!(
+                    data,
+                    vec![expected; threads as usize],
+                    "{label}, Wave{wave}"
+                );
+                eprintln!("{label}: {threads} lanes read {expected} on Wave{wave}");
+            }
+        }
     }
 
     #[test]
