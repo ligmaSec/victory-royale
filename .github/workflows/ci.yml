@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+  merge_group:
   push:
     branches: [main]
   workflow_dispatch:
@@ -21,16 +22,21 @@ jobs:
     name: fmt-policy
     # rustfmt does not compile code, so a Linux runner can check the
     # Windows-only crates.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       # Installs the toolchain that rust-toolchain.toml gives, with its
       # components, so CI uses the same rustfmt as local builds.
       - name: Install the toolchain
         run: rustup toolchain install
+      - name: Validate workflows and shell scripts
+        run: |
+          bash .github/scripts/install-tools.sh lint
+          "$RUNNER_TEMP/actionlint-bin/actionlint"
+          git ls-files -z -- '*.sh' | xargs -0 -r shellcheck
       - name: Documentation layout
         run: bash tests/docs.sh
       - name: Check the formatting
@@ -40,13 +46,15 @@ jobs:
 
   check:
     name: check
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
@@ -58,32 +66,51 @@ jobs:
 
   msrv:
     name: msrv
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
-      # Keep this version in sync with workspace.package.rust-version.
-      - name: Install minimum Rust toolchain
-        run: rustup toolchain install 1.88.0
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - name: Check workspace on the declared minimum
-        run: cargo +1.88.0 check --workspace --locked
+        shell: bash
+        run: |
+          msrv=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["rust-version"])')
+          rustup toolchain install "$msrv" --profile minimal
+          cargo "+$msrv" check --workspace --all-targets --all-features --locked
 
   # The portable crates build and test on Linux too; this catches
   # Windows-only code reaching them.
   linux:
     name: linux
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
         run: cargo test --workspace --locked
       - name: Proton launcher (synthetic, no Wine)
         run: bash tests/proton-launcher.sh
+
+  proton:
+    needs: [fmt-policy, check, msrv, linux]
+    uses: ./.github/workflows/proton.yml
+
+  gate:
+    name: Regression gate
+    if: always()
+    needs: [fmt-policy, check, msrv, linux, proton]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to pass
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"

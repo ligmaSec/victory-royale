@@ -1,0 +1,88 @@
+name: Proton distribution
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build and exercise the Linux distribution
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CC_x86_64_pc_windows_gnullvm: x86_64-w64-mingw32-clang
+      AR_x86_64_pc_windows_gnullvm: llvm-ar
+      VICTORY_BUILD_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install cross-build tools
+        run: |
+          bash .github/scripts/install-tools.sh cross
+          rustup target add x86_64-pc-windows-gnullvm
+      - name: Install runtime test tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends wine wine64 xvfb xauth clang llvm lld
+      - name: Build and package the release executable
+        run: |
+          cargo build --locked --release -p victory --target x86_64-pc-windows-gnullvm
+          python3 - <<'PYTHON'
+          from pathlib import Path
+
+          release = Path("target/x86_64-pc-windows-gnullvm/release")
+          binary = (release / "victory.exe").read_bytes()
+          for name in ("argument_clamp", "rect_expand", "rect_rewrite"):
+              shader, = release.glob(f"build/victory-gpu-*/out/{name}.dxil")
+              data = shader.read_bytes()
+              if not data.startswith(b"DXBC") or data not in binary:
+                  raise SystemExit(f"Missing embedded GPU helper: {name}")
+          PYTHON
+          dist="$RUNNER_TEMP/distribution"
+          mkdir -p "$dist/victory"
+          install -m 755 target/x86_64-pc-windows-gnullvm/release/victory.exe scripts/victory-proton.sh "$dist/victory/"
+          install -m 644 LICENSE victory.example.toml "$dist/victory/"
+          printf '%s\n' "$GITHUB_SHA" > "$dist/victory/REVISION"
+          cd "$dist"
+          tar -czf victory-proton-x86_64.tar.gz victory
+          sha256sum victory-proton-x86_64.tar.gz > SHA256SUMS
+      - name: Exercise the archive users will download
+        id: runtime
+        env:
+          TMPDIR: ${{ runner.temp }}/runtime-tests
+        run: |
+          dist="$RUNNER_TEMP/distribution"
+          mkdir -p "$TMPDIR" "$RUNNER_TEMP/unpacked"
+          cd "$dist"
+          sha256sum --check --strict SHA256SUMS
+          tar -xf victory-proton-x86_64.tar.gz -C "$RUNNER_TEMP/unpacked"
+          cd "$RUNNER_TEMP/unpacked/victory"
+          test "$(cat REVISION)" = "$GITHUB_SHA"
+          ./victory-proton.sh --help
+          bash "$GITHUB_WORKSPACE/tests/proton-launcher.sh" "$PWD/victory-proton.sh"
+          PATH="/usr/bin:$PATH" xvfb-run -a bash "$GITHUB_WORKSPACE/tests/runtime/run.sh" \
+            --victory "$PWD/victory.exe" --wine /usr/bin/wine
+      - name: Preserve failed synthetic cases
+        if: failure() && steps.runtime.outcome == 'failure'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runtime-diagnostics-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/runtime-tests/victory-runtime-*/summary.json
+            ${{ runner.temp }}/runtime-tests/victory-runtime-*/logs/*.log
+          if-no-files-found: warn
+          retention-days: 3
+      - name: Deliver verified main build
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: victory-proton-x86_64-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/distribution/victory-proton-x86_64.tar.gz
+            ${{ runner.temp }}/distribution/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

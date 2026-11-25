@@ -58,4 +58,14 @@ test ! -e "$work/0"
 test -d "$DXVK_STATE_CACHE_PATH"
 printf '%s\n' "$WINEPREFIX" 0 "$DXVK_STATE_CACHE_PATH" > "$work/expected"
 diff -u "$work/expected" "$ENV_RECORD"
+# An extracted distribution finds the executable beside its launcher.
+mkdir -p "$work/extracted bundle"
+cp "$launcher" "$work/extracted bundle/victory-proton.sh"
+touch "$work/extracted bundle/victory.exe"
+unset VICTORY_EXE
+export CARGO_TARGET_DIR="$work/no-build-tree"
+bash "$work/extracted bundle/victory-proton.sh" "$work/game with spaces/title.exe"
+read -r launched < "$LAUNCH_RECORD"
+expected="$work/extracted bundle/victory.exe"
+test "$launched" = "Z:${expected//\//\\}"
 echo 'Proton launcher checks passed.'
