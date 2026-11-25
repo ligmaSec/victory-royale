@@ -6,21 +6,17 @@ The default test run needs no game data and no console SDK:
 cargo test --workspace --locked
 ```
 
-CI (`.github/workflows/ci.yml`, `windows-latest`) runs exactly this, after
+Linux CI runs the portable workspace tests. Windows CI also exercises the
+Windows loader and graphics paths, and runs the tests serially to avoid
+contention for the graphics driver. Both jobs run Clippy. See the
+[workflow](../.github/workflows/ci.yml) for the exact commands.
 
-```powershell
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-```
-
-Run all three before sending a change. The workspace test run includes
-`xtask`'s `repository_passes_policy`, the [asset-policy](asset-policy.md)
-check, so it fails if a test fixture contains anything from the game. The same
-check runs per commit once `cargo xtask install-hooks` has been run.
+The workspace suite includes the [asset-policy check](asset-policy.md).
+Run `cargo xtask install-hooks` to enable it on commit.
 
 ## What the host needs
 
-Tests run on Windows. Some of them create a real Direct3D 12 device:
+The Windows graphics tests create a Direct3D 12 device.
 
 | Need | Used by |
 |------|---------|
@@ -60,9 +56,9 @@ cargo test -p victory-shader --locked -- <test name> --nocapture
 
 `victory-loader/tests/load_probe.rs` loads a stand-in title,
 `tests/fixtures/hle-probe`. It is not a workspace member: the test builds it
-on demand with the `cargo` that runs the tests, into its own target directory.
-This means the test needs a Windows `cargo` it can start, so it fails when the
-test executable is cross-built and run under Wine or Proton.
+on demand on Windows. When running the test under Proton, cross-build the
+fixture on Linux and set `VICTORY_HLE_PROBE` to its Windows path. See the
+[loader test commands](proton-launcher.md#testing-without-game-files).
 
 ## Writing tests
 

@@ -1,18 +1,42 @@
-# Running VIctory with the Proton launcher
+# Build and run VIctory on Linux
 
-Install `umu-run` on x86-64 Linux. The game requires an AVX2 CPU and a Vulkan
-driver that exposes Shader Model 6.6 through vkd3d-proton.
+The native Linux CLI can inspect files and translate shaders. Running the
+title uses the Windows executable under Proton. The launch path requires
+x86-64 Linux, an AVX2 CPU, UMU, and a Vulkan driver that exposes Shader
+Model 6.6 through vkd3d-proton. World rendering also needs mesh shaders.
+
+## Build on Linux
+
+Install Rust with rustup, a native C toolchain, and the x86-64 Linux UCRT
+distribution of LLVM-MinGW. Put its `bin` directory first on `PATH`.
+To embed the three GPU helper shaders, install the Linux DirectX Shader
+Compiler (`dxc`) and set `VICTORY_BUILD_DXC` to its absolute path before
+building. Run the following from the checkout.
+[LLVM-MinGW releases](https://github.com/mstorsjo/llvm-mingw/releases) ·
+[DirectX Shader Compiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases)
+
+```sh
+rustup target add x86_64-pc-windows-gnullvm
+export CC_x86_64_pc_windows_gnullvm=x86_64-w64-mingw32-clang
+export AR_x86_64_pc_windows_gnullvm=llvm-ar
+export VICTORY_BUILD_DXC="$(command -v dxc)"
+cargo build --locked --release -p victory --target x86_64-pc-windows-gnullvm
+```
+
+The launcher finds the release executable in the Cargo target directory.
+If you build without Linux DXC, leave `VICTORY_BUILD_DXC` unset. Supply
+Windows `dxcompiler.dll` and `dxil.dll` beside `victory.exe` if Wine's HLSL
+compiler rejects the helper shaders on startup.
+
+An existing x64 MSVC build also works with the launcher. With `cargo-xwin`,
+LLVM, and the MSVC Rust target installed, build one using
+`cargo xwin build --locked --release -p victory --target x86_64-pc-windows-msvc`.
+
+## Launch
+
+Install UMU so that `umu-run` is on `PATH`. Keep your game files outside
+the checkout. Pass the Linux path to the title executable to the launcher.
 [UMU installation](https://github.com/Open-Wine-Components/umu-launcher#installation)
-
-With Nix, `nix develop .#proton` (or `nix-shell --arg withProton true`)
-provides UMU and the MSVC cross-build tools. See
-[Linux development with Nix](linux-proton.md#development-with-nix).
-
-Use a Windows x64 build of VIctory. The launcher supports MSVC builds,
-including those produced by `cargo xwin`, and LLVM-MinGW builds. Both Rust
-targets use native Windows thread-local storage (TLS). A loader test with
-the GCC-based `x86_64-pc-windows-gnu` target aborted when a title DLL called
-into Rust during thread startup.
 
 ```sh
 ./scripts/victory-proton.sh "/path/to/game/title.exe" --execute
@@ -47,27 +71,11 @@ set `VICTORY_SKIP_HOST_PSOS` to its name or a comma-separated list of names.
 Draws and dispatches using those configurations are dropped. Other pipelines
 can still use the same shaders. Unset the variable to restore the passes.
 
-## Building with LLVM-MinGW
-
-Install Rust with rustup and put the x86-64 Linux UCRT distribution of
-LLVM-MinGW first on `PATH` (its `bin` directory).
-[LLVM-MinGW releases](https://github.com/mstorsjo/llvm-mingw/releases)
-
-```sh
-rustup target add x86_64-pc-windows-gnullvm
-cargo build --locked --release -p victory --target x86_64-pc-windows-gnullvm
-```
-
-For a self-contained cross-build, set `VICTORY_BUILD_DXC` to the absolute
-path to the build host's DXC executable before running Cargo. It compiles the
-indirect-argument clamp and both rectangle shaders into the executable. If the
-system compiler rejects one at runtime, VIctory uses its embedded bytecode.
-
 ## Testing without game files
 
 `bash tests/proton-launcher.sh` checks argument quoting, cache paths, XDG
 fallbacks and exit status with a fake UMU. It requires neither Wine nor a GPU,
-and runs in Linux CI and `nix flake check`.
+and runs in Linux CI.
 
 `./tests/proton-smoke.sh` compiles its synthetic title with the LLVM-MinGW
 toolchain and gnullvm Rust target above, even when `VICTORY_EXE` points to

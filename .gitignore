@@ -11,11 +11,6 @@
 /target/
 /tests/fixtures/*/target/
 
-# Nix / direnv local build output
-/.direnv/
-/result
-/result-*
-
 # Local configuration (contains paths to YOUR files)
 /victory.toml
 

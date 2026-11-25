@@ -11,10 +11,9 @@ own log strings and `module+rva` addresses.
 
 ## Set up
 
-Follow the requirements in the [README](README.md#getting-started). On x86-64
-Linux, `nix develop` or `nix-shell` supplies the pinned Rust toolchain, native
-build tools and Windows cross-compiler; see the
-[Linux guide](docs/linux-proton.md#development-with-nix). Then:
+Follow the [setup instructions](README.md#getting-started). Linux host tests
+require rustup and a native C toolchain. To build the Windows executable on
+Linux, use the [Proton guide](docs/proton-launcher.md#build-on-linux).
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit

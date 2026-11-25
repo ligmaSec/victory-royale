@@ -13,73 +13,21 @@ it can and on first use where it must (shaders). See
 
 The Windows executable can also be launched under Proton on x86-64 Linux. See
 [Running with the Proton launcher](docs/proton-launcher.md).
-For a pinned Linux development environment, run `nix develop` (or `nix-shell`).
-See [Linux development with Nix](docs/linux-proton.md#development-with-nix).
 
-## Status (2026-11-23)
+## Status
 
-**Not playable yet.** The title boots, runs its menus at its own 30 fps and
-loads the world, where rendering fails.
-
-| Stage | State |
-|-------|-------|
-| Boot, first-boot screens (accessibility, language, settings, legal) | works, 30 fps |
-| Intro video with sound | works |
-| Start screen, profile and saves | works |
-| Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
-
-Tested on one machine: Windows 11, AMD RX 6700 XT.
-
-> **Warning.** Entering the world on a real GPU can currently hang it, and
-> Windows then resets the display driver (every monitor goes black for a
-> moment). To look further, use a diagnostics build with
-> `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
-> A world frame can also outlast Windows' 2 s GPU timeout on slower GPUs
-> (`slow host submission` above 2000 ms, then the device is removed as hung);
-> raising `TdrDelay` and `TdrDdiDelay` (for example to 60) under
-> `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers` and rebooting
-> avoids that reset.
-
-For an Arch Linux cross-build and a Proton Experimental run on an RTX 4080,
-see the [Linux rendering report](docs/arch-proton-rendering.md).
-
-What each part does today and what it still needs:
-
-| Subsystem | Today | Needs |
-|-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
-| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | – |
-| Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
-| Audio | Menu, video and loading sound; XMA voices and Opus streams decode; convolution reverb is wet | DSP FFT/IFFT transforms stay silent; Opus results unverified against the title |
-| GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | Merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
-| Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Runs through the menus to the loading screen | The world, as above |
-
-In an offline scan of `shaders.rpf`, SM 6.6 texture atomics recovered
-520 shader translations. Specializing proven branch outcomes recovered
-another 108 by keeping descriptor words off paths that consume buffer data.
-Microsoft's DXIL validator accepted all 628 shaders. Game rendering with
-these shader changes still needs a Windows D3D12 run.
+Boot, first-time setup, menus, and intro video work. The title can enter the
+world, but the scene can render mostly black, run slowly, or hang the GPU.
+World gameplay remains unplayable. On Windows a GPU hang can trigger a display
+driver reset. Use the diagnostics build with `VICTORY_D3D12_WARP=1` to
+investigate on the software adapter.
 
 ## Getting started
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`). On Linux, see
-[docs/linux-proton.md](docs/linux-proton.md) for which crates build and test
-natively today, cross-building `victory.exe` and running it under Proton.
-
-Under Wine or Proton, builds without embedded helper shaders also need DXC's
-`dxcompiler.dll` (with its `dxil.dll`): Wine's `d3dcompiler_47` cannot compile
-the indirect-argument clamp. The Nix shell sets `VICTORY_BUILD_DXC` to embed
-these helpers during cross-builds. Runtime DXC is looked for in
-`VICTORY_DXC` (the DLL or its folder), beside the
-`dxil.dll` that shader validation finds, then the executable's folder and System32.
+`rust-toolchain.toml`). On x86-64 Linux, follow the
+[Proton guide](docs/proton-launcher.md) to build and launch the Windows executable.
 
 Clone the private repository with a GitHub account that has access. Run the
 remaining commands from the checkout.
@@ -99,13 +47,6 @@ The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
-
-Keep the game folder on an SSD if you can. From a hard drive the first
-screen stays black, at 30 fps and about 3 draws/frame, for a minute and a
-half or more while the title reads its files: the drive stays 100% busy with
-small random reads, and nothing shows until they finish. Wait for it rather
-than closing the window. A later launch is faster while Windows still holds
-the files in its cache.
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
@@ -131,25 +72,9 @@ profile, pass `--console series-s` when starting the title:
 target\release\victory.exe run <game dir>\<the title's exe> --execute --console series-s
 ```
 
-In a reported diagnostic run, the Series X profile used a 3840×2160 scene
-with 2560×1440 internal targets; the Series S profile used a 1920×1080 scene
-with 1280×720 internal targets. The UI can still use a separate 3840×2160
-presentation plane, so selecting Series S does not necessarily make the
-window or every render target 1080p. Changing the DXGI mode list alone does
-not change the scene resolution ([issue #203](https://github.com/Marvisak/VIctory/issues/203));
-Series S multi-plane presentation is covered separately by
-[PR #211](https://github.com/Marvisak/VIctory/pull/211).
+Series S lowers the scene resolution and can reduce memory usage. The UI
+uses a separate presentation plane and can still render at a higher resolution.
 
-The same report measured about 3.9 GB less committed process memory in the
-menus/intro and about 3.6 GB less at the world peak with Series S enabled.
-However, peak committed memory was still about 17.7 GB, and whole-system
-GPU memory use still reached about 7.3 of 8 GB. Both profiles also lost the
-GPU device 30–45 seconds after entering the world. These are measurements
-from one Windows 10 / RTX 2070 SUPER 8 GB / 32 GB RAM diagnostic setup
-(base commit `d2a4bae`, with PRs #175 and #211 applied), not general
-requirements or a guarantee of stability. Series S can reduce memory
-pressure, but it does not make a 16 GB RAM / 8 GB VRAM system reliably fit
-the world or resolve the current GPU hang.
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
@@ -291,10 +216,6 @@ to place with these next to it:
 Nothing from the title's data belongs in the report: no shader dumps, no
 frames, no memory, per [docs/asset-policy.md](docs/asset-policy.md). Names of
 our own functions, error codes and timings are enough to start.
-
-[docs/debugging-notes-from-a-port.md](docs/debugging-notes-from-a-port.md)
-collects what got another RAGE port from "the world loads" to "the game
-runs": what the title waited for, and how each wait was found.
 
 ## License
 

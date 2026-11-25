@@ -7,9 +7,8 @@ work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 mkdir -p "$work/bin" "$work/build with spaces" "$work/game with spaces"
 touch "$work/build with spaces/victory.exe" "$work/game with spaces/title.exe"
-# Nix's build sandbox has no /usr/bin/env.
-printf '#!%s\n' "$(command -v bash)" > "$work/bin/umu-run"
-cat >> "$work/bin/umu-run" <<'EOF'
+cat > "$work/bin/umu-run" <<'EOF'
+#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$@" > "$LAUNCH_RECORD"
 printf '%s\n' "$WINEPREFIX" "$VKD3D_SHADER_CACHE_PATH" "$DXVK_STATE_CACHE_PATH" > "$ENV_RECORD"
