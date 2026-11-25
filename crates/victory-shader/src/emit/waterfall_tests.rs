@@ -30,6 +30,25 @@ fn build_any(words: &[u32], buffers: bool) -> (HostShader, lower::Lowered) {
 }
 
 fn build_with_view(words: &[u32], buffer_stride: Option<u32>) -> (HostShader, lower::Lowered) {
+    build_compute(
+        words,
+        buffer_stride,
+        false,
+        super::ComputeWaves::with_wave32(true),
+        ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [32, 1, 1],
+        },
+    )
+}
+
+fn build_compute(
+    words: &[u32],
+    buffer_stride: Option<u32>,
+    wave64: bool,
+    waves: super::ComputeWaves,
+    cs: ComputeIo,
+) -> (HostShader, lower::Lowered) {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -55,7 +74,7 @@ fn build_with_view(words: &[u32], buffer_stride: Option<u32>) -> (HostShader, lo
     };
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 32,
         layout: vec![table(0), table(1)],
         used: vec![
@@ -63,27 +82,29 @@ fn build_with_view(words: &[u32], buffer_stride: Option<u32>) -> (HostShader, lo
             range(ResourceType::Uav, 16, 4, 0, 0),
             range(ResourceType::Sampler, 0, 4, 0, 1),
         ],
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: 2 << 1,
-            threads: [32, 1, 1],
-        }),
+        io: StageIo::Cs(cs),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-    })
+    let lowered = lower::lower_with_waves(
+        &lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        },
+        waves,
+        None,
+        None,
+    )
     .expect("lower");
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -593,6 +614,98 @@ fn scalar_structured_load_and_record_count_use_the_same_view() {
             for (label, result) in results {
                 assert_eq!(result, vec![expected; 32], "{label}");
             }
+        }
+    }
+}
+
+#[test]
+fn wave64_implicit_sample_preserves_guest_coordinates_and_mips() {
+    // Each 8-wide row doubles the horizontal derivative up to mip 3.
+    // Both halves of the 8x8 guest group must fill their own output slots.
+    let words = [
+        0xbe84_0300, // s_mov_b32 s4, s0
+        0xbe85_0380, // s_mov_b32 s5, 0
+        0xbe86_0301, // s_mov_b32 s6, s1
+        0xbe87_0380, // s_mov_b32 s7, 0
+        0xf40c_0302,
+        0xfa00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xf408_0a02,
+        0xfa00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xf408_0203,
+        0xfa00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0x3420_0283, // v_lshlrev_b32_e32 v16, 3, v1
+        0x4a20_2100, // v_add_nc_u32_e32 v16, v0, v16
+        0x3420_2082, // v_lshlrev_b32_e32 v16, 2, v16
+        0x3604_0081, // v_and_b32_e32 v2, 1, v0
+        0x3606_0283, // v_and_b32_e32 v3, 3, v1
+        0x3404_0503, // v_lshlrev_b32_e32 v2, v3, v2
+        0x7e04_0d02, // v_cvt_f32_u32_e32 v2, v2
+        0x100c_04ff,
+        0x3e00_0000, // v_mul_f32_e32 v6, 0x3e000000, v2
+        0x7e0e_0280, // v_mov_b32_e32 v7, 0
+        0xf080_0108,
+        0x0043_0c06, // image_sample v12, v[6:7], s[12:19], s[8:11] dmask:0x1 dim:SQ_RSRC_IMG_2D
+        0xe070_1000,
+        0x800a_0c10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xbf81_0000, // s_endpgm
+    ];
+    let io = ComputeIo {
+        rsrc2: (2 << 1) | (1 << 11),
+        threads: [8, 8, 1],
+    };
+    let narrow = super::ComputeWaves {
+        wave32: true,
+        narrow_quads: true,
+    };
+    let native = super::ComputeWaves::with_wave32(true);
+    let check_layout = |shader: &HostShader, threads: [u32; 3], wave: Option<u32>| {
+        let c = crate::Container::parse(&shader.dxil).unwrap();
+        let psv = c.part(crate::FourCC::PSV0).unwrap().data;
+        let word = |offset| u32::from_le_bytes(psv[offset..offset + 4].try_into().unwrap());
+        assert_eq!([word(40), word(44), word(48)], threads);
+        assert_eq!([word(20), word(24)], wave.map_or([0, u32::MAX], |w| [w; 2]));
+    };
+    let (original, lowered) = build_compute(&words, None, true, native, io);
+    assert!(!lowered.has_quad_read);
+    check_layout(&original, io.threads, Some(64));
+
+    // An actual barrier requires the original group. In particular it cannot
+    // be hidden by the absence of any declared group-shared memory.
+    let mut barrier = words.to_vec();
+    barrier.insert(words.len() - 1, 0xbf8a_0000); // s_barrier
+    let (guarded, _) = build_compute(&barrier, None, true, narrow, io);
+    check_layout(&guarded, io.threads, Some(64));
+
+    let mut texels = Vec::new();
+    for mip in 0..4 {
+        let size = 8 >> mip;
+        texels.extend(std::iter::repeat_n([(mip + 1) as f32; 4], size * size));
+    }
+    let views = [
+        View::TextureMips(8, 8, 4, &texels),
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::RawUav(64),
+    ];
+    let expected: Vec<_> = (0..64)
+        .map(|i| ((i / 8 % 4 + 1) as f32).to_bits())
+        .collect();
+    // Select each mip once via lane 1 minus lane 0 and once via lane 2 minus
+    // lane 0. Both also test that row-major addresses cover the upper half.
+    let mut vertical = words.to_vec();
+    vertical.splice(
+        13..14,
+        [
+            0x2c04_0081, // v_lshrrev_b32_e32 v2, 1, v0
+            0x3604_0481, // v_and_b32_e32 v2, 1, v2
+        ],
+    );
+    for program in [&words[..], &vertical] {
+        let (shader, lowered) = build_compute(program, None, true, narrow, io);
+        assert!(lowered.has_quad_read);
+        check_layout(&shader, [64, 1, 1], None);
+        for (label, got) in run(&shader, &views) {
+            assert_eq!(got, expected, "{label}");
+            eprintln!("{label}: all 64 guest coordinates and four mip levels verified");
         }
     }
 }

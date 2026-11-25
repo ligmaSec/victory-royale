@@ -87,6 +87,7 @@ pub(crate) struct Parts<'a> {
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
+    NeedsNativeWave,
     Fail(ShaderError),
 }
 
@@ -94,21 +95,21 @@ const UNTRACKED_SELECT: Why = "a select on an untracked mask";
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_with_wave32(parts, true, None, None)
+    lower_with_waves(parts, super::ComputeWaves::with_wave32(true), None, None)
 }
 
-pub(crate) fn lower_with_wave32(
+pub(crate) fn lower_with_waves(
     parts: &Parts,
-    allow_wave32: bool,
+    waves: super::ComputeWaves,
     pixel_inputs: Option<&[SigElement]>,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<Lowered, ShaderError> {
-    match lower_program(parts, false, allow_wave32, pixel_inputs, view_stride) {
+    match lower_program(parts, false, waves, pixel_inputs, view_stride) {
         Err(ShaderError::Unsupported {
             what: UNTRACKED_SELECT,
             ..
         }) if parts.native.stage == HwStage::Cs => {
-            lower_program(parts, true, allow_wave32, pixel_inputs, view_stride)
+            lower_program(parts, true, waves, pixel_inputs, view_stride)
         }
         result => result,
     }
@@ -117,14 +118,14 @@ pub(crate) fn lower_with_wave32(
 fn lower_program(
     parts: &Parts,
     numeric_selects: bool,
-    allow_wave32: bool,
+    waves: super::ComputeWaves,
     pixel_inputs: Option<&[SigElement]>,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    let mut waves = waves;
     loop {
-        match Lower::new(parts, &bad, numeric_selects, allow_wave32, view_stride).run(pixel_inputs)
-        {
+        match Lower::new(parts, &bad, numeric_selects, waves, view_stride).run(pixel_inputs) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -133,6 +134,10 @@ fn lower_program(
                         what: "a phi that does not settle",
                     });
                 }
+            }
+            Err(Stop::NeedsNativeWave) => {
+                waves.narrow_quads = false;
+                bad.clear();
             }
             Err(Stop::Fail(e)) => return Err(e),
         }
@@ -257,6 +262,8 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// Original group dimensions when four consecutive flat ids form one host quad.
+    flat_quads: Option<[u32; 3]>,
     /// Retry a compute shader with numeric selects only when the normal
     /// translation needs one. Unused selects need no fixed wave size.
     numeric_selects: bool,
@@ -501,7 +508,7 @@ impl<'a> Lower<'a> {
         x: &'a Parts<'a>,
         bad: &'a HashMap<Value, Why>,
         numeric_selects: bool,
-        allow_wave32: bool,
+        waves: super::ComputeWaves,
         view_stride: Option<ViewStride<'a>>,
     ) -> Self {
         let p = x.p;
@@ -520,6 +527,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
+        let mut flat_quads = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -572,13 +580,33 @@ impl<'a> Lower<'a> {
             // independent lane exchange outside those sections), lowering it
             // with WaveSize(32) matches the 64-lane reduction identically on
             // 32-lane hosts (`thread_id()` reads `s.wave_size = 32`).
-            let one_wave32 = allow_wave32
+            let one_wave32 = waves.wave32
                 && x.native.wave64
                 && threads == 32
                 && s.lds_dwords == 0
                 && !masks_held
                 && super::wave::single_wave32_reductions(p);
-            if one_wave32 {
+            // Explicit gradients only read lanes 0, 1 and 2 of each quad. A
+            // one-dimensional host group gives each four consecutive flat
+            // thread IDs the same quad as the console.
+            let quad_samples_only = waves.narrow_quads
+                && x.native.wave64
+                && threads == 64
+                && s.lds_dwords == 0
+                && !masks_held
+                && !numeric_selects
+                && insts().any(|i| implicit_derivatives(i.name()))
+                && insts().all(|i| {
+                    (!is_console_lane_op(i) || implicit_derivatives(i.name()))
+                        && !matches!(i.name(), "v_readfirstlane_b32" | "s_barrier")
+                        && !i.name().starts_with("ds_")
+                })
+                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+            if quad_samples_only {
+                flat_quads = Some(cs.threads);
+                s.threads = Some([threads, 1, 1]);
+                console_lanes = false;
+            } else if one_wave32 {
                 s.wave_size = Some(32);
             } else if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -670,6 +698,7 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            flat_quads,
             numeric_selects,
             flat: None,
             no_barrier,
@@ -1198,6 +1227,11 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        // Lowering can also introduce whole-wave operations for implicit masks.
+        // Keep the native program when a dependency crosses a quad boundary.
+        if self.flat_quads.is_some() && self.s.m.uses_whole_wave() {
+            return Err(Stop::NeedsNativeWave);
+        }
         self.s.prune_pixel_inputs();
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
@@ -2445,7 +2479,9 @@ impl<'a> Lower<'a> {
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
             return Err("a cross-lane operation outside compute");
         }
-        debug_assert!(self.s.threads.is_none() || self.console_lanes);
+        debug_assert!(
+            self.s.threads.is_none() || self.console_lanes || (quad && self.flat_quads.is_some())
+        );
         self.s.flags |= flags::WAVE_OPS;
         Ok(())
     }
@@ -2456,10 +2492,10 @@ impl<'a> Lower<'a> {
     /// plus the lane index. (A bijection while each host wave holds a
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
-        if !self.console_lanes {
+        if !self.console_lanes && self.flat_quads.is_none() {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
-        let [x, y, _] = self.s.threads.expect("compute");
+        let [x, y, _] = self.flat_quads.or(self.s.threads).expect("compute");
         let e = self.s.entry;
         let i32t = self.s.t.i32;
         let flat = self.s.op(
@@ -2470,20 +2506,24 @@ impl<'a> Lower<'a> {
             96,
             &[],
         );
-        let first = self.s.op(
-            e,
-            "waveReadLaneFirst.i32",
-            Attr::NoUnwind,
-            i32t,
-            118,
-            &[flat],
-        );
-        let wave = self.s.wave_size.expect("set with console lanes");
-        let mask = self.s.m.i32(!(wave - 1));
-        let base = self.s.m.bin(e, Bin::And, first, mask);
-        let lane = self.lane_index();
-        let f = self.s.m.bin(e, Bin::Add, base, lane);
-        self.s.flags |= flags::WAVE_OPS;
+        let f = if self.console_lanes {
+            let first = self.s.op(
+                e,
+                "waveReadLaneFirst.i32",
+                Attr::NoUnwind,
+                i32t,
+                118,
+                &[flat],
+            );
+            let wave = self.s.wave_size.expect("set with console lanes");
+            let mask = self.s.m.i32(!(wave - 1));
+            let base = self.s.m.bin(e, Bin::And, first, mask);
+            let lane = self.lane_index();
+            self.s.flags |= flags::WAVE_OPS;
+            self.s.m.bin(e, Bin::Add, base, lane)
+        } else {
+            flat
+        };
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
         Val::I32(match c {
             0 => self.s.m.bin(e, Bin::URem, f, xk),
@@ -2627,25 +2667,39 @@ impl<'a> Lower<'a> {
     /// `scale` if given.
     fn quad_gradients(&mut self, coords: &[V], scale: Option<V>) -> Vec<V> {
         let c = self.cur;
-        let lane = self.lane_index();
-        let top = self.s.m.i32(!3);
-        let base = self.s.m.bin(c, Bin::And, lane, top);
-        let lanes: Vec<V> = (1..3u32)
-            .map(|k| {
+        let indices = if self.flat_quads.is_some() {
+            [0, 1, 2].map(|k| self.s.m.i32(k))
+        } else {
+            let lane = self.lane_index();
+            let mask = self.s.m.i32(!3);
+            let base = self.s.m.bin(c, Bin::And, lane, mask);
+            let [right, down] = [1, 2].map(|k| {
                 let k = self.s.m.i32(k);
                 self.s.m.bin(c, Bin::Or, base, k)
-            })
-            .collect();
+            });
+            [base, right, down]
+        };
         let fu = self.s.m.undef(self.s.t.f32);
         let mut g = vec![fu; 6];
         for (k, &x) in coords.iter().enumerate().take(3) {
             let xi = self.as_int(x);
             let at = |l: &mut Self, lane: V| {
-                let r = l.read_lane(xi, lane);
+                let r = if l.flat_quads.is_some() {
+                    l.s.op(
+                        c,
+                        "quadReadLaneAt.i32",
+                        Attr::NoUnwind,
+                        l.s.t.i32,
+                        122,
+                        &[xi, lane],
+                    )
+                } else {
+                    l.read_lane(xi, lane)
+                };
                 l.as_float(r)
             };
-            let origin = at(self, base);
-            for (d, &lane) in lanes.iter().enumerate() {
+            let origin = at(self, indices[0]);
+            for (d, &lane) in indices[1..].iter().enumerate() {
                 let there = at(self, lane);
                 let mut diff = self.s.m.bin(c, Bin::Sub, there, origin);
                 if let Some(s) = scale {

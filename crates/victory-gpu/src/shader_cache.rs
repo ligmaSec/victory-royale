@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{ComputeWaves, HostShader, StaticSampler, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -37,25 +37,26 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// Whether the active host adapter supports `WaveSize(32)` compute shaders.
-fn allow_wave32() -> bool {
+/// Use the offline translator's existing behavior until an adapter is available.
+fn wave_widths() -> ComputeWaves {
     #[cfg(windows)]
-    {
-        crate::host::host().is_none_or(|h| h.supports_wave32())
+    if let Some(host) = crate::host::host() {
+        return host.wave_widths();
     }
-    #[cfg(not(windows))]
-    {
-        true
+    ComputeWaves {
+        wave32: true,
+        narrow_quads: false,
     }
 }
 
 /// What identifies this build: the BLAKE3 of our executable file and of
 /// the translation settings it runs with (the loop limit and the clean-up
-/// passes, which a diagnostics build can change at run time, and whether
-/// Wave32 lowering is enabled for the active host adapter).
-fn build(wave32: bool) -> &'static [u8; 32] {
-    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
-    BUILD.get_or_init(|| {
+/// passes, which a diagnostics build can change at run time, and the active
+/// adapter's reduction and quad lowering choices).
+fn build(waves: ComputeWaves) -> &'static [u8; 32] {
+    static BUILD: [OnceLock<[u8; 32]>; 4] = [const { OnceLock::new() }; 4];
+    let widths = u8::from(waves.wave32) | (u8::from(waves.narrow_quads) << 1);
+    BUILD[usize::from(widths)].get_or_init(|| {
         let exe = std::env::current_exe().and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
@@ -68,7 +69,7 @@ fn build(wave32: bool) -> &'static [u8; 32] {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
-                bytes.push(u8::from(wave32));
+                bytes.push(widths);
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -86,12 +87,14 @@ fn build(wave32: bool) -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let wave32 = allow_wave32();
+    let waves = wave_widths();
     let translate = |c: &[u8]| {
-        victory_shader::emit::translate_with_wave32(c, wave32).map_err(|e| e.to_string())
+        victory_shader::emit::translate_for_adapter(c, waves, None)
+            .map(|(shader, _)| shader)
+            .map_err(|e| e.to_string())
     };
     match CACHE.get() {
-        Some(cache) => cached(cache, build(wave32), container, translate),
+        Some(cache) => cached(cache, build(waves), container, translate),
         None => translate(container),
     }
 }

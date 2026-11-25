@@ -22,7 +22,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::{Shader, Translated};
-use victory_shader::emit::{StructuredBinding, translate_with_view_strides};
+use victory_shader::emit::{StructuredBinding, translate_for_adapter};
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 type Strides = Vec<(StructuredBinding, u32)>;
@@ -109,15 +109,15 @@ impl Pending {
             if shader.translated().is_none() {
                 // Probe lowering with a valid annotation. Only the binding
                 // locations survive the probe; its DXIL never reaches D3D12.
-                translate_with_view_strides(
+                translate_for_adapter(
                     &shader.container,
-                    host.supports_wave32(),
-                    &|binding, required| {
+                    host.wave_widths(),
+                    Some(&|binding, required| {
                         required.then(|| {
                             bindings.borrow_mut().insert(binding);
                             4
                         })
-                    },
+                    }),
                 )
                 .ok()?;
             }
@@ -134,10 +134,10 @@ impl Pending {
                     return Some(shader.clone());
                 }
                 let accessed = std::cell::RefCell::new(BTreeSet::new());
-                let (host, mut used) = translate_with_view_strides(
+                let (host, mut used) = translate_for_adapter(
                     &shader.container,
-                    host.supports_wave32(),
-                    &|binding, _| {
+                    host.wave_widths(),
+                    Some(&|binding, _| {
                         let i = self
                             .strides
                             .binary_search_by_key(&binding, |&(key, _)| key)
@@ -145,7 +145,7 @@ impl Pending {
                         let stride = self.strides[i].1;
                         accessed.borrow_mut().insert((binding, stride));
                         Some(stride)
-                    },
+                    }),
                 )
                 .map_err(|error| {
                     tracing::warn!(?shader, %error, "shader with bound structured views refused");
