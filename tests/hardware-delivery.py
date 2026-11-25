@@ -90,6 +90,19 @@ class RequestDelivery(unittest.TestCase):
             with mock.patch.dict(self.source, change), self.assertRaises(ValueError):
                 keys.publication(7, "publisher", 22, comment)
 
+    def test_confirmation_names_the_requester_and_lists_reviewed_files(self):
+        for name, width in (("requester", 100), ("r" * 39, 52)):
+            label = f"Send encrypted diagnostics to @{name}"
+            page, _, _ = runner.report_ui.layout(label, "PR #7", ["Included files", "summary.txt", "main-events.csv"],
+                                                [("y", "Encrypt and send", "Send this ZIP.")], 0, 0, width, 24, False)
+            self.assertIn("@" + name, page)
+            self.assertIn("summary.txt", page)
+            self.assertIn("main-events.csv", page)
+            if width == 100:
+                actions = [("k", "Keep local and finish", "Keep this ZIP."), ("i", label, "Review files first.")]
+                menu, _, _ = runner.report_ui.layout("Hardware test results", "PR #7", [], actions, 0, 0, width, 24, False)
+                self.assertIn(label, menu)
+
     def test_published_stamp_covers_the_requester_key_and_both_builds(self):
         out = self.root / "kit.zip"
         build = {"run": 9, "revision": "f" * 40, "sha256": "0" * 64}
