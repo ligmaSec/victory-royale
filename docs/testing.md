@@ -16,10 +16,16 @@ Run `cargo xtask install-hooks` to enable it on commit.
 
 ## CI and private builds
 
-CI runs for pull requests, merge groups, and pushes to `main`. The **Regression
-gate** requires formatting, workflow and shell lint, asset policy, Linux and
-Windows workspace tests, the declared minimum Rust version, and the distribution
-test to pass. Failed, skipped, and cancelled prerequisite jobs fail the gate.
+Every pull request and push to `main` runs the documentation and asset checks.
+Changes limited to project guides and test READMEs finish there. Code, workflow,
+dependency, and other changes also run the Windows and Linux workspace suites,
+workflow lint, formatting, the minimum-Rust check, and the distribution test.
+Manual runs and merge-group checks use the full suite.
+
+A push merging a code PR can reuse its successful minimum-Rust job when the
+merged Git tree matches the one the job tested. Direct code pushes and merges
+without matching test evidence rerun it. The regression gate verifies the
+expected jobs for each path. A docs-only merge does not publish a binary.
 
 The distribution job builds the x86-64 Windows release on Linux and checks that
 all three compiled DXIL helpers are present in the executable. It unpacks the
