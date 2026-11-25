@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.request
 import zipfile
 
 REPO = "ligmaSec/victory-royale"
@@ -33,6 +34,16 @@ def github(endpoint, payload=None, method=None):
     return json.loads(result.stdout)
 
 
+def public_gist(endpoint):
+    # Actions uses an installation token for repository reads. Gists live
+    # outside that installation, and public registrations need no token.
+    request = urllib.request.Request("https://api.github.com/" + endpoint,
+                                     headers={"Accept": "application/vnd.github+json",
+                                              "User-Agent": "victory-hardware-request"})
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.load(response)
+
+
 def account(user):
     if (type(user["id"]) is not int or user["id"] < 1 or user.get("type") != "User"
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", user["login"])):
@@ -40,10 +51,10 @@ def account(user):
     return {"id": user["id"], "login": user["login"]}
 
 
-def registration(owner, gist_id):
+def registration(owner, gist_id, *, read=None):
     if not re.fullmatch("[0-9a-f]{32}", gist_id):
         raise ValueError("Invalid key registration ID.")
-    gist = github("gists/" + gist_id)
+    gist = (read or github)("gists/" + gist_id)
     if gist["id"] != gist_id or gist["public"] is not True or account(gist["owner"]) != owner:
         raise ValueError("The public registration does not belong to the requester.")
     entry = gist["files"].get(REGISTRATION, {})
@@ -53,18 +64,19 @@ def registration(owner, gist_id):
     return {"gist": gist_id, "key": key}
 
 
-def find_registration(owner):
+def find_registration(owner, *, read=None):
+    read = read or github
     found = []
     page = 1
     while True:
-        rows = github(f"users/{owner['login']}/gists?per_page=100&page={page}")
+        rows = read(f"users/{owner['login']}/gists?per_page=100&page={page}")
         found.extend(row["id"] for row in rows if row["public"] and REGISTRATION in row["files"])
         if len(rows) < 100:
             break
         page += 1
     if len(found) > 1:
         raise ValueError("Multiple public report keys are registered. Keep one registration.")
-    return registration(owner, found[0]) if found else None
+    return registration(owner, found[0], read=read) if found else None
 
 
 def publication(pr, actor, actor_id, comment):
@@ -83,7 +95,7 @@ def publication(pr, actor, actor_id, comment):
         if owner["id"] != actor_id:
             raise ValueError("The dispatch actor no longer matches this GitHub account.")
     try:
-        pinned = find_registration(owner)
+        pinned = find_registration(owner, read=public_gist)
     except ValueError as error:
         print(f"Private delivery unavailable for @{owner['login']}: {error}", file=sys.stderr)
         pinned = None

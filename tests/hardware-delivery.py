@@ -47,6 +47,7 @@ class RequestDelivery(unittest.TestCase):
         self.source = {"id": 567, "user": requester, "body": "/victory hardware-test\nCompare the opening.",
                        "issue_url": f"https://api.github.com/repos/{keys.REPO}/issues/7"}
         self.stack.enter_context(mock.patch.object(keys, "github", self.github))
+        self.stack.enter_context(mock.patch.object(keys, "public_gist", self.github))
         self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
 
     def github(self, path, payload=None, method=None):
@@ -77,6 +78,21 @@ class RequestDelivery(unittest.TestCase):
         if path.startswith("gists/"):
             return self.gists[path.split("/")[1]]
         self.fail(f"unexpected GitHub call {path}")
+
+    def test_publisher_uses_public_gists_and_authenticated_request_provenance(self):
+        gid = "a" * 32
+        self.gists[gid] = dict(id=gid, public=True, owner=requester,
+                              files={keys.REGISTRATION: {"content": "age1" + "q" * 58}})
+        with mock.patch.object(keys, "github", side_effect=self.github) as repository, \
+                mock.patch.object(keys, "public_gist", side_effect=self.github) as public:
+            binding = keys.publication(7, "publisher", 22, comment)
+            self.assertEqual(binding["registration"]["gist"], gid)
+            repository.assert_called_once_with(f"repos/{keys.REPO}/issues/comments/567")
+            self.assertEqual(public.call_args_list, [
+                mock.call("users/requester/gists?per_page=100&page=1"), mock.call("gists/" + gid)])
+            with mock.patch.dict(self.gists[gid], owner=publisher):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertIsNone(keys.publication(7, "publisher", 22, comment)["registration"])
 
     def test_delegation_validates_the_request_comment_and_handles_no_key(self):
         self.assertEqual(keys.publication(7, "publisher", 22, comment),
