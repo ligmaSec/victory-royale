@@ -189,6 +189,8 @@ class HardwareRequest(unittest.TestCase):
         self.assertIn(f"Local logs: {report}", stdout.getvalue())
         filtered, = temp.rglob("*-diagnostics.zip")
         self.assertIn(f"Filtered diagnostics: {filtered}", stdout.getvalue())
+        self.assertEqual(filtered.parent.name, "share")
+        self.assertEqual(list(filtered.parent.iterdir()), [filtered])
         with zipfile.ZipFile(filtered) as archive:
             self.assertEqual(set(archive.namelist()), {"summary.txt", "main-frames.csv", "candidate-frames.csv"})
         with zipfile.ZipFile(report) as archive:

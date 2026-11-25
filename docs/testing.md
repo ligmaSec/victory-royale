@@ -85,7 +85,8 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
    p95, longest frame time and stall counts for each build. You can open it
    locally before sending. Choose **i** for the private upload page and select
    the printed ZIP. Until a project inbox is configured, use the private destination
-   supplied by the requester. The runner saves both files in a temporary folder.
+   supplied by the requester. The printed `share` folder contains just the filtered
+   ZIP. The raw archive stays one directory up.
 
 **Raw logs may contain usernames, file paths, credentials or output from the title.**
 Keep `report.zip` local. Both sharing options use a fixed set of recognized

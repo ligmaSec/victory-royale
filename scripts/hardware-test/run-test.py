@@ -433,14 +433,15 @@ def run_request(manifest, options):
                 report = diagnostic_summary(request, results, windows, complete, destination)
                 summary_path = destination / "summary.txt"
                 summary_path.write_text(report, encoding="utf-8")
-                filtered = destination / f"victory-pr{request['pr']}-diagnostics.zip"
+                share = destination / "share"
+                share.mkdir()
+                filtered = share / (destination.name + "-diagnostics.zip")
                 with zipfile.ZipFile(filtered, "x", zipfile.ZIP_DEFLATED) as out:
                     for name in ("summary.txt", "main-frames.csv", "candidate-frames.csv"):
                         # Fixed ZIP metadata avoids recording local times or file modes.
                         entry = zipfile.ZipInfo(name)
                         out.writestr(entry, (destination / name).read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
                 share_result(request["pr"], report, filtered)
-
 
 
 if __name__ == "__main__":
