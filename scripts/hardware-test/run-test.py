@@ -15,18 +15,13 @@ import tempfile
 import textwrap
 import zipfile
 
+import report_keys
 import report_ui
 
-REPO = "ligmaSec/victory-royale"
+REPO = report_keys.REPO
 PACKAGE = "victory-proton-x86_64.tar.gz"
-# Only a reviewed runner change can select the recipient for private reports.
-REPORT_RECIPIENT = "age1mdqjdgme7frky259ez5xkmzylqafkjp3e8tms5flct2lh0h735hq4xjdkj"
-REPORT_MAINTAINER = "ligmaSec"
-AGE_RELEASE = "v1.3.2"
-AGE_PACKAGES = {
-    "linux": ("linux-amd64.tar.gz", "cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10"),
-    "win32": ("windows-amd64.zip", "f48d8f8f9ebe903ab5027ed067652f2cc1db94bc206976430133b905dcd8e8c7"),
-}
+# Stamped into the official extracted runner. A loose request cannot supply this value.
+PUBLISHED_SHA256 = None
 ROOT = Path(__file__).resolve().parent
 OUTGOING = ("summary.txt", "main-frames.csv", "candidate-frames.csv", "main-submissions.csv",
             "candidate-submissions.csv", "main-events.csv", "candidate-events.csv")
@@ -65,7 +60,11 @@ def digest(path):
 
 
 def read_request(path):
-    request = json.loads(path.read_text(encoding="utf-8"))
+    return parse_request(path.read_bytes())
+
+
+def parse_request(data):
+    request = json.loads(data)
     if (request["version"] != 1 or type(request["pr"]) is not int or request["pr"] < 1
             or not isinstance(request["scenario"], str) or not request["scenario"].strip()
             or not request["scenario"].isprintable()):
@@ -88,7 +87,7 @@ def stage_build(request, side, folder, packages):
     if not archive.is_file():
         if not shutil.which("gh"):
             raise ValueError("The request is missing its packages. Extract the entire kit or install GitHub CLI.")
-        subprocess.run(["gh", "run", "download", str(build["run"]), "-R", REPO,
+        subprocess.run(["gh", "run", "download", str(build["run"]), "-R", "github.com/" + REPO,
                         "-n", artifact, "-D", str(folder)], check=True)
         archive = folder / PACKAGE
     if digest(archive) != build["sha256"]:
@@ -166,7 +165,7 @@ def github_rows(endpoint, query):
     if not shutil.which("gh"):
         raise ValueError("Published requests need GitHub CLI. Install gh and run gh auth login, "
                          "or pass a downloaded kit ZIP to this command.")
-    result = subprocess.run(["gh", "api", "--paginate", f"repos/{REPO}/{endpoint}", "--jq", query],
+    result = subprocess.run(["gh", "api", "--hostname", "github.com", "--paginate", f"repos/{REPO}/{endpoint}", "--jq", query],
                             capture_output=True, encoding="utf-8")
     if result.returncode:
         raise ValueError(f"GitHub lookup failed: {result.stderr.strip()}\n"
@@ -229,7 +228,7 @@ def select_published(number, list_only, folder):
         print("This request has no unexpired kit published from main.")
         return None
     print(f"Downloading the Series X test for PR #{number}…", flush=True)
-    subprocess.run(["gh", "run", "download", str(run_id), "-R", REPO, "-n", artifact, "-D", str(folder)],
+    subprocess.run(["gh", "run", "download", str(run_id), "-R", "github.com/" + REPO, "-n", artifact, "-D", str(folder)],
                    check=True)
     manifest = folder / "request.json"
     if not manifest.is_file():
@@ -241,6 +240,25 @@ def select_published(number, list_only, folder):
     if [parent["sha"] for parent in parents] != [request["main"]["revision"], pull["head"]]:
         raise ValueError(f"PR #{number} changed after this kit was built. Ask the requester to publish a fresh kit.")
     return manifest
+
+
+def official_archive(path, request):
+    run_id = request.get("publication_run")
+    if type(run_id) is not int or run_id < 1:
+        return False
+    try:
+        prefix = f"repos/{REPO}/actions/"
+        run = report_keys.github(prefix + f"runs/{run_id}")
+        if (run["path"] != ".github/workflows/hardware-request.yml" or run["head_branch"] != "main"
+                or run["head_repository"]["full_name"] != REPO or run["event"] != "workflow_dispatch"
+                or run["conclusion"] != "success"):
+            return False
+        expected = "sha256:" + digest(path)
+        name = f"victory-series-x-pr-{request['pr']}"
+        artifacts = report_keys.github(prefix + f"runs/{run_id}/artifacts")["artifacts"]
+        return any(a["name"] == name and a["digest"] == expected for a in artifacts)
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        return False
 
 
 def unpack_kit(path, folder, plan):
@@ -272,6 +290,7 @@ def run():
         parser.error("--list takes no request")
     with tempfile.TemporaryDirectory(prefix="victory-request-") as temporary:
         folder = Path(temporary)
+        options.trusted_digest = PUBLISHED_SHA256
         argument = options.request
         manifest = ROOT / "request.json"
         if options.list or (argument is None and not manifest.is_file()):
@@ -286,12 +305,22 @@ def run():
                 path = Path(argument).expanduser()
                 if not path.is_file():
                     raise ValueError(f"Cannot find {path}. Pass a PR number or an existing kit ZIP or request JSON.")
-                manifest = unpack_kit(path, folder, options.plan) if path.suffix.lower() == ".zip" else path
+                if path.suffix.lower() == ".zip":
+                    # Inspect and unpack the same snapshot even if the source is replaced.
+                    snapshot = folder / "kit.zip"
+                    shutil.copyfile(path, snapshot)
+                    manifest = unpack_kit(snapshot, folder, options.plan)
+                    if official_archive(snapshot, read_request(manifest)):
+                        options.trusted_digest = digest(manifest)
+                else:
+                    manifest = path
         if manifest is not None:
             # Execute tools only from our runner's directory or the official discovery path.
             # A supplied JSON or ZIP may describe game builds but cannot select an editor.
             from_picker = argument is None or re.fullmatch(r"#?[1-9][0-9]*", argument)
             options.review_kit = folder if from_picker and manifest.parent == folder else ROOT
+            if from_picker and manifest.parent == folder:
+                options.trusted_digest = digest(manifest)
             run_request(manifest, options)
 
 
@@ -481,38 +510,21 @@ def diagnostic_summary(request, results, windows, complete, destination):
 
 
 def encrypt_report(filtered, recipient):
-    # Only this file's native age recipient is accepted. No plugin or identity
-    # from a test request participates in encryption.
-    if not re.fullmatch(r"age1[023456789acdefghjklmnpqrstuvwxyz]{58}", recipient):
-        raise ValueError("Invalid project report recipient.")
-    with tempfile.TemporaryDirectory(prefix="victory-encrypt-") as temporary:
-        work = Path(temporary)
-        package, checksum = AGE_PACKAGES[sys.platform]
-        name = f"age-{AGE_RELEASE}-{package}"
-        subprocess.run(["gh", "release", "download", AGE_RELEASE, "-R", "github.com/FiloSottile/age",
-                        "-p", name, "-D", str(work)], check=True, capture_output=True)
-        archive = work / name
-        if digest(archive) != checksum:
-            raise ValueError("The age download failed its checksum.")
-        if sys.platform == "win32":
-            exe = work / "age.exe"
-            with zipfile.ZipFile(archive) as bundle, bundle.open("age/age.exe") as src, exe.open("xb") as out:
-                shutil.copyfileobj(src, out)
-        else:
-            exe = work / "age"
-            with tarfile.open(archive, "r:gz") as bundle, bundle.extractfile("age/age") as src, exe.open("xb") as out:
-                shutil.copyfileobj(src, out)
-            exe.chmod(0o700)
+    with report_keys.age_tool("age") as exe:
         return subprocess.check_output([str(exe), "--armor", "--recipient", recipient, str(filtered)],
                                        stderr=subprocess.PIPE).decode("ascii")
 
 
-def send_encrypted_report(filtered, recipient):
-    armor = encrypt_report(filtered, recipient)
+def send_encrypted_report(filtered, binding):
+    report_keys.verify(binding)
+    login = binding["requester"]["login"]
+    armor = encrypt_report(filtered, binding["registration"]["key"])
     # Always create explicitly unlisted on github.com. Only the encrypted file
     # is present, including when the second request (notification) fails.
     gist = {"public": False, "files": {"report.age": {"content": armor}}}
     api = ["gh", "api", "--hostname", "github.com"]
+    # The tool download and encryption can take time. Honor rotation during that interval.
+    report_keys.verify(binding)
     gist_id = subprocess.run([*api, "gists", "--input", "-", "--jq", ".id"], input=json.dumps(gist),
                              capture_output=True, text=True, check=True).stdout.strip()
     if not re.fullmatch(r"[0-9a-f]{32}", gist_id):
@@ -520,13 +532,14 @@ def send_encrypted_report(filtered, recipient):
     # Record the receipt before notification so a failed mention needs no new upload.
     receipt = f"https://gist.github.com/{gist_id}"
     print(f"Encrypted report: {receipt}", flush=True)
-    notice = {"body": f"@{REPORT_MAINTAINER} A VIctory hardware report is ready."}
+    notice = {"body": f"@{login} A VIctory hardware report is ready. From the repository root, run "
+                      f"`python3 scripts/hardware-test/report-inbox.py receive {receipt}` (Windows: use py)."}
     result = subprocess.run([*api, f"gists/{gist_id}/comments", "--input", "-"], input=json.dumps(notice),
                             capture_output=True, text=True)
     if result.returncode:
-        print(f"Send the receipt privately to @{REPORT_MAINTAINER}. The notification was unsuccessful.")
+        print(f"Send the receipt privately to @{login}. The notification was unsuccessful.")
     else:
-        print(f"Notification posted for @{REPORT_MAINTAINER}.")
+        print(f"Notification posted for @{login}.")
 
 
 def review_result(filtered, kit, own_editor=False):
@@ -624,7 +637,7 @@ def report_overview(summary):
     return rows
 
 
-def share_result(pr, filtered, kit):
+def share_result(pr, filtered, kit, binding=None):
     context = f"Series X  ·  PR #{pr}"
     with zipfile.ZipFile(filtered) as archive:
         initial = archive.read("summary.txt").decode("utf-8") if "summary.txt" in archive.namelist() else ""
@@ -638,6 +651,16 @@ def share_result(pr, filtered, kit):
                                           text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
     except (OSError, subprocess.SubprocessError):
         account = None
+    login = binding["requester"]["login"] if binding else None
+    available = False
+    reason = (f"Private delivery unavailable. @{login} has no verified key for this kit." if login
+              else "Private delivery unavailable. Use a published requester-bound kit.")
+    if binding and binding["registration"] and account:
+        try:
+            report_keys.verify(binding)
+            available = True
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+            reason = f"Private delivery unavailable. Could not verify @{login}’s published key. Keep this ZIP local."
     status = "Check for usernames, paths and credentials before sharing."
     try:
         while True:
@@ -653,11 +676,14 @@ def share_result(pr, filtered, kit):
                 actions.append(("e", "Edit in my own editor", "Open working copies, edit or remove files, then apply locally."))
             if report.strip():
                 actions.append(("v", "Preview summary", "Read the exact summary that can appear on the public PR."))
-            if REPORT_RECIPIENT and account and names:
-                actions.append(("i", "Send encrypted diagnostics", "Review the recipient, GitHub account and included files before sending."))
+            if available and names:
+                actions.append(("i", f"Send encrypted diagnostics to @{login}",
+                                f"Send encrypted diagnostics to @{login}. Review the account and included files first."))
             if report.strip() and account:
                 actions.append(("p", "Post public summary", "Preview and confirm the text before posting under your GitHub account."))
             body = [status, "", *report_overview(report), "", f"{len(names)} outgoing files  ·  Raw logs stay local"]
+            if not available and (account or not binding or not binding["registration"]):
+                body.append(reason)
             if not account:
                 body.append("Sharing requires GitHub CLI signed in to github.com. Local review is available.")
             action = report_ui.choose("Hardware test results", context, body, actions, "k", "k")
@@ -688,18 +714,21 @@ def share_result(pr, filtered, kit):
                     print("Public post unconfirmed. Check the PR before retrying.")
                 break
             if action == "i":
-                confirmed = report_ui.choose("Send encrypted diagnostics?", context,
-                    [f"Recipient: @{REPORT_MAINTAINER}", f"GitHub account: {account}", "",
+                confirmed = report_ui.choose(f"Send encrypted diagnostics to @{login}", context,
+                    [f"Recipient: @{login}", f"GitHub account: {account}", "", "Included files", *names, "",
                      "The runner encrypts these files locally, then uploads ciphertext to an unlisted GitHub Gist.",
-                     "GitHub sees your account, upload time and size. Anyone with the link can retrieve the ciphertext.",
-                     "", "Included files", *names],
+                     "GitHub sees your account, upload time and size. Anyone with the link can retrieve the ciphertext."],
                     [("b", "Back to results", "Return without sending."),
-                     ("y", "Encrypt and send", "Only the maintainer's report key can decrypt these files.")], "b", "b")
+                     ("y", "Encrypt and send", "Only the requester's report key can decrypt these files.")], "b", "b")
                 if confirmed != "y":
                     continue
                 try:
-                    send_encrypted_report(filtered, REPORT_RECIPIENT)
-                except (OSError, ValueError, subprocess.SubprocessError):
+                    send_encrypted_report(filtered, binding)
+                except (ValueError, KeyError):
+                    available = False
+                    reason = "Private delivery unavailable. Key verification failed. Keep this ZIP local."
+                    continue
+                except (OSError, subprocess.SubprocessError):
                     print("Private delivery unconfirmed. Check your gists before retrying. GitHub CLI needs gist access.")
                 break
             break
@@ -709,10 +738,18 @@ def share_result(pr, filtered, kit):
 
 
 def run_request(manifest, options):
-    request = read_request(manifest)
+    data = manifest.read_bytes()
+    request = parse_request(data)
+    binding = request.get("delivery") if hashlib.sha256(data).hexdigest() == options.trusted_digest else None
     print(f"VIctory PR #{request['pr']} | Series X | two launches", flush=True)
     instruction_block(PRIVACY_HEADING, LOG_PRIVACY + " Your reports stay on this machine until you choose to share.")
     if options.plan:
+        if binding:
+            owner = binding["requester"]["login"]
+            print(f"Private delivery: @{owner}" if binding["registration"] else
+                  f"Private delivery unavailable: @{owner} has no registered key for this kit.")
+        else:
+            print("Private delivery unavailable for this request.")
         for side in ("main", "candidate"):
             build = request[side]
             print(f"{side}: {build['revision'][:12]}  https://github.com/{REPO}/actions/runs/{build['run']}")
@@ -766,7 +803,7 @@ def run_request(manifest, options):
                         # Fixed ZIP metadata avoids recording local times or file modes.
                         entry = zipfile.ZipInfo(name)
                         out.writestr(entry, (destination / name).read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
-                share_result(request["pr"], filtered, options.review_kit)
+                share_result(request["pr"], filtered, options.review_kit, binding)
 
 
 if __name__ == "__main__":

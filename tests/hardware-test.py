@@ -28,6 +28,10 @@ def load(name):
 sys.path.insert(0, str(SCRIPTS))
 runner = load("run-test")
 prepare = load("prepare")
+inbox = load("report-inbox")
+keys = runner.report_keys
+REQUESTER = {"id": 83, "login": "test-requester"}
+BINDING = {"requester": REQUESTER, "registration": {"key": "fixture", "gist": "e" * 32}}
 
 
 class HardwareRequest(unittest.TestCase):
@@ -56,7 +60,7 @@ class HardwareRequest(unittest.TestCase):
         self.output = self.root / "out"
 
     def fake_download(self, args, check):
-        self.assertEqual(args[:6], ["gh", "run", "download", "12", "-R", runner.REPO])
+        self.assertEqual(args[:6], ["gh", "run", "download", "12", "-R", "github.com/" + runner.REPO])
         shutil.copy(self.package, Path(args[-1]) / runner.PACKAGE)
 
     def test_bundled_build_offline(self):
@@ -126,7 +130,7 @@ class HardwareRequest(unittest.TestCase):
     def test_published_request(self):
         available = {7: ({"title": "First scene", "head": "current"}, 12, "victory-series-x-pr-7")}
         def download(args, check):
-            self.assertEqual(args[:-1], ["gh", "run", "download", "12", "-R", runner.REPO,
+            self.assertEqual(args[:-1], ["gh", "run", "download", "12", "-R", "github.com/" + runner.REPO,
                                          "-n", "victory-series-x-pr-7", "-D"])
             shutil.copy(self.manifest, Path(args[-1]) / "request.json")
         parents = [{"sha": self.revision}, {"sha": "current"}]
@@ -343,14 +347,14 @@ class HardwareRequest(unittest.TestCase):
         safe = self.outgoing_zip("Preview")
         for key, login, choice, sent in ((None, True, "i", False), ("configured", False, "i", False),
                                          ("configured", True, "", False), ("configured", True, "i", True)):
-            with mock.patch.object(sys.stdin, "isatty", return_value=True), mock.patch.object(runner, "REPORT_RECIPIENT", key), \
+            with mock.patch.object(sys.stdin, "isatty", return_value=True), mock.patch.object(keys, "verify"), \
                     mock.patch.object(subprocess, "check_output", side_effect=None if login else FileNotFoundError,
                                       return_value="fixture-account"), mock.patch("builtins.input", side_effect=[choice, "y", ""]), \
                     mock.patch.object(runner, "send_encrypted_report") as send, contextlib.redirect_stdout(io.StringIO()) as output:
-                runner.share_result(7, safe, self.root)
+                runner.share_result(7, safe, self.root, BINDING if key else None)
             self.assertEqual(send.called, sent)
             if sent:
-                send.assert_called_once_with(safe, key)
+                send.assert_called_once_with(safe, BINDING)
                 self.assertIn("fixture-account", output.getvalue())
 
     def test_review_applies_exact_edits_and_ignores_unrelated_files(self):
@@ -374,9 +378,10 @@ class HardwareRequest(unittest.TestCase):
                     mock.patch.object(subprocess, "check_output", return_value="account"), \
                     mock.patch.object(subprocess, "run") as post, \
                     mock.patch.object(runner, "send_encrypted_report") as send, contextlib.redirect_stdout(io.StringIO()):
-                runner.share_result(7, filtered, self.root)
+                with mock.patch.object(keys, "verify"):
+                    runner.share_result(7, filtered, self.root, BINDING)
             if destination == "i":
-                send.assert_called_once_with(filtered, runner.REPORT_RECIPIENT)
+                send.assert_called_once_with(filtered, BINDING)
                 post.assert_not_called()
             else:
                 self.assertEqual(post.call_args.kwargs["input"], "Reviewed ☀".encode())
@@ -450,7 +455,8 @@ class HardwareRequest(unittest.TestCase):
                 "module=runpy.run_path('run-test.py'); "
                 "patch('subprocess.check_output',return_value='fixture').start(); "
                 "patch('subprocess.run',side_effect=AssertionError('unexpected network or launcher')).start(); "
-                "module['share_result'](43,Path(sys.argv[1]),Path(sys.argv[2]))")
+                "patch('report_keys.verify').start(); "
+                f"module['share_result'](43,Path(sys.argv[1]),Path(sys.argv[2]),{BINDING!r})")
         child = subprocess.Popen([sys.executable, "-B", "-c", code, str(filtered), str(self.root)], cwd=SCRIPTS,
                                  stdin=slave, stdout=slave, stderr=slave, env={**os.environ, "TERM": "xterm-256color"})
         os.close(slave)
@@ -505,18 +511,18 @@ class HardwareRequest(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 0, stdout=gist_id)
                 self.assertEqual(command[4], f"gists/{gist_id}/comments")
                 self.assertEqual(list(body), ["body"])
-                self.assertIn("@" + runner.REPORT_MAINTAINER, body["body"])
+                self.assertIn("@" + REQUESTER["login"], body["body"])
                 self.assertNotIn("canary", body["body"])
                 return subprocess.CompletedProcess(command, notify_status)
-            with mock.patch.object(runner, "encrypt_report", return_value="ciphertext"), \
+            with mock.patch.object(keys, "verify"), mock.patch.object(runner, "encrypt_report", return_value="ciphertext"), \
                     mock.patch.object(subprocess, "run", side_effect=github) as api, contextlib.redirect_stdout(io.StringIO()) as out:
-                runner.send_encrypted_report(filtered, "recipient")
+                runner.send_encrypted_report(filtered, BINDING)
             self.assertEqual(api.call_count, 2)
             self.assertIn(f"https://gist.github.com/{gist_id}", out.getvalue())
             self.assertIn("unsuccessful" if notify_status else "Notification posted", out.getvalue())
-        with mock.patch.object(runner, "encrypt_report", side_effect=ValueError("bad checksum")), \
+        with mock.patch.object(keys, "verify"), mock.patch.object(runner, "encrypt_report", side_effect=ValueError("bad checksum")), \
                 mock.patch.object(subprocess, "run", side_effect=AssertionError), self.assertRaises(ValueError):
-            runner.send_encrypted_report(filtered, "recipient")
+            runner.send_encrypted_report(filtered, BINDING)
 
     def test_private_timeline_correlates_builds_without_exporting_raw_identifiers(self):
         import csv
