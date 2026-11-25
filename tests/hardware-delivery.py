@@ -136,6 +136,44 @@ class RequestDelivery(unittest.TestCase):
                 zip_out.writestr("modified", "new bytes")
             self.assertFalse(runner.official_archive(out, request))
 
+    def test_collects_a_truncated_gist_using_its_pinned_raw_revision(self):
+        body = b"synthetic armored report"
+        token = (receipt + " " + hashlib.sha256(body).hexdigest()).encode()
+        url = f"https://gist.githubusercontent.com/tester/{receipt}/raw/{'1' * 40}/report.age"
+        entry = dict(truncated=True, size=len(body), raw_url=url)
+        gist = dict(id=receipt, public=False, owner=tester, files={"report.age": entry})
+        with mock.patch.object(keys, "github", return_value=gist), \
+                mock.patch.object(subprocess, "check_output", return_value=token), \
+                mock.patch.object(inbox.urllib.request, "urlopen", return_value=io.BytesIO(body)) as raw, \
+                mock.patch.object(inbox, "save_report") as save:
+            inbox.collect_comment("age", [], {"user": tester}, "armor", self.root)
+            raw.assert_called_once_with(url, timeout=30)
+            save.assert_called_once()
+            for changed in (dict(raw_url=url.replace("gist.githubusercontent.com", "other.example")),
+                            dict(size=keys.MAX_COLLECTED_CIPHER + 1)):
+                with mock.patch.dict(entry, changed), self.assertRaises(ValueError):
+                    inbox.collect_comment("age", [], {"user": tester}, "armor", self.root)
+            self.assertEqual(raw.call_count, 1)
+
+    def test_scans_past_unrelated_comments_and_retries_failed_receipts(self):
+        folder = self.root / "keys"
+        folder.mkdir()
+        (folder / "age1fixture.agekey").touch()
+        comments = [{"id": i, "updated_at": "v1", "body": "other"} for i in range(100)]
+        last = {"id": 105, "updated_at": "v2", "body": keys.RECEIPT_HEADER + "fixture"}
+        with mock.patch.object(keys, "find_registration", return_value={"gist": receipt}), \
+                mock.patch.object(keys, "github", side_effect=[comments, [last], comments, [last]]) as pages, \
+                mock.patch.object(keys, "age_tool", side_effect=lambda _: contextlib.nullcontext("age")), \
+                mock.patch.object(inbox, "collect_comment", side_effect=[OSError, None]) as decrypt, \
+                contextlib.redirect_stderr(io.StringIO()):
+            seen = set()
+            inbox.collect(requester, folder, self.root, seen)
+            self.assertFalse(seen)
+            inbox.collect(requester, folder, self.root, seen)
+            self.assertEqual(seen, {(105, "v2")})
+            self.assertEqual(decrypt.call_count, 2)
+            self.assertEqual([call.args[0].split("page=")[-1] for call in pages.call_args_list], ["1", "2", "1", "2"])
+
     def test_only_the_verified_requester_decrypts_the_reviewed_zip(self):
         # CI requires the pinned tools on both platforms. Offline contributors can use installed age.
         tools = {}
@@ -239,7 +277,37 @@ class RequestDelivery(unittest.TestCase):
             runner.run()
             prompt.assert_called_once()
         self.assertFalse(delivery)
-        runner.send_encrypted_report(filtered, binding)
+        token = runner.send_encrypted_report(filtered, binding)
+        public_comments = []
+        registration = binding["registration"]["gist"]
+        def with_mailbox(path, payload=None, method=None):
+            if path == f"gists/{registration}/comments":
+                self.assertEqual(self.viewer, tester)
+                public_comments.append(dict(payload, id=19, user=tester, updated_at="v1"))
+                return {}
+            if path == f"gists/{registration}/comments?per_page=100&page=1":
+                return public_comments
+            if path == f"gists/{receipt}":
+                cipher = delivery["cipher"]
+                return dict(id=receipt, public=False, owner=tester, files={"report.age":
+                            dict(content=cipher, size=len(cipher), truncated=False)})
+            return self.github(path, payload, method)
+        self.stack.enter_context(mock.patch.object(keys, "github", with_mailbox))
+        with mock.patch.object(runner.report_ui, "choose", return_value="k") as consent:
+            runner.offer_collection(token, binding, "PR #7")
+            self.assertIn("GitHub username and posting time", " ".join(consent.call_args.args[2]))
+            self.assertEqual(consent.call_args.args[-2:], ("k", "k"))
+        self.assertFalse(public_comments)
+        with mock.patch.object(runner.report_ui, "choose", return_value="a"):
+            runner.offer_collection(token, binding, "PR #7")
+        notice = public_comments[0]["body"]
+        self.assertTrue(notice.startswith(keys.RECEIPT_HEADER + "-----BEGIN AGE ENCRYPTED FILE-----"))
+        for hidden in (receipt, token, "summary.txt", "reviewed synthetic content", "PR #7"):
+            self.assertNotIn(hidden, notice)
+        wrong_keys = list(folders["publisher"].glob("age1*.agekey"))
+        with self.assertRaises(subprocess.CalledProcessError):
+            inbox.collect_comment(tools["age"], wrong_keys, public_comments[0], notice[len(keys.RECEIPT_HEADER):],
+                                  self.root / "wrong")
         self.assertIn("@requester", delivery["notice"])
         self.assertIn("receive https://gist.github.com/" + receipt, delivery["notice"])
         self.viewer = publisher
@@ -253,6 +321,24 @@ class RequestDelivery(unittest.TestCase):
             runner.send_encrypted_report(filtered, binding)
         command("receive", receipt, "--output-dir", str(self.root / "right"))
         command("receive", receipt, "--output-dir", str(self.root / "right"))
+        # Comments are public and editable. Only accept the submitting account's exact ciphertext.
+        automatic = self.root / "automatic"
+        original = delivery["cipher"]
+        delivery["cipher"] += "x"
+        with contextlib.redirect_stderr(io.StringIO()):
+            command("collect", "--output-dir", str(automatic))
+            delivery["cipher"] = original
+            with mock.patch.dict(public_comments[0], user=publisher):
+                command("collect", "--output-dir", str(automatic))
+        self.assertFalse(list(automatic.glob("*.zip")))
+        seen = set()
+        inbox.collect(keys.account(requester), folders["requester"], automatic, seen)
+        self.assertEqual(seen, {(19, "v1")})
+        with mock.patch.object(inbox, "collect_comment", side_effect=AssertionError):
+            inbox.collect(keys.account(requester), folders["requester"], automatic, seen)
+        command("collect", "--output-dir", str(automatic))
+        auto_report, = automatic.glob("*.zip")
+        self.assertEqual(auto_report.read_bytes(), filtered.read_bytes())
         saved, = (self.root / "right").glob("*.zip")
         self.assertEqual(saved.read_bytes(), filtered.read_bytes())
         with zipfile.ZipFile(saved) as z:

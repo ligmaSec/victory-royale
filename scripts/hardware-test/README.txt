@@ -33,6 +33,9 @@ your account before sending. It downloads a checksum-verified age tool, encrypts
 the filtered ZIP and returns an unlisted GitHub Gist receipt. GitHub sees your
 account, upload time and size. Anyone with the receipt can retrieve the encrypted
 file. The requester receives a GitHub notification and decrypts the ZIP locally.
+After sending, Finish privately is the default. Publish encrypted receipt lets
+the requester collect your ZIP automatically. Your username and posting time
+will be public on their key Gist. The link and diagnostics stay encrypted.
 When the kit has no verified requester key, or the key has changed, keep your
 diagnostics local and ask for a fresh kit. Offline runs still
 save a shareable ZIP with frame times, submission costs and shader events.

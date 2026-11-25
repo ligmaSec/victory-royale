@@ -540,6 +540,33 @@ def send_encrypted_report(filtered, binding):
         print(f"Send the receipt privately to @{login}. The notification was unsuccessful.")
     else:
         print(f"Notification posted for @{login}.")
+    if len(armor) > report_keys.MAX_COLLECTED_CIPHER:
+        print("Use the private receipt. This report exceeds the automatic collection limit.")
+        return None
+    return gist_id + " " + hashlib.sha256(armor.encode("ascii")).hexdigest()
+
+
+def offer_collection(receipt, binding, context):
+    login = binding["requester"]["login"]
+    confirmed = report_ui.choose("Allow automatic collection?", context,
+        [f"Your encrypted report has been uploaded for @{login}.", "",
+         "Anyone can see your GitHub username and posting time on the requester's public key Gist.",
+         "The report link is encrypted. The public comment contains no logs or file names."],
+        [("k", "Finish privately", "Use the existing private Gist notification."),
+         ("a", "Publish encrypted receipt", f"Let @{login} collect this report automatically.")], "k", "k")
+    if confirmed == "a":
+        try:
+            registration = binding["registration"]
+            report_keys.verify(binding)
+            with report_keys.age_tool("age") as age:
+                armor = subprocess.check_output([str(age), "--armor", "--recipient", registration["key"]],
+                                                input=receipt.encode("ascii"), stderr=subprocess.PIPE).decode("ascii")
+            report_keys.verify(binding)
+            report_keys.github(f"gists/{registration['gist']}/comments",
+                               {"body": report_keys.RECEIPT_HEADER + armor})
+            print("Encrypted receipt published for automatic collection.")
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+            print(f"Automatic collection unconfirmed. Keep the private receipt for @{login}.")
 
 
 def review_result(filtered, kit, own_editor=False):
@@ -723,7 +750,9 @@ def share_result(pr, filtered, kit, binding=None):
                 if confirmed != "y":
                     continue
                 try:
-                    send_encrypted_report(filtered, binding)
+                    receipt = send_encrypted_report(filtered, binding)
+                    if receipt:
+                        offer_collection(receipt, binding, context)
                 except (ValueError, KeyError):
                     available = False
                     reason = "Private delivery unavailable. Key verification failed. Keep this ZIP local."

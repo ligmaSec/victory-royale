@@ -109,6 +109,11 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
    A mention on the gist notifies the requester. Your account, gist size and
    upload time are visible to GitHub. Anyone with the URL can retrieve the
    ciphertext. The named requester's private age key is needed to read its contents.
+   After delivery, **Finish privately** is selected. If you choose **Publish encrypted receipt**,
+   the runner posts an encrypted copy of the report link and checksum on the requester's
+   public key-registration Gist. Anyone can see your GitHub username, the requester and the
+   posting time. The comment contains no readable report link, file names or logs.
+   This lets the requester collect the ZIP automatically.
    Keep the receipt if notification fails. You can delete the gist from your account.
 
 **Raw logs may contain usernames, file paths, credentials or output from the title.**
@@ -140,6 +145,20 @@ You can also copy the Gist link into this command. Open the reviewed files local
 ```sh
 python3 scripts/hardware-test/report-inbox.py receive GIST_URL
 ```
+
+To collect opted-in reports automatically, run this on the machine with your requester keys.
+
+```sh
+python3 scripts/hardware-test/report-inbox.py collect --watch
+```
+
+Leave it running. It checks your registration every five minutes, writes complete reviewed ZIPs
+to `~/uploads` and prints their paths. Ctrl+C stops the watcher. Omit `--watch` for one pass,
+or use `--output-dir` to select a folder. It picks up receipts posted while the watcher
+was stopped. Repeated scans preserve existing reports. Files stay zipped until you open them.
+Automatic collection accepts encrypted uploads up to 16 MiB and reserves up to 512 MiB for
+received reports in the output folder. Move older ZIPs elsewhere if it fills up. Use the
+private `receive` command for larger files, older kits, or testers who finish privately.
 
 Run `python3 scripts/hardware-test/report-inbox.py rotate` to publish a fresh key.
 Back up the folder again. Old identities stay there and can decrypt reports
