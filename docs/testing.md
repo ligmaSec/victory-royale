@@ -76,6 +76,17 @@ cargo test -p victory-shader --locked
 cargo test -p victory-shader --locked -- <test name> --nocapture
 ```
 
+## Comparing frame pacing
+
+Keep the build settings, driver, window size and launch sequence the same. Compare
+the menu and first scene after loading separately. Release logs include a
+`present intervals` line for every five seconds of completed frame intervals
+(or 4,096 intervals at high rates). Each line gives the sample count, mean,
+median, nearest-rank p95, longest interval and counts over 100 ms and one second.
+These are wall-clock times between successful host presents. Startup before
+the first present and gaps while DXGI reports an occluded window are excluded.
+A stall appears in the log when presentation resumes.
+
 ## Tests that skip or are ignored
 
 * **Differential shader tests** (`victory-shader/src/emit/diff_tests.rs`)
