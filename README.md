@@ -30,13 +30,13 @@ Install UMU (`umu-run`) and extract the verified Proton build from a successful
 
 ```sh
 ./victory-proton.sh --test                                # check the launcher offline
-./victory-proton.sh --run "/path/to/title.exe"            # use your Proton runtime
-./victory-proton.sh --report --runtime pinned "/path/to/title.exe"  # compare with the project runtime
+./victory-proton.sh --run "/path/to/title.exe"             # launch with pinned vkd3d-proton
+./victory-proton.sh --report "/path/to/title.exe"          # same runtime, with diagnostic logs
 ```
 
 `--report` launches once and prints the path to a compressed diagnostic archive
-when the process exits. Use `--report` alone to capture the default runtime.
-The pinned runtime downloads on first use and is verified before each launch.
+when the process exits. Both modes download pinned vkd3d-proton on first use
+and verify the cache on each launch. Add `--runtime proton` to use Proton's own libraries.
 Contributors running from source use
 `./scripts/victory-proton.sh --build` after installing the cross-toolchain,
 then the same commands with `./scripts/victory-proton.sh`.

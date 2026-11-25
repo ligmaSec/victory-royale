@@ -11,8 +11,8 @@ Usage: victory-proton.sh --build | --test
   --build          Build the Windows release from a source checkout with LLVM-MinGW.
   --run            Execute the title.
   --report         Execute once and save the launcher and Proton logs in one archive.
-  --runtime pinned Use the project-pinned vkd3d-proton build. Fetch and verify it on first use.
-  --runtime proton Use the configured Proton runtime (default).
+  --runtime pinned Use the pinned vkd3d-proton build (default for --run and --report).
+  --runtime proton Use the vkd3d-proton libraries supplied by Proton.
   --vkd3d-dir DIR  Use the x64 d3d12.dll and d3d12core.dll from DIR for this run.
 
 With no mode, the launcher forwards the title and options to victory run.
@@ -133,6 +133,7 @@ binary=$(realpath -- "$binary")
 title=$(realpath -- "$1")
 shift
 if [[ -n $mode ]]; then
+    runtime=${runtime:-pinned}
     # Accept an existing --execute, including invocations migrated from the old syntax.
     execute=(--execute)
     for arg in "$@"; do

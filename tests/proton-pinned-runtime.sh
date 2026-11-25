@@ -26,7 +26,7 @@ UMU
 chmod +x "$work/tools/umu-run"
 
 # One anonymous download on a clean host, then an offline report using the cache.
-bash "$launcher" --run --runtime pinned "$work/title.exe"
+bash "$launcher" --run "$work/title.exe"
 test -s "$HOME/umu-called"
 cat > "$work/tools/curl" <<'CURL'
 #!/usr/bin/env bash
@@ -34,7 +34,7 @@ echo called > "$HOME/curl-called"
 exit 1
 CURL
 chmod +x "$work/tools/curl"
-bash "$launcher" --report --runtime pinned "$work/title.exe"
+bash "$launcher" --report "$work/title.exe"
 test ! -e "$HOME/curl-called"
 reports=("$XDG_DATA_HOME"/victory/reports/*.tar.gz)
 tar -xOf "${reports[0]}" ./build.txt | grep -Fxq 'runtime=pinned'

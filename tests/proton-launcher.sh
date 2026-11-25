@@ -110,11 +110,12 @@ if bash "$launcher" --runtime unknown "$work/game with spaces/title.exe" 2>/dev/
 mkdir -p "$work/source"
 touch "$work/source/.victory-root"
 ln -s "$work/source" "$work/data-link"
-if XDG_DATA_HOME="$work/data-link" bash "$launcher" --report "$work/game with spaces/title.exe" 2>/dev/null; then
+if XDG_DATA_HOME="$work/data-link" bash "$launcher" --report --runtime proton "$work/game with spaces/title.exe" 2>/dev/null; then
     exit 1
 fi
 test ! -d "$work/source/victory/reports"
 bash "$launcher" --run --runtime proton "$work/game with spaces/title.exe" --execute
+head -n 1 "$LAUNCH_RECORD" | diff -u <(printf '%s\n' "Z:$binary") -
 tail -n +4 "$LAUNCH_RECORD" | diff -u <(echo --execute) -
 
 # An extracted distribution finds the executable beside its launcher.
