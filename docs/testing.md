@@ -74,11 +74,12 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
    specified in the scenario.
 2. The **candidate** opens next. Repeat the same steps with the same settings and window
    size. The runner gives each build its own fresh translation cache.
-3. At **REPORT READY**, send the intact `report.zip` at the **Upload:** path to the
-   private destination in the request, or directly to the requester. The runner leaves
-   it in a new system temporary folder after exit. Send it before the system cleans
-   that folder. If the runner prints **Partial report:**, send that file and say
-   which run stopped.
+3. At **REPORT READY** or **TEST INTERRUPTED**, review the ZIP at the printed path.
+   **Logs may contain your username, local file paths, or other sensitive information.**
+   On Linux, also check the logs inside the nested `.tar.gz` files. If you are comfortable
+   sharing the contents, send the ZIP privately to the requester before the temporary
+   folder is cleaned. You can send a written summary instead. For a partial report,
+   say which run stopped.
 
 Tell the requester what you saw on each build. For example, say whether the first
 scene showed roads and vehicles or only lights and subtitles. Include your OS,
@@ -91,7 +92,10 @@ Run the [hardware kit workflow](../.github/workflows/hardware-request.yml) on
 `main` with the PR number and a short Series X scenario. Specify where to start,
 what to observe and when to close each run. Once it succeeds, send the tester the
 checkout command for their OS with the PR number appended, plus the private report
-destination. The menu also lists the request. If the PR head changes or the kit
+destination. Tell testers that logs can contain usernames, local paths and other
+sensitive information, and that they can reply with a written summary. Add the
+`tester wanted` label to the PR while the request is open.
+The menu also lists the request. If the PR head changes or the kit
 expires, publish a fresh kit for the current revision.
 
 For testers without a checkout, share the kit ZIP. To prepare one locally with a
@@ -104,7 +108,10 @@ python3 scripts/hardware-test/prepare.py PR_NUMBER --output test-kit.zip \
 ```
 
 The packager matches the successful PR build to its tested main parent and checks
-both artifact digests. If either build has expired, refresh the pair first.
+both artifact digests. A documentation-only push can pass CI without packaging a
+build. If the tested parent is the current head of `main`, run
+`gh workflow run ci.yml --ref main`. Wait for CI to finish, then prepare the kit
+again. If either revision has moved or expired, refresh the matched pair first.
 Post the tested revisions, configuration and observed differences on the PR. For
 performance comparisons, include frame times and stalls alongside average or median FPS.
 

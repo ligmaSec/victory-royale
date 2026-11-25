@@ -153,11 +153,11 @@ class HardwareRequest(unittest.TestCase):
                     mock.patch.object(runner, "run_request", side_effect=check_manifest):
                 runner.run()
 
-    def run_pair(self, launch):
+    def run_pair(self, launch, stdout=None):
         args = ["runner", str(self.manifest), "--title", str(self.title), "--output-dir", str(self.output)]
         with mock.patch.object(sys, "argv", args), mock.patch.object(shutil, "which", return_value="tool"), \
                 mock.patch.object(subprocess, "run", side_effect=self.fake_download), \
-                mock.patch.object(runner, "launch", side_effect=launch), contextlib.redirect_stdout(io.StringIO()):
+                mock.patch.object(runner, "launch", side_effect=launch), contextlib.redirect_stdout(stdout or io.StringIO()):
             runner.run()
 
     def test_instructions_at_launch_and_private_zip_in_temp(self):
@@ -182,7 +182,10 @@ class HardwareRequest(unittest.TestCase):
         report, = temp.rglob("*.zip")
         self.assertEqual(list(temp.iterdir()), [report.parent])
         self.assertIn("REPORT READY", stdout.getvalue())
-        self.assertIn("Send this ZIP privately", stdout.getvalue())
+        blocks = stdout.getvalue().split("REPORT READY")
+        self.assertIn("LOG PRIVACY", blocks[0].split("RUN 1 OF 2")[0])
+        self.assertIn("sensitive information", " ".join(blocks[1].split()))
+        self.assertIn("written summary", " ".join(blocks[1].split()))
         self.assertEqual(stdout.getvalue().rstrip().splitlines()[-1], f"Upload: {report}")
         with zipfile.ZipFile(report) as archive:
             self.assertEqual(set(archive.namelist()), {"request.json", "main.log", "candidate.log"})
@@ -204,8 +207,12 @@ class HardwareRequest(unittest.TestCase):
                 raise ValueError("test interruption")
             launched(side, *args)
 
+        stdout = io.StringIO()
         with self.assertRaisesRegex(ValueError, "interruption"):
-            self.run_pair(fail)
+            self.run_pair(fail, stdout)
+        notice = " ".join(stdout.getvalue().split("TEST INTERRUPTED")[1].split())
+        self.assertIn("sensitive information", notice)
+        self.assertIn("written summary", notice)
         partial, = set(self.output.glob("*/report.zip")) - set(bundles)
         with zipfile.ZipFile(partial) as archive:
             self.assertEqual(set(archive.namelist()), {"request.json", "main.log"})
@@ -239,6 +246,36 @@ class HardwareRequest(unittest.TestCase):
                 self.assertEqual((results / "main-exit.txt").read_text().strip(), "42")
                 if not windows:
                     self.assertEqual((results / "main.tar.gz").read_bytes(), b"this launch")
+
+    def test_main_ci_refresh_after_a_docs_only_push(self):
+        prefix = "victory-proton-x86_64-"
+        calls = []
+        def api(path):
+            calls.append(path)
+            if "ci.yml/runs?" in path:
+                self.assertIn("head_sha=" + self.revision, path)
+                self.assertIn("branch=main", path)
+                return {"workflow_runs": [
+                    {"id": 1, "event": "workflow_dispatch", "head_branch": "another"},
+                    {"id": 2, "event": "pull_request", "head_branch": "main"},
+                    {"id": 3, "event": "push", "head_branch": "main"},
+                    {"id": 12, "event": "workflow_dispatch", "head_branch": "main"},
+                ]}
+            if "/3/artifacts" in path:
+                return {"artifacts": []}
+            self.assertIn("/12/artifacts", path)
+            return {"artifacts": [{"name": prefix + rev, "expired": False}
+                                  for rev in ("b" * 40, self.revision)]}
+
+        def download(args, check):
+            self.fake_download(args, check)
+            self.assertEqual(args[args.index("-n") + 1], prefix + self.revision)
+            (Path(args[-1]) / "SHA256SUMS").write_text(self.build["sha256"] + "  " + runner.PACKAGE)
+        with mock.patch.object(prepare, "api", side_effect=api), \
+                mock.patch.object(subprocess, "run", side_effect=download):
+            build, base, data = prepare.find_build("main", self.revision, prefix)
+        self.assertEqual((build, base, data), (self.build, None, self.package.read_bytes()))
+        self.assertEqual(len(calls), 3)
 
     def test_reject_wrong_merge_parent_and_expired_builds(self):
         artifact = {"name": "pr-7-" + self.revision, "expired": False}
