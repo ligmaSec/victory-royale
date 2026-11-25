@@ -79,19 +79,19 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
    specified in the scenario.
 2. The **candidate** opens next. Repeat the same steps with the same settings and window
    size. The runner gives each build its own fresh translation cache.
-3. At **REPORT READY** or **TEST INTERRUPTED**, read the summary for both builds.
-   It shows the build revisions, platform, recognized GPU vendor, launcher exits,
-   frame intervals and counts of recognized diagnostic messages. Timing covers all
-   completed reporting windows, including menus. A run without timing samples
-   says so. Tell the requester what you saw in the opening scene on each build.
-4. Choose **r — Review/edit** to see each file queued for sharing. Use ↑/↓ to pick a
-   file, **Enter** to edit and **Space** to exclude or include it. In the editor,
-   **Ctrl+F** searches the current file, **F3** finds the next match and **Esc**
-   returns to the file list. **Ctrl+S** applies your edits to the outgoing ZIP
-   and returns to the sharing menu. The original logs stay in the local report.
-   A kit without the bundled editor offers a temporary folder you can edit yourself.
-5. Press Enter to keep everything local, or choose a destination. Public sharing
-   previews the exact text and confirms the signed-in GitHub account and PR.
+3. After the runs, the **Hardware test results** screen shows each build’s timings.
+   Missing samples are shown as unavailable. These timings include menus. Tell the
+   requester what you saw in the opening scene. Use **↑/↓** to highlight an action,
+   **Enter** to select and **Esc** to go back. **PgUp/PgDn** scroll longer details.
+4. Choose **Preview summary** to read the public text. **Review and edit files**
+   opens the built-in editor when supplied. Use **↑/↓** to pick a file, **Space**
+   to include or exclude it, **Enter** to edit, **Ctrl+F** to search and **Esc** to
+   return to the file list. **Ctrl+S** applies changes locally. To use another
+   editor, choose **Edit in my own editor → Open folder**. Edit or delete
+   working copies, save, then select **Apply edits**. **Back without applying**
+   discards those edits. The folder option also works with older kits.
+5. Choose **Keep local and finish** to print the saved ZIP path. **Post public
+   summary** previews the exact text and names the signed-in account and PR.
    For private sharing, the filtered ZIP also contains per-window mean, median,
    p95, longest frame time and stall counts for each build. Separate submission
    samples record time spent on CPU preparation, buffer and texture copies,
@@ -102,8 +102,8 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
 6. For **Send encrypted report**, install GitHub CLI and sign in to github.com
    with permission to create gists (`gh auth login --hostname github.com --scopes gist`).
    For an existing CLI login, `gh auth refresh --hostname github.com --scopes gist`
-   adds the scope. The runner shows the account and maintainer. Choose **i**
-   to encrypt the ZIP locally and send it. The runner downloads the pinned,
+   adds the scope. The confirmation screen lists the account, recipient and every outgoing file.
+   Choose **Encrypt and send** to complete delivery. The runner downloads the pinned,
    checksum-verified x86-64 age tool. [Official age release](https://github.com/FiloSottile/age/releases/tag/v1.3.2).
    GitHub stores the encrypted file in an unlisted gist owned by your account.
    A mention on the gist notifies the maintainer. Your account, gist size and

@@ -15,6 +15,8 @@ import tempfile
 import textwrap
 import zipfile
 
+import report_ui
+
 REPO = "ligmaSec/victory-royale"
 PACKAGE = "victory-proton-x86_64.tar.gz"
 # Only a reviewed runner change can select the recipient for private reports.
@@ -29,7 +31,7 @@ ROOT = Path(__file__).resolve().parent
 OUTGOING = ("summary.txt", "main-frames.csv", "candidate-frames.csv", "main-submissions.csv",
             "candidate-submissions.csv", "main-events.csv", "candidate-events.csv")
 REVIEWER = "victory-report-review" + (".exe" if sys.platform == "win32" else "")
-PRIVACY_HEADING = "WARNING: LOGS MAY CONTAIN SENSITIVE INFORMATION"
+PRIVACY_HEADING = report_ui.WARNING
 LOG_PRIVACY = "Raw logs can include your username, file paths, credentials, or output from the game."
 
 ANSI = re.compile(rb"\x1b\[[0-9;]*m")
@@ -527,7 +529,7 @@ def send_encrypted_report(filtered, recipient):
         print(f"Notification posted for @{REPORT_MAINTAINER}.")
 
 
-def review_result(filtered, kit):
+def review_result(filtered, kit, own_editor=False):
     """Edit temporary copies. Replace the outgoing ZIP only after an explicit apply."""
     with tempfile.TemporaryDirectory(prefix="victory-review-", dir=filtered.parent) as temporary:
         work = Path(temporary)
@@ -541,7 +543,7 @@ def review_result(filtered, kit):
             print("All files were excluded. There is nothing to review.")
             return
         helper = kit / "review" / REVIEWER
-        if helper.is_file():
+        if helper.is_file() and not own_editor:
             # GitHub artifact extraction can clear execute permissions.
             exe = work / REVIEWER
             shutil.copyfile(helper, exe)
@@ -554,10 +556,33 @@ def review_result(filtered, kit):
                 return
             result.check_returncode()
         else:
-            print(f"Open this folder in your editor: {files}")
-            print("Edit the text or delete files to exclude them. Close your editor when finished.")
-            if input("[a] Apply edits locally   [Enter] Cancel: ").strip().lower() != "a":
-                return
+            instructions = [
+                "1. Choose Open folder. Open summary.txt or a CSV with a text editor.",
+                "2. Edit text or delete a file to exclude it. Save and close your editor.",
+                "3. Return here and choose Apply edits. You decide whether to share afterward.",
+                "", "Working folder", str(files), "",
+                "Only summary.txt can be posted publicly. The CSV files can be sent encrypted.",
+                "Working copies are removed when you leave this screen. Your original logs stay local.",
+            ]
+            default_action = "o" if report_ui.terminal_available() else "b"
+            while True:
+                action = report_ui.choose("Edit in my own editor", "Local review", instructions,
+                    [("o", "Open folder", "Open the temporary working copies in your file manager."),
+                     ("a", "Apply edits", "Save the files you kept to the outgoing ZIP."),
+                     ("b", "Back without applying", "Discard temporary edits and return to the report.")], default_action, "b")
+                if action != "o":
+                    break
+                default_action = "a"
+                try:
+                    if sys.platform == "win32":
+                        os.startfile(files)
+                    else:
+                        subprocess.run(["xdg-open", str(files)], check=True, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+                except (OSError, subprocess.CalledProcessError):
+                    instructions[0] = "1. Open the working folder shown below in your file manager or editor."
+            if action != "a":
+                return False
         replacement = work / "reviewed.zip"
         with zipfile.ZipFile(replacement, "x") as archive:
             for name in names:
@@ -574,70 +599,113 @@ def review_result(filtered, kit):
                     raise ValueError(f"{name} contains hidden control characters. Use plain text.")
                 archive.writestr(zipfile.ZipInfo(name), data, compress_type=zipfile.ZIP_DEFLATED)
         os.replace(replacement, filtered)
-        print("Applied to the local ZIP. Choose a destination when ready.")
+        return True
+
+
+def report_overview(summary):
+    """Summarize recognized rows. The preview always shows the exact public text."""
+    rows = []
+    sides = re.split(r"(?m)^(Main|Candidate) \| [a-f0-9]{40}\r?$", summary)
+    if len(sides) != 5:
+        return ["Choose Preview summary to read the outgoing text."] if summary else ["Public summary excluded."]
+    preamble = sides[0].splitlines()
+    if len(preamble) >= 2:
+        rows.append(preamble[1] + "  ·  Timings include menus")
+    for name, part in zip(sides[1::2], sides[2::2]):
+        mean = re.search(r"(?m)^Mean: (.+)$", part)
+        longest = re.search(r"(?m)^Longest: ([\d.]+) ms", part)
+        stalls = re.search(r"over 1 s: (\d+)", part)
+        detail = mean[1].strip() if mean else "Frame timings unavailable"
+        rows.append(f"{name:<11}{detail}")
+        if longest and stalls:
+            rows.append(f"          Longest {longest[1]} ms  ·  {stalls[1]} over one second")
+    if any("unavailable" in row for row in rows):
+        rows.append("Both builds need timing samples for an FPS comparison.")
+    return rows
 
 
 def share_result(pr, filtered, kit):
-    instruction_block(PRIVACY_HEADING, LOG_PRIVACY + " Review the outgoing files for personal information, "
-                      "including anything you add. Keep the raw archive local. You can reply with a written summary or press Enter to finish locally.",
-                      f"Filtered diagnostics: {filtered}")
+    context = f"Series X  ·  PR #{pr}"
     with zipfile.ZipFile(filtered) as archive:
-        if "summary.txt" in archive.namelist():
-            print(archive.read("summary.txt").decode("utf-8"), flush=True)
+        initial = archive.read("summary.txt").decode("utf-8") if "summary.txt" in archive.namelist() else ""
     if not sys.stdin.isatty():
+        instruction_block(PRIVACY_HEADING, LOG_PRIVACY + " Keep the raw archive local. You can reply with a written summary.",
+                          f"Filtered diagnostics: {filtered}")
+        print(initial, flush=True)
         return
-    private = ""
-    if REPORT_RECIPIENT:
-        try:
-            account = subprocess.check_output(["gh", "api", "--hostname", "github.com", "user", "--jq", ".login"],
-                                              text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
-        except (OSError, subprocess.SubprocessError):
-            print("Encrypted sharing needs GitHub CLI signed in to github.com with gist access.")
-        else:
-            print(f"GitHub will associate the unlisted encrypted gist with {account}. "
-                  f"Only the holder of @{REPORT_MAINTAINER}'s report key can decrypt it.")
-            private = "   [i] Send encrypted report"
+    try:
+        account = subprocess.check_output(["gh", "api", "--hostname", "github.com", "user", "--jq", ".login"],
+                                          text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
+    except (OSError, subprocess.SubprocessError):
+        account = None
+    status = "Check for usernames, paths and credentials before sharing."
     try:
         while True:
             with zipfile.ZipFile(filtered) as archive:
                 names = archive.namelist()
                 report = archive.read("summary.txt").decode("utf-8") if "summary.txt" in names else ""
-            if not names:
-                print("All files excluded. Nothing to send.")
-                return
-            public = f"   [p] Public summary on PR #{pr}" if report.strip() else ""
-            choice = input(f"[r] Review/edit   [Enter] Keep local{private}{public}: ").strip().lower()
-            if choice != "r":
+            folder_mode = not (kit / "review" / REVIEWER).is_file()
+            actions = [("k", "Keep local and finish", "Close the report. Your ZIP stays in the temporary folder printed on exit.")]
+            if names:
+                actions.append(("r", "Edit in my own editor" if folder_mode else "Review and edit files",
+                                "Edit or exclude outgoing files. Applying your edits saves them locally."))
+            if names and not folder_mode:
+                actions.append(("e", "Edit in my own editor", "Open working copies, edit or remove files, then apply locally."))
+            if report.strip():
+                actions.append(("v", "Preview summary", "Read the exact summary that can appear on the public PR."))
+            if REPORT_RECIPIENT and account and names:
+                actions.append(("i", "Send encrypted diagnostics", "Review the recipient, GitHub account and included files before sending."))
+            if report.strip() and account:
+                actions.append(("p", "Post public summary", "Preview and confirm the text before posting under your GitHub account."))
+            body = [status, "", *report_overview(report), "", f"{len(names)} outgoing files  ·  Raw logs stay local"]
+            if not account:
+                body.append("Sharing requires GitHub CLI signed in to github.com. Local review is available.")
+            action = report_ui.choose("Hardware test results", context, body, actions, "k", "k")
+            if action in ("r", "e"):
+                try:
+                    changed = review_result(filtered, kit, own_editor=True) if action == "e" else review_result(filtered, kit)
+                    status = "Edits saved locally. Choose a destination when ready." if changed else "Review cancelled. Your outgoing ZIP is unchanged."
+                except (OSError, ValueError, subprocess.SubprocessError) as error:
+                    status = f"Could not apply edits. Your ZIP is unchanged. {error}"
+                continue
+            if action == "v":
+                report_ui.choose("Public summary preview", context, report.splitlines(),
+                                 [("b", "Back to results", "Return to the report to edit, save or share.")], "b", "b")
+                continue
+            if action == "p":
+                confirmed = report_ui.choose("Post public summary?", context,
+                    [f"Account: {account}", f"Public destination: https://github.com/{REPO}/pull/{pr}",
+                     "", *report.splitlines()],
+                    [("b", "Back to results", "Return without posting."),
+                     ("y", "Post this summary", "Anyone who can see the PR can read this exact text.")], "b", "b")
+                if confirmed != "y":
+                    continue
+                try:
+                    subprocess.run(["gh", "pr", "comment", str(pr), "-R", "github.com/" + REPO, "--body-file", "-"],
+                                   input=report.encode("utf-8"), check=True)
+                    print(f"Posted the reviewed summary to PR #{pr}.")
+                except (OSError, subprocess.CalledProcessError):
+                    print("Public post unconfirmed. Check the PR before retrying.")
                 break
-            try:
-                review_result(filtered, kit)
-            except (OSError, ValueError, subprocess.SubprocessError) as error:
-                print(f"Review could not be applied: {error}")
-                return
-        if choice == "i" and private:
-            try:
-                send_encrypted_report(filtered, REPORT_RECIPIENT)
-            except (OSError, ValueError, subprocess.SubprocessError):
-                print("Private delivery unconfirmed. Check your gists before retrying. "
-                      "GitHub CLI must be signed in with gist access. "
-                      f"Your filtered ZIP is saved here: {filtered}")
-            return
+            if action == "i":
+                confirmed = report_ui.choose("Send encrypted diagnostics?", context,
+                    [f"Recipient: @{REPORT_MAINTAINER}", f"GitHub account: {account}", "",
+                     "The runner encrypts these files locally, then uploads ciphertext to an unlisted GitHub Gist.",
+                     "GitHub sees your account, upload time and size. Anyone with the link can retrieve the ciphertext.",
+                     "", "Included files", *names],
+                    [("b", "Back to results", "Return without sending."),
+                     ("y", "Encrypt and send", "Only the maintainer's report key can decrypt these files.")], "b", "b")
+                if confirmed != "y":
+                    continue
+                try:
+                    send_encrypted_report(filtered, REPORT_RECIPIENT)
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    print("Private delivery unconfirmed. Check your gists before retrying. GitHub CLI needs gist access.")
+                break
+            break
     except (EOFError, KeyboardInterrupt):
-        return
-    if choice != "p" or not public:
-        return
-    try:
-        account = subprocess.check_output(["gh", "api", "--hostname", "github.com", "user", "--jq", ".login"],
-                                          text=True, stderr=subprocess.DEVNULL).strip()
-        print(report, flush=True)
-        answer = input(f"Post the summary above as {account} to https://github.com/{REPO}/pull/{pr}? [y/N] ")
-        if answer.strip().lower() == "y":
-            subprocess.run(["gh", "pr", "comment", str(pr), "-R", "github.com/" + REPO, "--body-file", "-"],
-                           input=report.encode("utf-8"), check=True)
-    except (EOFError, KeyboardInterrupt):
-        return
-    except (OSError, subprocess.CalledProcessError):
-        print("Sharing did not finish. Check the PR before retrying. Your result is saved locally.")
+        pass
+    print(f"Filtered diagnostics: {filtered}", flush=True)
 
 
 def run_request(manifest, options):

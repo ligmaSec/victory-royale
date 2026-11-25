@@ -16,14 +16,18 @@ WARNING: LOGS MAY CONTAIN SENSITIVE INFORMATION
 ====================================================================
 Raw logs may include usernames, file paths, credentials and game output.
 Keep the full archive local. Review the filtered ZIP before choosing to share.
-At REPORT READY or TEST INTERRUPTED, choose [r] Review/edit. Use the arrow keys
-to choose a file, Enter to edit it and Space to include or exclude it. Ctrl+F
-searches the file. Esc returns to the file list. Ctrl+S applies your edits to
-the local outgoing ZIP. Only summary.txt can be posted publicly. Check any text
-you add for sensitive information. If the kit has no editor, the runner prints
-a temporary folder to edit and asks whether to apply your changes. Press Enter
-to keep it local. You can post the summary to the PR under your GitHub account
-or press [i] to send detailed diagnostics encrypted to the maintainer. Sending
+After the runs, use the full-screen results menu. Use Up/Down to highlight a
+choice, Enter to select, Esc to go back and PgUp/PgDn to scroll the details.
+Preview summary shows the text eligible for public posting. Review and edit
+files opens the bundled editor: Enter edits a file, Space includes/excludes it,
+Ctrl+F searches, Esc returns to the list and Ctrl+S applies your edits locally.
+To use your own editor, choose Edit in my own editor, then Open folder.
+Save edits or delete files, then select Apply edits. Back without applying
+discards those working copies. Your original logs stay local.
+
+Keep local and finish prints the filtered ZIP location. Post public summary
+previews the account, PR and text. Send encrypted diagnostics lists the account,
+recipient and files. Confirm Encrypt and send to deliver the ZIP. Sending
 requires GitHub CLI signed in to github.com with gist access. The runner names
 your account before sending. It downloads a checksum-verified age tool, encrypts
 the filtered ZIP and returns an unlisted GitHub Gist receipt. GitHub sees your

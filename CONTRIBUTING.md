@@ -6,7 +6,7 @@ If this is your first contribution, try one test and tell us what happened.
 You can help without writing a patch. Browse [PRs looking for testers](https://github.com/ligmaSec/victory-royale/pulls?q=is%3Apr+is%3Aopen+label%3A%22tester+wanted%22) to find a test. A result from a second machine can
 show whether a failure follows a particular build, GPU driver, or setting.
 
-- **Testing a pull request?** Use the [interactive Series X test](docs/testing.md#run-a-series-x-hardware-test) on Windows or Linux/Proton. Pick the PR and follow the same scenario twice. Logs may contain usernames, local paths, or other sensitive information. Choose **Review/edit** to redact text or exclude files before sharing. The runner previews a summary you can post to the PR and can send detailed diagnostics encrypted to the maintainer using GitHub CLI authenticated with gist access. Keep the raw logs local.
+- **Testing a pull request?** Use the [interactive Series X test](docs/testing.md#run-a-series-x-hardware-test) on Windows or Linux/Proton. Pick the PR and follow the same scenario twice. Logs may contain usernames, local paths, or other sensitive information. Use the results screen to preview the summary, redact text or exclude files before sharing. The runner previews a summary you can post to the PR and can send detailed diagnostics encrypted to the maintainer using GitHub CLI authenticated with gist access. Keep the raw logs local.
 - **Reporting a single Linux run?** Install UMU (`umu-run`) and extract a tested
   [Proton build](docs/testing.md#ci-and-build-downloads). From its `victory`
   directory, run `./victory-proton.sh --report "/path/to/title.exe"`.

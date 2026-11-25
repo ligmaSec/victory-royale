@@ -99,6 +99,7 @@ def prepare():
                 out.writestr("review/" + name, data)
                 out.writestr("review/" + name + ".sha256", hashlib.sha256(data).hexdigest())
         out.write(ROOT / "run-test.py", "run-test.py")
+        out.write(ROOT / "report_ui.py", "report_ui.py")
         out.write(ROOT.parents[1] / "LICENSE", "LICENSE")
         out.write(ROOT / "README.txt", "README.txt")
         out.writestr("request.json", json.dumps(request, indent=2) + "\n")

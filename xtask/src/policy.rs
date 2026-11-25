@@ -160,6 +160,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
             | "tests/metal/probe.swift"
             | "scripts/hardware-test/run-test.py"
             | "scripts/hardware-test/prepare.py"
+            | "scripts/hardware-test/report_ui.py"
             | "tests/hardware-test.py"
     ) || ALLOWED_NAMES.contains(&name)
         || ext
