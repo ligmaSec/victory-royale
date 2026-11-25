@@ -32,6 +32,11 @@ prepare = load("prepare")
 
 class HardwareRequest(unittest.TestCase):
     def setUp(self):
+        # Launch tests capture their output and must never prompt the person running the suite.
+        # Interactive cases supply their own input or create a real pseudoterminal.
+        stdin = mock.patch.object(sys, "stdin", io.StringIO())
+        stdin.start()
+        self.addCleanup(stdin.stop)
         work = tempfile.TemporaryDirectory()
         self.addCleanup(work.cleanup)
         self.root = Path(work.name).resolve()
