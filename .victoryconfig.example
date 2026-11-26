@@ -10,6 +10,7 @@ save_dir = saves/7952987A
 # output_dir = ~/victory-reports
 # Linux only; blank uses the launcher's existing discovery and prefix.
 # proton_dir = ~/.local/share/Steam/steamapps/common/Proton - Experimental
+# umu_dir = ~/.local/bin
 # wine_prefix = ~/.local/share/victory/proton
 
 # For older kits with no requested endpoint. Published endpoints take precedence.

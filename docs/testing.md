@@ -74,7 +74,7 @@ runtime on first use.
 To remember your paths, copy `.victoryconfig.example` to `.victoryconfig` in the checkout root
 or beside the extracted runner. For one setup across kits, put the copy in your home directory.
 Set `game_dir` to your dump directory, or `title` to a specific executable. You can also set
-`save_dir`, `output_dir`, and on Linux `proton_dir` and `wine_prefix`. Relative paths start at the
+`save_dir`, `output_dir`, and on Linux `proton_dir`, `wine_prefix`, and `umu_dir` (the folder containing `umu-run`). Relative paths start at the
 config file. The runner checks the checkout or kit before your home. `--config FILE` selects a
 specific file. Explicit CLI paths override the file. Existing `PROTONPATH` and `WINEPREFIX`
 environment variables override their config entries. Keep the local config on your machine.

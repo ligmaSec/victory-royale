@@ -215,6 +215,7 @@ def launch(side, folder, title, results, windows, console="series-x", *, stop=No
     if windows:
         command = [str(folder / "victory.exe"), "run", str(title), "--execute", "--console", console]
     else:
+        env["PATH"] = session.launch_path(settings)
         for key, variable in (("proton_dir", "PROTONPATH"), ("wine_prefix", "WINEPREFIX")):
             if (settings or {}).get(key) and not env.get(variable):
                 env[variable] = str(settings[key])
@@ -998,7 +999,7 @@ def run_request(manifest, options):
     if not windows and not sys.platform.startswith("linux"):
         raise ValueError("This kit supports Windows and Linux/Proton.")
     for binary in ([] if windows else ["bash", "umu-run"]):
-        if not shutil.which(binary):
+        if not shutil.which(binary, path=session.launch_path(options.settings)):
             raise ValueError(f"Missing {binary}. See the requirements in README.txt.")
     title = (options.title or choose_title()).expanduser().resolve()
     if title.parent.is_relative_to(source):

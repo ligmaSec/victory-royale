@@ -34,7 +34,7 @@ def preferences(path):
             cfg.read_file(f)
     except configparser.Error as error:
         raise ValueError(f"Invalid hardware-test configuration at {path}.") from error
-    allowed = {"game_dir", "title", "proton_dir", "wine_prefix", "save_dir", "output_dir"}
+    allowed = {"game_dir", "title", "proton_dir", "wine_prefix", "umu_dir", "save_dir", "output_dir"}
     if cfg.defaults() or cfg.sections() != ["hardware"] or set(cfg["hardware"]) - allowed - {
             "stop_after", "observe_seconds", "timeout_seconds"}:
         raise ValueError(f"Unrecognized settings in {path}. See .victoryconfig.example.")
@@ -48,6 +48,12 @@ def preferences(path):
         paths["stop"] = stopping(marker, section.getint("observe_seconds", 180),
                                  section.getint("timeout_seconds", 900))
     return paths
+
+
+def launch_path(settings):
+    current = os.environ.get("PATH", os.defpath)
+    directory = (settings or {}).get("umu_dir")
+    return str(directory) + os.pathsep + current if directory else current
 
 
 class Tail:

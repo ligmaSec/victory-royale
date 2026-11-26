@@ -247,8 +247,10 @@ echo "Report: $report (launcher exit 0)"
         title.touch()
         # The fixture distribution exercises the child environment with Bash.
         # Satisfy the runner's UMU preflight without downloading a runtime in CI.
-        (self.root / "umu-run").touch(mode=0o755)
-        env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ["PATH"],
+        umu = self.root / "tools"
+        umu.mkdir()
+        (umu / "umu-run").touch(mode=0o755)
+        env = dict(os.environ, PATH=os.environ["PATH"],
                    XDG_DATA_HOME=str(self.root / "xdg"), EXPECTED_PROTON=str(self.root / "Proton Build"),
                    EXPECTED_PREFIX=str(self.root / "test prefix"))
         env.pop("PROTONPATH", None)
@@ -256,7 +258,7 @@ echo "Report: $report (launcher exit 0)"
         out = self.root / "reports"
         (kit / ".victoryconfig").write_text(
             "[hardware]\ntitle = ../fixture.exe\noutput_dir = ../reports\n"
-            "proton_dir = ../Proton Build\nwine_prefix = ../test prefix\n")
+            "proton_dir = ../Proton Build\nwine_prefix = ../test prefix\numu_dir = ../tools\n")
         result = subprocess.run([sys.executable, str(kit / "run-test.py")], env=env, cwd=self.root, stdin=subprocess.DEVNULL,
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
