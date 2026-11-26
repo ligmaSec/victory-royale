@@ -157,8 +157,11 @@ def analyse(log: Path, captures: Path) -> int:
               f"over1s={last['over1s']:.0f}")
 
     # A sweep fails if anything that should render is missing or errors appear.
+    # A dim night world still has some lit sky, lamps or windows. Loading
+    # screens measured in past sweeps had bright_frac <= 0.017; require less
+    # than 2% bright pixels before calling every capture a dark screen.
     dark_screen = bool(brightness) and all(
-        m < 80 and f < 0.05 for (_, m), f in zip(brightness, bright_fraction)
+        m < 80 and f < 0.02 for (_, m), f in zip(brightness, bright_fraction)
     )
     # Warm night lighting also suppresses blue, but the whole image stays
     # dim. Only flag a collapsed blue channel when the capture is bright;
