@@ -43,6 +43,9 @@ class RequestDelivery(unittest.TestCase):
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        config = mock.patch.object(runner, "default_config", return_value=self.root / ".victoryconfig")
+        config.start()
+        self.addCleanup(config.stop)
         self.viewer = requester
         self.gists = {}
         self.source = {"id": 567, "user": requester, "body": "/victory hardware-test\nCompare the opening.",

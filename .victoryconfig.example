@@ -13,7 +13,8 @@ save_dir = saves/7952987A
 # wine_prefix = ~/.local/share/victory/proton
 
 # For older kits with no requested endpoint. Published endpoints take precedence.
-# Alternatives: manual, present-1024, first-mesh-bind.
-stop_after = device-ready
-observe_seconds = 180
-timeout_seconds = 900
+# Keep manual for an older kit with written instructions. To automate a known scene,
+# choose device-ready, present-1024, first-mesh-bind, or timing-window.
+stop_after = manual
+# observe_seconds = 180
+# timeout_seconds = 900

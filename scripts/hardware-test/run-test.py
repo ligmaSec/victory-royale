@@ -163,6 +163,11 @@ def settings_root():
     return base
 
 
+def default_config():
+    local = settings_root() / ".victoryconfig"
+    return local if local.is_file() else Path.home() / ".victoryconfig"
+
+
 def default_save():
     return settings_root() / "saves" / TITLE_ID
 
@@ -389,9 +394,12 @@ def run():
     parser.add_argument("--config", type=Path, help="read hardware-test settings from this file")
     parser.add_argument("--manual", action="store_true", help="close both builds yourself")
     options = parser.parse_args()
-    local = settings_root() / ".victoryconfig"
-    config = options.config or (local if local.is_file() else Path.home() / ".victoryconfig")
-    options.settings = session.preferences(config.expanduser().resolve()) if options.config or config.is_file() else {}
+    config = options.config or default_config()
+    options.settings = {}
+    if options.config or config.is_file():
+        config = config.expanduser().resolve()
+        options.settings = session.preferences(config)
+        print(f"Using hardware settings from {config}", flush=True)
     options.title = options.title or options.settings.get("title")
     options.save_dir = options.save_dir or options.settings.get("save_dir")
     options.output_dir = options.output_dir or options.settings.get("output_dir")

@@ -11,6 +11,7 @@ import time
 MARKERS = {
     "device-ready": re.compile(rb"victory_gpu::host:\s+host D3D12 device ready\b"),
     "present-1024": re.compile(rb"victory_gpu::queue:\s+(?:title requested a present|frame presented) [^\n]*\bframe=1024\b"),
+    "timing-window": re.compile(rb"victory_gpu::host:\s+present intervals: [1-9][0-9]* frames, mean "),
     "first-mesh-bind": re.compile(rb'victory_gpu::[\w:]+:\s+first bind [^\n]*\bstage="mesh"'),
 }
 ANSI = re.compile(rb"\x1b\[[0-9;]*m")
@@ -149,7 +150,8 @@ def terminate_run(process, windows, env):
 def monitor(process, log, windows, env, stop, close_file):
     tail = Tail()
     report_dir = None
-    reports = Path(env.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "victory/reports"
+    home = Path(env.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    reports = (home if home.is_absolute() else Path.home() / ".local/share") / "victory/reports"
     start = time.monotonic()
     deadline = start + stop["timeout_seconds"]
     matched = None

@@ -58,6 +58,9 @@ class HardwareRequest(unittest.TestCase):
         work = tempfile.TemporaryDirectory()
         self.addCleanup(work.cleanup)
         self.root = Path(work.name).resolve()
+        config = mock.patch.object(runner, "default_config", return_value=self.root / ".victoryconfig")
+        config.start()
+        self.addCleanup(config.stop)
         self.package = self.root / runner.PACKAGE
         self.revision = "a" * 40
         with tarfile.open(self.package, "w:gz") as bundle:
@@ -276,6 +279,10 @@ class HardwareRequest(unittest.TestCase):
         self.assertEqual(profile["title"], self.root / "my game" / "game_scarlett_master.exe")
         self.assertEqual(profile["save_dir"], self.save)
         self.assertEqual(profile["proton_dir"], self.root / "Proton Engine")
+        self.assertTrue(runner.session.MARKERS["timing-window"].search(
+            b"victory_gpu::host: present intervals: 128 frames, mean 25.00 ms, median 20.00 ms"))
+        self.assertFalse(runner.session.MARKERS["timing-window"].search(
+            b"victory_gpu::host: adapter initialization has started"))
         stop = runner.session.stopping("first-mesh-bind", 7, 55)
         request = dict(self.request, version=5, save=runner.TITLE_ID, stop=stop)
         self.manifest.write_text(json.dumps(request))

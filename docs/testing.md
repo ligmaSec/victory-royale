@@ -229,7 +229,7 @@ records the requester and their verified key at that time. If they have no key,
 the results screen offers local review and public summary sharing. Check
 `run-test.py PR_NUMBER --plan` for the intended account before inviting testers.
 When preparing a request, select device readiness, title present request 1,024, first mesh
-bind, or manual close. Set the observation time and startup-inclusive timeout for the scene.
+bind, a completed frame-timing window, or manual close. Set the observation time and startup-inclusive timeout for the scene.
 Use manual close when only the tester can identify the endpoint.
 After publication, [Verify the published hardware request](../.github/workflows/hardware-request-verify.yml)
 previews the PR by number using the same picker as testers. A successful preview
