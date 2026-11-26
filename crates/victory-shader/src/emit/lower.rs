@@ -8946,27 +8946,7 @@ impl<'a> Lower<'a> {
             guard
         };
         let at = self.begin_guarded(guard);
-        let c = self.cur;
-        let z = self.s.m.i32(0);
-        let mv = self.s.m.i32(mesh.max_vertices);
-        let mut bad = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut idxs = [z; 3];
-        for k in 0..3 {
-            // Each 10-bit field ends with an edge flag above the nine index bits.
-            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x1FF));
-            let i = self.s.m.bin(c, Bin::LShr, x, shift);
-            let i = self.s.m.bin(c, Bin::And, i, mask);
-            let oob = self.s.m.cmp(c, pred::IUGE, i, mv);
-            bad = self.s.m.bin(c, Bin::Or, bad, oob);
-            idxs[k as usize] = i;
-        }
-        let mut args = vec![flat];
-        for i in idxs {
-            args.push(self.s.m.select(c, bad, z, i));
-        }
-        let void = self.s.t.void;
-        self.s
-            .op(c, "emitIndices", Attr::NoUnwind, void, 169, &args);
+        emit_triangle(&mut self.s, self.cur, flat, x, mesh.max_vertices);
         self.end_guarded(at, &[]);
         Ok(())
     }
@@ -9401,6 +9381,33 @@ fn post_dominators(succs: &[Vec<usize>], preds: &[Vec<usize>], exit: usize) -> V
     ipdom
 }
 
+/// Emits the host indices for one packed GFX10 primitive. A culled or
+/// out-of-range triangle becomes degenerate before it reaches the rasterizer.
+fn emit_triangle(s: &mut Shader, block: usize, primitive: V, packed: V, max_vertices: u32) {
+    let zero = s.m.i32(0);
+    let limit = s.m.i32(max_vertices);
+    let mut culled = s.m.cmp(block, pred::SLT, packed, zero);
+    let mut indices = [zero; 3];
+    for (corner, index) in indices.iter_mut().enumerate() {
+        let shift = s.m.i32(10 * corner as u32);
+        // Each 10-bit field ends with an edge flag above the nine index bits.
+        let mask = s.m.i32(0x1FF);
+        let shifted = s.m.bin(block, Bin::LShr, packed, shift);
+        *index = s.m.bin(block, Bin::And, shifted, mask);
+        let outside = s.m.cmp(block, pred::IUGE, *index, limit);
+        culled = s.m.bin(block, Bin::Or, culled, outside);
+    }
+    let [a, b, c] = indices.map(|index| s.m.select(block, culled, zero, index));
+    s.op(
+        block,
+        "emitIndices",
+        Attr::NoUnwind,
+        s.t.void,
+        169,
+        &[primitive, a, b, c],
+    );
+}
+
 /// The lane `v_readlane_b32` / `v_writelane_b32` names, wrapped to the wave
 /// (`& 31`, `& 63` in wave64). A constant stays a constant: its value is the
 /// lane, not its place in the constant pool (`V::Const` holds the place).
@@ -9474,6 +9481,54 @@ mod tests {
             S_ENDPGM,
         ];
         assert_eq!(fence_only(&words), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn mesh_edge_flags_preserve_vertices_and_cull_only_invalid_triangles() {
+        use super::super::bitcode::{Term, opt};
+        use super::Shader;
+
+        let mut shader = Shader::new(false);
+        let block = shader.entry;
+        let triangle = 1 | (17 << 10) | (254 << 20);
+        let flags = [1 << 9, 1 << 19, 1 << 29];
+        let mut expected = Vec::new();
+        for bits in 0..8 {
+            let mut packed = triangle;
+            for (corner, flag) in flags.iter().enumerate() {
+                if bits & (1 << corner) != 0 {
+                    packed |= flag;
+                }
+            }
+            let value = shader.m.i32(packed);
+            let primitive = shader.m.i32(bits);
+            super::emit_triangle(&mut shader, block, primitive, value, 255);
+            expected.push(vec![169, i64::from(bits), 1, 17, 254]);
+        }
+        for packed in [
+            triangle | (1 << 31),
+            255,
+            255 << 10,
+            255 << 20,
+            triangle | 256,
+        ] {
+            let primitive = shader.m.i32(8);
+            let value = shader.m.i32(packed);
+            super::emit_triangle(&mut shader, block, primitive, value, 255);
+            expected.push(vec![169, 8, 0, 0, 0]);
+        }
+        shader.m.terminate(block, Term::Ret);
+        shader.m.optimise(opt::MODULE);
+        let actual: Vec<Vec<_>> = shader
+            .m
+            .dx_op_args("dx.op.emitIndices", 169)
+            .map(|args| {
+                args.iter()
+                    .map(|&v| shader.m.int_value(v).unwrap())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(actual, expected);
     }
 
     /// Lowers a synthetic compute program with these input registers and

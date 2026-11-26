@@ -509,24 +509,22 @@ impl Module {
     }
 
     pub(crate) fn has_dx_op(&self, name: &str, opcode: i64) -> bool {
-        self.dx_ops(name, opcode).next().is_some()
+        self.dx_op_args(name, opcode).next().is_some()
     }
 
     #[cfg(test)]
     pub(crate) fn dx_op_count(&self, name: &str, opcode: i64) -> usize {
-        self.dx_ops(name, opcode).count()
+        self.dx_op_args(name, opcode).count()
     }
 
-    fn dx_ops(&self, name: &str, opcode: i64) -> impl Iterator<Item = &Inst> {
-        self.insts.iter().filter(move |inst| match &inst.op {
-            Op::Call(fid, args) => {
-                self.funcs[*fid as usize].name == name
-                    && matches!(
-                        args.first(),
-                        Some(V::Const(cid)) if matches!(self.consts[*cid as usize].1, Const::Int(n) if n == opcode)
-                    )
-            }
-            _ => false,
+    pub(super) fn dx_op_args(&self, name: &str, opcode: i64) -> impl Iterator<Item = &[V]> {
+        self.insts.iter().filter_map(move |inst| {
+            let Op::Call(fid, args) = &inst.op else {
+                return None;
+            };
+            (self.funcs[*fid as usize].name == name
+                && self.int_value(*args.first()?) == Some(opcode))
+            .then_some(args.as_slice())
         })
     }
 
