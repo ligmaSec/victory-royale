@@ -192,7 +192,7 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// it to slot 0, so a larger heap would lose its top slots to them.
 const MAX_VIEWS: u32 = victory_shader::emit::VIEW_HEAP_LIMIT;
 const _: () = assert!(PORTABLE_VIEWS <= MAX_VIEWS && DYNAMIC < PORTABLE_VIEWS);
-const _: () = assert!(SAMPLERS <= victory_shader::emit::SAMPLER_HEAP_LIMIT);
+const _: () = assert!(SAMPLERS == victory_shader::emit::SAMPLER_HEAP_LIMIT);
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
@@ -254,7 +254,13 @@ impl HostHeap {
             );
         }
         if sampler {
-            return match make(count) {
+            // A shader indexes the host heap directly. Its bound is SAMPLERS,
+            // even for a smaller title heap. Leave the padding as point samplers.
+            if count == 0 {
+                tracing::warn!(count, sampler, "no host descriptor heap");
+                return None;
+            }
+            return match make(SAMPLERS) {
                 Ok(heap) => Self::with(host, heap, kind, count, 0),
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -309,7 +315,7 @@ impl HostHeap {
     }
 
     /// The host heap over `heap`: `count` title slots, then `extra` dynamic
-    /// ones, all made null.
+    /// ones. All physical slots, including sampler padding, start null.
     fn with(
         host: &Host,
         heap: ID3D12DescriptorHeap,
@@ -319,10 +325,11 @@ impl HostHeap {
     ) -> Option<Self> {
         let sampler = kind == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
         // SAFETY: a live heap.
-        let (cpu, step) = unsafe {
+        let (cpu, step, physical) = unsafe {
             (
                 heap.GetCPUDescriptorHandleForHeapStart().ptr,
                 host.device.GetDescriptorHandleIncrementSize(kind),
+                heap.GetDesc().NumDescriptors,
             )
         };
         tracing::debug!(count, sampler, "host descriptor heap");
@@ -330,7 +337,7 @@ impl HostHeap {
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(count + extra) * u64::from(step),
+            u64::from(physical) * u64::from(step),
             u64::from(step),
             sampler,
         ));
@@ -352,7 +359,7 @@ impl HostHeap {
         // used-resource entry names) read a wild address. Every slot starts
         // null instead.
         let started = std::time::Instant::now();
-        if let Err(e) = h.fill_null(kind, count + extra) {
+        if let Err(e) = h.fill_null(kind, physical) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
             return None;
         }
@@ -2161,6 +2168,27 @@ mod tests {
         }
         assert_eq!(count(8), Some(2));
         assert_eq!(count(u64::MAX), Some(u32::MAX));
+    }
+
+    #[test]
+    fn sampler_heaps_cover_direct_shader_indices() {
+        if host().is_none() {
+            eprintln!("skipping sampler heap check: needs a D3D12 device");
+            return;
+        }
+        for (requested, mirrored, dynamic) in [
+            (4, 4, 0),
+            (SAMPLERS, SAMPLERS, 0),
+            (SAMPLERS + 1, SAMPLERS - SAMPLER_DYNAMIC, SAMPLER_DYNAMIC),
+        ] {
+            let heap = HostHeap::new(true, requested).expect("shader-visible sampler heap");
+            // SAFETY: the descriptor belongs to this live D3D12 heap.
+            let physical = unsafe { heap.heap.GetDesc() }.NumDescriptors;
+            eprintln!("{requested} requested: {physical} physical sampler slots");
+            assert_eq!(physical, victory_shader::emit::SAMPLER_HEAP_LIMIT);
+            assert_eq!(heap.count(), mirrored);
+            assert_eq!(heap.dynamic_capacity(), dynamic);
+        }
     }
 
     /// The CPU-side block used to initialize null samplers must fit the
