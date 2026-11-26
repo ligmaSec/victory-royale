@@ -18,7 +18,7 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
 /// too, and their draws traced at debug level.
-pub(crate) fn listed(n: u64) -> bool {
+fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
         let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
@@ -38,6 +38,8 @@ fn world_on() -> bool {
 /// The first presented frame that ran 500 draws or more.
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
+const WORLD_OFFSETS: [u64; 2] = [2, 6];
+
 /// At the present of `frame`, with the draws run by the host so far: record
 /// the first frame of the world, and log it when world capture is requested.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
@@ -49,7 +51,7 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
             .compare_exchange(u64::MAX, frame, Relaxed, Relaxed)
             .is_ok()
     {
-        let (plus2, plus6) = world_offsets(frame);
+        let [plus2, plus6] = WORLD_OFFSETS.map(|offset| frame.saturating_add(offset));
         tracing::info!(frame, plus2, plus6, "the first frame of 500 draws or more");
     }
 }
@@ -59,18 +61,21 @@ fn world_frame(frame: u64, before: u64, drawn: u64, enabled: bool) -> Option<u64
     (enabled && drawn.saturating_sub(before) >= 500).then_some(frame)
 }
 
-/// The two captured offsets from the world's first frame.
-fn world_offsets(first: u64) -> (u64, u64) {
-    (first + 2, first + 6)
-}
-
 /// Whether frame `n` is the world's first frame or one of its two offsets.
 fn world_wanted(n: u64, first: u64) -> bool {
-    if first == u64::MAX {
-        return false;
-    }
-    let (plus2, plus6) = world_offsets(first);
-    n == first || n == plus2 || n == plus6
+    first != u64::MAX && (n == first || world_followup(n, first))
+}
+
+/// The world marker is discovered at present. Target binds and draw traces
+/// can be selected in advance for its two later captures.
+fn world_followup(n: u64, first: u64) -> bool {
+    n.checked_sub(first)
+        .is_some_and(|offset| WORLD_OFFSETS.contains(&offset))
+}
+
+/// Frames whose operations can be traced while command lists are recorded.
+pub(crate) fn detailed(n: u64) -> bool {
+    listed(n) || world_followup(n, WORLD.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Whether frame `n` is saved.
@@ -243,15 +248,16 @@ pub(crate) fn save_read_back(
     }
 }
 
-/// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in
-/// `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved
+type Target = (usize, std::sync::Arc<crate::resource::HostTexture>);
+
+/// With `VICTORY_DUMP_TARGETS` set, the textures of each detailed frame,
+/// held in first-use order. Each is saved
 /// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`
 /// (what each holds at the end of the frame; formats normalized to show
 /// structure: floats scaled by their largest value, depth by its range).
-/// The host copies are held: the title may release a target before the
-/// frame is presented.
-static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
-    std::sync::Mutex::new(Vec::new());
+/// The host copies stay alive if the title releases a target before present.
+static TARGETS: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<Target>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -353,10 +359,20 @@ pub(crate) fn note_target(resource: crate::object::This) {
             *SHOWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
         }
     }
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() || !dump_on() {
         return;
     }
-    let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+    let frame = crate::queue::presented() + 1;
+    if !detailed(frame) {
+        return;
+    }
+    let mut frames = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+    // A present can start while the recording thread is acquiring the lock.
+    // It must not leave an entry behind for a frame already drained.
+    if frame <= crate::queue::presented() {
+        return;
+    }
+    let targets = frames.entry(frame).or_default();
     if !targets.iter().any(|&(r, _)| r == resource as usize)
         && let Some(copy) = crate::resource::host_copy(resource)
     {
@@ -367,7 +383,13 @@ pub(crate) fn note_target(resource: crate::object::This) {
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
-    let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    let Some(targets) = TARGETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&frame)
+    else {
+        return;
+    };
     let Some(host) = crate::host::host() else {
         return;
     };
@@ -740,6 +762,17 @@ mod tests {
         assert!(!super::world_wanted(11, 10));
         assert!(!super::world_wanted(13, 10));
         assert!(!super::world_wanted(10, u64::MAX));
+    }
+
+    #[test]
+    fn only_the_two_known_followup_frames_trace_recorded_operations() {
+        let selected = |first| {
+            (1..=12)
+                .filter(|&n| super::world_followup(n, first))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(selected(3), [5, 9]);
+        assert!(selected(u64::MAX).is_empty());
     }
 
     #[test]
