@@ -4724,34 +4724,44 @@ mod present_plane_tests {
         };
         let scene = make_plane(32, 32, &[1.0, 0.0, 0.0, 1.0]);
         let overlay = make_plane(64, 64, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let left = RECT {
+            left: 0,
+            top: 0,
+            right: 32,
+            bottom: 64,
+        };
+        // SAFETY: live 64x64 render target on the open list.
+        unsafe {
+            list.list.ClearRenderTargetView(
+                host.rtv(Some(&overlay), None),
+                &[0.0; 4],
+                Some(&[left]),
+            );
+        }
         list.close();
         host.execute(&[&list]);
         let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
-        assert!(
-            host.present(&[(&scene, state)], 1).is_some(),
-            "single-plane control"
-        );
-        let first_pixel =
-            |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
-                let mut mapped = std::ptr::null_mut();
-                // SAFETY: the present copy has completed. The footprint names
-                // a live RGBA pixel inside the readback buffer.
-                let rgba = unsafe {
-                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
-                    let rgba = mapped
-                        .cast::<u8>()
-                        .add(footprint.Offset as usize)
-                        .cast::<[u8; 4]>()
-                        .read();
-                    buffer.Unmap(0, None);
-                    rgba
-                };
-                (footprint.Footprint.Width, footprint.Footprint.Height, rgba)
+        let sample = |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+            let width = footprint.Footprint.Width;
+            let height = footprint.Footprint.Height;
+            let mut mapped = std::ptr::null_mut();
+            assert!(width >= 4 && height > 0);
+            // SAFETY: the completed readback contains both quarter points of its first RGBA row.
+            let pixels = unsafe {
+                buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                let row = mapped
+                    .cast::<u8>()
+                    .add(footprint.Offset as usize)
+                    .cast::<[u8; 4]>();
+                let pixels = [width / 4, 3 * width / 4].map(|x| row.add(x as usize).read());
+                buffer.Unmap(0, None);
+                pixels
             };
-
+            (width, height, pixels)
+        };
         let mut attempted = false;
         let mut fallback = None;
-        let shown = host.present_with_compositor(
+        host.present_with_compositor(
             &[(&scene, state), (&overlay, state)],
             2,
             |_, _| {
@@ -4760,31 +4770,32 @@ mod present_plane_tests {
                     windows::Win32::Foundation::E_FAIL,
                 ))
             },
-            |buffer, footprint| fallback = Some(first_pixel(buffer, footprint)),
+            |buffer, footprint| fallback = Some(sample(buffer, footprint)),
         );
         assert!(attempted);
-        assert!(
-            shown.is_some(),
-            "the primary plane must still be shown in this frame"
-        );
-        assert_eq!(fallback, Some((32, 32, [255, 0, 0, 255])));
+        let red = [255, 0, 0, 255];
+        assert_eq!(fallback, Some((32, 32, [red, red])));
         let presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
         let swap_chain = presentation.as_ref().unwrap();
         assert_eq!((swap_chain.width, swap_chain.height), (32, 32));
         drop(presentation);
 
         let mut composite = None;
-        assert!(
-            host.present_with_compositor(
-                &[(&scene, state), (&overlay, state)],
-                3,
-                Compositor::new,
-                |buffer, footprint| composite = Some(first_pixel(buffer, footprint)),
-            )
-            .is_some(),
-            "compositor initialization can be retried after failure"
+        host.present_with_compositor(
+            &[(&scene, state), (&overlay, state)],
+            3,
+            Compositor::new,
+            |buffer, footprint| composite = Some(sample(buffer, footprint)),
         );
-        // Premultiplied half-blue over opaque red.
-        assert_eq!(composite, Some((32, 32, [127, 0, 128, 255])));
+        assert_eq!(composite, Some((32, 32, [red, [127, 0, 128, 255]])));
+        // A subsequent primary-only present must have the original color on both sides.
+        let mut primary = None;
+        host.present_with_compositor(
+            &[(&scene, state)],
+            4,
+            |_, _| panic!("primary-only present compiled a compositor"),
+            |buffer, footprint| primary = Some(sample(buffer, footprint)),
+        );
+        assert_eq!(primary, Some((32, 32, [red, red])));
     }
 }
