@@ -1,11 +1,15 @@
 """Local hardware-test preferences and automatic, per-launch stopping conditions."""
+import ast
 import configparser
+import gzip
+import io
 from pathlib import Path
 import os
 import re
 import shutil
 import signal
 import subprocess
+import tarfile
 import time
 
 MARKERS = {
@@ -48,6 +52,71 @@ def preferences(path):
         paths["stop"] = stopping(marker, section.getint("observe_seconds", 180),
                                  section.getint("timeout_seconds", 900))
     return paths
+
+
+def report_headers(report):
+    if report.is_symlink():
+        return
+    if report.is_dir():
+        for log in report.glob("steam-*.log"):
+            if log.is_file() and not log.is_symlink():
+                with log.open("rb") as stream:
+                    yield stream.read(32768)
+    elif report.name.endswith(".tar.gz") and report.is_file():
+        # Completed runs usually contain build.txt and a short launcher.log before the
+        # Proton header. Limit decompression even when a previous report is gigabytes long.
+        with gzip.open(report, "rb") as stream:
+            prefix = io.BytesIO(stream.read(128 * 1024))
+        with tarfile.open(fileobj=prefix, mode="r:") as archive:
+            for member in archive:
+                if member.isfile() and re.fullmatch(r"(?:\./)?steam-[^/]+\.log", member.name):
+                    prefix.seek(member.offset_data)
+                    yield prefix.read(min(member.size, 32768))
+                    return
+
+
+def previous_title():
+    """Recover a live title path from recent local Proton reports."""
+    home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    if not home.is_absolute():
+        home = Path.home() / ".local/share"
+    reports = home / "victory/reports"
+    for report in sorted(reports.glob("run-*"), reverse=True)[:32]:
+        try:
+            for header in report_headers(report):
+                for line in header.splitlines():
+                    if not line.startswith(b"Command: "):
+                        continue
+                    args = ast.literal_eval(line[len(b"Command: "):].decode())
+                    if not (isinstance(args, list) and len(args) >= 3
+                            and all(isinstance(arg, str) for arg in args[:3])
+                            and args[0].replace("\\", "/").split("/")[-1].lower() == "victory.exe"
+                            and args[1] == "run"):
+                        continue
+                    title = args[2]
+                    if title[:3].upper() == "Z:\\":
+                        title = title[2:].replace("\\", "/")
+                    candidate = Path(title)
+                    if (candidate.is_absolute() and candidate.name.lower() == "game_scarlett_master.exe"
+                            and candidate.is_file()):
+                        return candidate
+        except (OSError, EOFError, tarfile.TarError, ValueError, SyntaxError, RecursionError):
+            continue
+    return None
+
+
+def discover_title():
+    name = "game_scarlett_master.exe"
+    configured = os.environ.get("VICTORY_GAME_DIR")
+    if configured:
+        return Path(configured).expanduser() / name
+    for games in ("games", "Games"):
+        candidate = Path.home() / games / "GTA6.Xbox.v1.0.2.1" / name
+        if candidate.is_file():
+            return candidate
+    if os.name == "posix":
+        return previous_title()
+    return None
 
 
 def launch_path(settings):

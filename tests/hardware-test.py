@@ -42,10 +42,41 @@ class SaveLocations(unittest.TestCase):
             scripts.mkdir(parents=True)
             (checkout / ".victory-root").touch()
             kit = Path(directory) / "kit"
+            home = mock.patch.object(Path, "home", return_value=kit)
+            roots = mock.patch.object(runner, "checkout_roots", return_value=[])
+            home.start()
+            roots.start()
+            self.addCleanup(home.stop)
+            self.addCleanup(roots.stop)
             with mock.patch.object(runner, "ROOT", scripts):
                 self.assertEqual(runner.default_save(), checkout / "saves" / "7952987A")
             with mock.patch.object(runner, "ROOT", kit):
                 self.assertEqual(runner.default_save(), kit / "saves" / "7952987A")
+
+
+class PathRecovery(unittest.TestCase):
+    def test_recover_only_a_live_title_from_a_victory_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            title = root / "Games with spaces" / "game_scarlett_master.exe"
+            title.parent.mkdir()
+            title.touch()
+            log = root / "victory/reports/run-01/steam-victory.log"
+            log.parent.mkdir(parents=True)
+            args = ["Z:" + '\\' + "kit" + '\\' + "victory.exe", "run",
+                    "Z:" + str(title).replace("/", '\\')]
+            with mock.patch.dict(os.environ, {"XDG_DATA_HOME": temp}):
+                for bad in (["other.exe", *args[1:]], [args[0], "inspect", args[2]], args[:1], None):
+                    log.write_text("Command: " + repr(bad))
+                    self.assertIsNone(runner.session.previous_title())
+                log.write_text("prefix" + '\n' + "Command: " + repr(args) + '\n')
+                self.assertEqual(runner.session.previous_title(), title)
+                with tarfile.open(log.parent.with_suffix(".tar.gz"), "w:gz") as archive:
+                    archive.add(log, arcname="./steam-victory.log")
+                shutil.rmtree(log.parent)
+                self.assertEqual(runner.session.previous_title(), title)
+                title.unlink()
+                self.assertIsNone(runner.session.previous_title())
 
 
 class HardwareRequest(unittest.TestCase):

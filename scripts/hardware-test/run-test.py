@@ -163,13 +163,27 @@ def settings_root():
     return base
 
 
+def checkout_roots():
+    cwd = Path.cwd()
+    return [root for root in (cwd, *cwd.parents) if (root / ".victory-root").is_file()]
+
+
 def default_config():
-    local = settings_root() / ".victoryconfig"
-    return local if local.is_file() else Path.home() / ".victoryconfig"
+    shared = Path.home() / ".victoryconfig"
+    for root in (settings_root(), *checkout_roots()):
+        local = root / ".victoryconfig"
+        if local.is_file():
+            return local
+    return shared
 
 
 def default_save():
-    return settings_root() / "saves" / TITLE_ID
+    local = settings_root() / "saves" / TITLE_ID
+    for root in (settings_root(), *checkout_roots(), Path.home() / "games", Path.home() / "Games"):
+        candidate = root / "saves" / TITLE_ID
+        if candidate.is_dir():
+            return candidate
+    return local
 
 
 def copy_save(source, destination):
@@ -1001,7 +1015,7 @@ def run_request(manifest, options):
     for binary in ([] if windows else ["bash", "umu-run"]):
         if not shutil.which(binary, path=session.launch_path(options.settings)):
             raise ValueError(f"Missing {binary}. See the requirements in README.txt.")
-    title = (options.title or choose_title()).expanduser().resolve()
+    title = (options.title or session.discover_title() or choose_title()).expanduser().resolve()
     if title.parent.is_relative_to(source):
         raise ValueError("Select a game executable outside the source save folder.")
     if not title.is_file() or title.suffix.lower() != ".exe":
