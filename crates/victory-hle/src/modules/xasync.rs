@@ -511,8 +511,8 @@ struct Call {
     /// Set by the first completion, which then runs without a lock: the
     /// provider's cleanup may wait for a thread completing the same call.
     claimed: AtomicBool,
-    /// The status is published.
-    done: Mutex<bool>,
+    /// Waiters retain this call and its result even if the block is reused.
+    completion_status: Mutex<HRESULT>,
     finished: Condvar,
 }
 
@@ -597,7 +597,7 @@ pub fn XAsyncBegin(
         // behind never reads zero (it holds the result's size). So this is
         // a new block, and the call left behind ends here. A call in flight
         // keeps its address, and a block still holding a result is in use.
-        let over = *lock(&left.done);
+        let over = *lock(&left.completion_status) != E_PENDING;
         if !(over && zeroed(block)) {
             return E_INVALIDARG;
         }
@@ -611,7 +611,7 @@ pub fn XAsyncBegin(
         context: context as usize,
         identity: identity as usize,
         claimed: AtomicBool::new(false),
-        done: Mutex::new(false),
+        completion_status: Mutex::new(E_PENDING),
         finished: Condvar::new(),
     });
     lock(&CALLS).insert(block as usize, call.clone());
@@ -634,7 +634,7 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
     extern "system" fn work(context: *mut c_void, canceled: bool) {
         // SAFETY: boxed in `XAsyncSchedule`; a task runs once.
         let Work { call, block } = *unsafe { Box::from_raw(context.cast::<Work>()) };
-        if !is_current(&call, block) {
+        if call.claimed.load(Ordering::Acquire) || !is_current(&call, block) {
             return;
         }
         let hr = if canceled {
@@ -647,7 +647,7 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
     if block.is_null() {
         return E_INVALIDARG;
     }
-    let Some(call) = call(block) else {
+    let Some(call) = call(block).filter(|c| !c.claimed.load(Ordering::Acquire)) else {
         return E_INVALIDARG;
     };
     // SAFETY: a block in flight is valid.
@@ -696,12 +696,20 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
     // SAFETY: a block in flight is valid.
     let (handle, routine) = unsafe { ((*block).queue, (*block).callback) };
     let (status, size) = words(block);
-    if result < 0 || required_size == 0 {
-        release(block);
+    let release = result < 0 || required_size == 0;
+    if release {
+        // Cleanup can reenter the runtime. Keep the call visible to waiters throughout it.
+        call.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
     }
+    // A caller must find either this call or its published status in the block.
+    let mut calls = lock(&CALLS);
     size.store(required_size, Ordering::Release);
     status.store(result as u32 as usize, Ordering::Release);
-    *lock(&call.done) = true;
+    *lock(&call.completion_status) = result;
+    if release {
+        calls.remove(&(block as usize));
+    }
+    drop(calls);
     call.finished.notify_all();
     if routine.is_some() {
         let task = Task::new(block.cast(), complete);
@@ -717,8 +725,11 @@ pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
         return E_INVALIDARG;
     }
     if wait && let Some(call) = call(block) {
-        let done = lock(&call.done);
-        drop(call.finished.wait_while(done, |d| !*d));
+        let status = lock(&call.completion_status);
+        return *call
+            .finished
+            .wait_while(status, |hr| *hr == E_PENDING)
+            .unwrap_or_else(|e| e.into_inner());
     }
     status(block)
 }
@@ -741,7 +752,7 @@ pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
 /// provider completed it first. A completed call is left alone.
 pub fn XAsyncCancel(block: *mut AsyncBlock) {
     if let Some(call) = call(block) {
-        if *lock(&call.done) {
+        if call.claimed.load(Ordering::Acquire) {
             return;
         }
         call.provider(OP_CANCEL, block, 0, std::ptr::null_mut());
@@ -1768,6 +1779,71 @@ mod tests {
         XTaskQueueCloseHandle(q);
     }
 
+    #[test]
+    fn waiting_during_provider_cleanup_returns_the_completion_status() {
+        use std::sync::{Barrier, mpsc};
+
+        struct Gate {
+            entered: Barrier,
+            resume: Barrier,
+            cancellations: AtomicU32,
+        }
+        extern "system" fn gated(op: u32, data: *const ProviderData) -> HRESULT {
+            // SAFETY: the test keeps the gate alive until all provider calls return.
+            let gate = unsafe { &*(*data).context.cast::<Gate>() };
+            match op {
+                OP_CLEANUP => {
+                    gate.entered.wait();
+                    gate.resume.wait();
+                }
+                OP_CANCEL => {
+                    gate.cancellations.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+            S_OK
+        }
+
+        for result in [S_OK, E_ABORT] {
+            let mut gate = Gate {
+                entered: Barrier::new(2),
+                cancellations: AtomicU32::new(0),
+                resume: Barrier::new(2),
+            };
+            let mut block = AsyncBlock {
+                queue: std::ptr::null(),
+                context: std::ptr::null_mut(),
+                callback: None,
+                internal: [0; 4],
+            };
+            assert_eq!(begin(&mut block, (&raw mut gate).cast(), gated), S_OK);
+            let address = (&raw mut block) as usize;
+            std::thread::scope(|s| {
+                s.spawn(move || XAsyncComplete(address as *mut AsyncBlock, result, 0));
+                gate.entered.wait();
+                let polled = XAsyncGetStatus(address as *mut AsyncBlock, false);
+                XAsyncCancel(address as *mut AsyncBlock);
+                let scheduled = XAsyncSchedule(address as *mut AsyncBlock, 0);
+                let (ready, started) = mpsc::channel();
+                let (send, recv) = mpsc::channel();
+                s.spawn(move || {
+                    ready.send(()).unwrap();
+                    send.send(XAsyncGetStatus(address as *mut AsyncBlock, true))
+                        .unwrap();
+                });
+                started.recv().unwrap();
+                let early = recv.recv_timeout(Duration::from_millis(100));
+                gate.resume.wait();
+                assert_eq!(polled, E_PENDING);
+                assert_eq!(scheduled, E_INVALIDARG);
+                assert_eq!(gate.cancellations.load(Ordering::SeqCst), 0);
+                assert_eq!(early, Err(mpsc::RecvTimeoutError::Timeout));
+                assert_eq!(recv.recv_timeout(Duration::from_secs(5)), Ok(result));
+            });
+            assert_eq!(XAsyncGetStatus(&mut block, false), result);
+        }
+    }
+
     /// The call a test provider looks at in its cleanup, and what it saw
     /// (1: the completion lock was free, 2: held).
     static CLEANED: Mutex<Option<Arc<Call>>> = Mutex::new(None);
@@ -1776,7 +1852,7 @@ mod tests {
     extern "system" fn cleanup_checks(op: u32, _: *const ProviderData) -> HRESULT {
         if op == OP_CLEANUP {
             let call = CLEANED.lock().unwrap().clone();
-            let free = call.is_some_and(|c| c.done.try_lock().is_ok());
+            let free = call.is_some_and(|c| c.completion_status.try_lock().is_ok());
             SEEN.store(if free { 1 } else { 2 }, Ordering::SeqCst);
         }
         S_OK
