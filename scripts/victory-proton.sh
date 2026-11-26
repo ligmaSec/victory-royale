@@ -22,6 +22,27 @@ HELP
 
 pinned_asset=vkd3d-proton-ec20719-x64.tar.gz
 
+# Proton identifies a build by a version token, optionally preceded by its
+# build timestamp. Keep report fields single-line and free of install paths.
+proton_version_pattern='([0-9]{1,20} )?[A-Za-z0-9][A-Za-z0-9._+-]{0,95}'
+
+observed_proton_version() {
+    local log header version=
+    for log in "$1"/steam-*.log; do
+        [[ -f $log ]] || continue
+        # The header starts the log, after Proton's optional separator.
+        if ! header=$(head -c 256 -- "$log" 2>/dev/null |
+            LC_ALL=C awk 'NR == 1 && /^=+$/ { next } { print; exit }' |
+            LC_ALL=C grep -axE "Proton: $proton_version_pattern"); then
+            continue
+        fi
+        header=${header#Proton: }
+        if [[ -n $version && $version != "$header" ]]; then return 1; fi
+        version=$header
+    done
+    [[ -n $version ]] && printf '%s\n' "$version"
+}
+
 verify_runtime_archive() {
     local digest=64b13a6d73bb48394e0135a2048bcf423a69c08226ab410a8a8bde075f5ed4b5
     (cd -- "$1" && printf '%s  %s\n' "$digest" "$pinned_asset" | sha256sum --check --status)
@@ -228,7 +249,7 @@ if [[ -z $proton_path ]]; then
     done
 fi
 if [[ -z $library && -n $proton_path && -f $proton_path/version ]] &&
-    grep -q 'experimental-' "$proton_path/version"; then
+    grep -q -- 'experimental-' "$proton_path/version" 2>/dev/null; then
     # shortcut: only a Steam layout gives us a library to put the compat path in.
     case $proton_path in
         */steamapps/common/*) library=${proton_path%/common/*} ;;
@@ -258,6 +279,20 @@ if [[ -n $library ]]; then
 else
     command=(umu-run "Z:$windows_binary" run "Z:$windows_title" "$@")
 fi
+
+proton_selection=umu
+proton_selected_version=unknown
+if (( auto_experimental )); then
+    proton_selection=auto-experimental
+elif [[ -n $proton_path && ( -d $proton_path || $proton_path == */* ) ]]; then
+    proton_selection=explicit
+fi
+if [[ $proton_selection != umu && -f $proton_path/version && -r $proton_path/version ]]; then
+    proton_selected_version=$(head -c 256 -- "$proton_path/version" 2>/dev/null | head -n 1 |
+        LC_ALL=C grep -axE "$proton_version_pattern") || proton_selected_version=unknown
+fi
+printf 'Proton selection (%s): %s\n' "$proton_selection" "$proton_selected_version" >&2
+
 if [[ $mode != --report ]]; then
     if [[ -z $stage ]]; then exec "${command[@]}"; fi
     "${command[@]}"
@@ -282,6 +317,8 @@ export WINEDEBUG=${WINEDEBUG:--all,+timestamp,+pid,+tid,+seh}
     cd -- "${binary%/*}"
     sha256sum -- "${binary##*/}"
     printf 'runtime=%s\n' "${runtime:-proton}"
+    printf 'proton_selection=%s\n' "$proton_selection"
+    printf 'proton_selected_version=%s\n' "$proton_selected_version"
     if [[ $runtime == pinned ]]; then printf 'runtime_asset=%s\n' "$pinned_asset"; fi
     if [[ -f REVISION ]]; then
         printf 'package_revision=%s\n' "$(<REVISION)"
@@ -306,6 +343,9 @@ status=0
 trap ':' INT
 "${command[@]}" > "$report/launcher.log" 2>&1 || status=$?
 trap - INT
+proton_observed_version=$(observed_proton_version "$report") || proton_observed_version=unknown
+printf 'Proton observed in report: %s\n' "$proton_observed_version" >&2
+printf 'proton_observed_version=%s\n' "$proton_observed_version" >> "$report/build.txt"
 printf '%s\n' "$status" > "$report/launcher-exit.txt"
 # Keep the raw logs if archiving fails, and publish only complete archives.
 if tar -czf "$report.tar.gz.part" -C "$report" .; then

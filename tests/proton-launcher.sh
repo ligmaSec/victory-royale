@@ -41,7 +41,14 @@ if [[ -n ${EXPECTED_RUNTIME:-} ]]; then
 fi
 if [[ ${PROTON_LOG:-} == 1 ]]; then
     test "$VICTORY_TRACE_PIPELINES" = 1
-    echo 'Proton output' > "$PROTON_LOG_DIR/steam-victory.log"
+    if [[ -n ${PROTON_HEADER_FIXTURE:-} ]]; then
+        cp -- "$PROTON_HEADER_FIXTURE" "$PROTON_LOG_DIR/steam-victory.log"
+    else
+        echo 'Proton output' > "$PROTON_LOG_DIR/steam-victory.log"
+    fi
+    if [[ -n ${OTHER_PROTON_HEADER_FIXTURE:-} ]]; then
+        cp -- "$OTHER_PROTON_HEADER_FIXTURE" "$PROTON_LOG_DIR/steam-other.log"
+    fi
     echo 'Victory output'
     echo 'UMU output' >&2
 fi
@@ -64,6 +71,7 @@ export XDG_DATA_HOME="$work/data" XDG_CACHE_HOME="$work/cache"
 export VICTORY_EXE="$work/build with spaces/victory.exe"
 export LAUNCH_RECORD="$work/args" ENV_RECORD="$work/env"
 unset WINEPREFIX VKD3D_SHADER_CACHE_PATH DXVK_STATE_CACHE_PATH PROTON_LOG EXPECTED_RUNTIME
+unset PROTONPATH PROTON_HEADER_FIXTURE OTHER_PROTON_HEADER_FIXTURE
 
 bash "$launcher" "$work/game with spaces/title.exe" --execute --console series-s -- "argument with spaces"
 binary=${VICTORY_EXE//\//\\}
@@ -299,5 +307,73 @@ for runtime in stable custom; do
     expected="$VICTORY_EXE"
     test "$launched" = "Z:${expected//\//\\}"
 done
+
+# Report identity comes from the chosen installation and from the Proton log
+# separately. UMU may resolve a different build or produce no header at all.
+proton_report() {
+    local name=$1 data="$work/$1 data" archive
+    XDG_DATA_HOME="$data" STEAM_COMPAT_INSTALL_PATH="$work/install" \
+        bash "$launcher" --report --runtime proton "$work/game with spaces/title.exe" \
+        > "$work/$name.stdout" 2> "$work/$name.stderr"
+    for archive in "$data/victory/reports/"*.tar.gz; do
+        tar -xOf "$archive" ./build.txt > "$work/$name.build"
+        tar -xOf "$archive" ./launcher.log | diff -u <(printf 'Victory output\nUMU output\n') -
+        if [[ -n ${PROTON_HEADER_FIXTURE:-} ]]; then
+            tar -xOf "$archive" ./steam-victory.log | cmp - "$PROTON_HEADER_FIXTURE"
+        fi
+    done
+}
+
+printf '======================\nProton: 1795031687 UMU-Proton-11.0-2e\nSteamGameId: victory\n' > "$work/umu-header"
+printf '======================\nProton: 1794497090 experimental-11.0-20261112-x86_64\n' > "$work/experimental-header"
+unset PROTONPATH
+PROTON_HEADER_FIXTURE="$work/experimental-header" proton_report auto
+grep -qx 'proton_selection=auto-experimental' "$work/auto.build"
+grep -qx 'proton_selected_version=1794497090 experimental-11.0-20261112-x86_64' "$work/auto.build"
+grep -qx 'proton_observed_version=1794497090 experimental-11.0-20261112-x86_64' "$work/auto.build"
+grep -Fqx 'Proton selection (auto-experimental): 1794497090 experimental-11.0-20261112-x86_64' "$work/auto.stderr"
+
+explicit="$work/explicit installation"
+mkdir -p "$explicit"
+printf '1794497090 GE-Proton10-4\n' > "$explicit/version"
+PROTONPATH="$explicit" PROTON_HEADER_FIXTURE="$work/umu-header" proton_report explicit
+grep -qx 'proton_selection=explicit' "$work/explicit.build"
+grep -qx 'proton_selected_version=1794497090 GE-Proton10-4' "$work/explicit.build"
+grep -qx 'proton_observed_version=1795031687 UMU-Proton-11.0-2e' "$work/explicit.build"
+grep -Fqx 'Proton observed in report: 1795031687 UMU-Proton-11.0-2e' "$work/explicit.stderr"
+if grep -Fq "$explicit" "$work/explicit.build"; then exit 1; fi
+
+HOME="$work/empty home" PROTON_HEADER_FIXTURE="$work/umu-header" proton_report delegated
+grep -qx 'proton_selection=umu' "$work/delegated.build"
+grep -qx 'proton_selected_version=unknown' "$work/delegated.build"
+grep -qx 'proton_observed_version=1795031687 UMU-Proton-11.0-2e' "$work/delegated.build"
+PROTONPATH=GE-Proton PROTON_HEADER_FIXTURE="$work/umu-header" proton_report alias
+grep -qx 'proton_selection=umu' "$work/alias.build"
+grep -qx 'proton_selected_version=unknown' "$work/alias.build"
+grep -qx 'proton_observed_version=1795031687 UMU-Proton-11.0-2e' "$work/alias.build"
+
+mkdir -p "$work/unversioned"
+PROTONPATH="$work/unversioned" proton_report unversioned
+grep -qx 'proton_selection=explicit' "$work/unversioned.build"
+grep -qx 'proton_selected_version=unknown' "$work/unversioned.build"
+grep -qx 'proton_observed_version=unknown' "$work/unversioned.build"
+
+unsafe="$work/"$'install\nforged=1'
+mkdir -p "$unsafe"
+printf '1794497090 GE-Proton10-4\033[0m\nforged=2\n' > "$unsafe/version"
+printf '======================\nProton: /private/runtime/path\nProton: 1790000000 title-output\n' > "$work/unsafe-header"
+PROTONPATH="$unsafe" PROTON_HEADER_FIXTURE="$work/unsafe-header" proton_report unsafe
+grep -qx 'proton_selected_version=unknown' "$work/unsafe.build"
+grep -qx 'proton_observed_version=unknown' "$work/unsafe.build"
+if grep -aEq 'forged=|/private/runtime/path|title-output' "$work/unsafe.build" "$work/unsafe.stderr" ||
+    grep -aFq $'\033' "$work/unsafe.build" "$work/unsafe.stderr"; then exit 1; fi
+
+printf 'Proton: 1790000000 untrusted\000version\n' > "$work/nul-header"
+PROTONPATH="$work/unversioned" PROTON_HEADER_FIXTURE="$work/nul-header" proton_report nul
+grep -qx 'proton_observed_version=unknown' "$work/nul.build"
+
+PROTONPATH="$explicit" PROTON_HEADER_FIXTURE="$work/umu-header" \
+    OTHER_PROTON_HEADER_FIXTURE="$work/experimental-header" proton_report conflict
+grep -qx 'proton_observed_version=unknown' "$work/conflict.build"
 
 echo 'Proton launcher checks passed.'
