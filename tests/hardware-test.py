@@ -106,7 +106,10 @@ class HardwareRequest(unittest.TestCase):
             github.side_effect = [[{"number": 7, "title": "First scene", "head": "current", "wanted": False},
                                    {"number": 8, "title": "Check lights", "head": "other", "wanted": True},
                                    {"number": 11, "title": "Other PR", "head": "other", "wanted": False}],
-                                  [10, 12], [], [{"name": "victory-series-x-pr-9"},
+                                  [{"id": 10, "status": "completed", "conclusion": "success"},
+                                   {"id": 12, "status": "completed", "conclusion": "success"},
+                                   {"id": 14, "status": "completed", "conclusion": "failure"},
+                                   {"id": 15, "status": "in_progress", "conclusion": None}], [], [{"name": "victory-series-x-pr-9"},
                                                    {"name": "victory-series-x-pr-7"}]]
             runner.run()
             self.assertIn("#7  First scene", out.getvalue())
@@ -115,9 +118,11 @@ class HardwareRequest(unittest.TestCase):
             self.assertIn("/pull/8", out.getvalue())
             self.assertNotIn("#11", out.getvalue())
             self.assertNotIn("#9", out.getvalue())
-            self.assertIn("hardware-request.yml/runs?branch=main&event=workflow_dispatch&status=success",
+            self.assertNotIn("status=", github.call_args_list[1].args[0])
+            self.assertIn("actions/runs/12/artifacts?", github.call_args_list[2].args[0])
+            self.assertIn("actions/runs/10/artifacts?", github.call_args_list[3].args[0])
+            self.assertIn("hardware-request.yml/runs?branch=main&event=workflow_dispatch",
                           github.call_args_list[1].args[0])
-            self.assertIn("runs/12/artifacts", github.call_args_list[2].args[0])
             self.assertIn("expired == false", github.call_args_list[2].args[1])
             github.side_effect = [[]]
             runner.run()
