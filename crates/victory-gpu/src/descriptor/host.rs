@@ -2066,15 +2066,25 @@ impl HostHeap {
             // one and uploads what it shows. Made null here, the texture
             // read as nothing for as long as it waited in the queue, every
             // time it got sharper.
+            // Also a view of another placed texture of the same kind (moved,
+            // or one a title streams into a new place with more or fewer
+            // levels: `can_stand_for`): made null here, it read as black
+            // while the new one waited in the queue or for its memory. The
+            // slot holds the host copy it held already, until the pass or a
+            // draw makes the new one; nothing more is kept.
+            let shown = made[index as usize];
+            let old = view_at(shown as u32, (shown >> 32) as u32);
             if later
                 && keep_views()
-                && view_at(
-                    made[index as usize] as u32,
-                    (made[index as usize] >> 32) as u32,
-                )
-                .is_some_and(|old| same_placed_texture(&old, &view))
+                && old
+                    .as_ref()
+                    .is_some_and(|old| same_placed_texture(old, &view))
             {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some(view);
+            }
+            if later && keep_shown() && old.as_ref().is_some_and(|old| can_stand_for(old, &view)) {
+                KEPT_STANDING_IN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
             made[index as usize] = if later { 0 } else { key };
@@ -3047,6 +3057,46 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
     }
 }
 
+/// Writes of a slot with a view of another placed texture that can stand
+/// for the one it showed ([`can_stand_for`]), since the start: the slot
+/// kept showing the old one until the new was made.
+pub(crate) static KEPT_STANDING_IN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a slot written with a view of another placed texture of the same
+/// kind keeps showing the one it shows until the new one is made
+/// (`VICTORY_KEEP_SHOWN=0`: made null at once, black until then, as before).
+/// avatarmanz/VIctory-7900XTX `d1c412c`, its level 1.
+fn keep_shown() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_SHOWN").is_none_or(|v| v != "0"))
+}
+
+/// Whether `old`, the placed texture view a slot shows, can be shown in
+/// place of `new`, a view of another placed texture, until `new` is made:
+/// both textures (not buffers) and views of one dimension and format, and
+/// either the same resource description elsewhere (moved) or the same kind
+/// of texture with the same aspect in another size (a title that streams a
+/// texture in places it anew with more levels). Not another kind of texture:
+/// what it would show is not this one's.
+fn can_stand_for(old: &View, new: &View) -> bool {
+    let (View::Placed(false, a, from), View::Placed(false, b, to)) = (old, new) else {
+        return false;
+    };
+    if a[0] == 1 || b[0] == 1 || a[0] != b[0] || from[..2] != to[..2] {
+        return false;
+    }
+    // (Width, 64 bits, height, depth and levels, format: words 4 to 8.)
+    if a[2..13] == b[2..13] {
+        return true;
+    }
+    let (wide, high) = ([a[4], b[4]].map(u64::from), [a[6], b[6]].map(u64::from));
+    a[8] == b[8]
+        && !wide.contains(&0)
+        && !high.contains(&0)
+        && wide[0] * high[1] == wide[1] * high[0]
+}
+
 /// A shader view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
@@ -3514,6 +3564,49 @@ mod tests {
             &View::Placed(true, resource, desc)
         ));
         assert!(!same_placed_texture(&low, &View::Shader(0, None)));
+    }
+
+    /// A slot written with another texture goes on showing the old one only
+    /// if it is of the same kind: moved, or in another size of one aspect;
+    /// never a buffer, another format, dimension or shape.
+    #[test]
+    fn only_a_texture_of_its_kind_stands_for_a_new_one() {
+        let texture = [3, 0, 0, 0, 512, 0, 256, 0x8_0001, 98, 1, 0, 0x105, 0, 0];
+        let view = |resource: [u32; 14], format: u32, dimension: u32, address: u32| {
+            let mut desc = [0u32; 16];
+            (desc[0], desc[1], desc[10], desc[11]) = (format, dimension, address, 0xb);
+            View::Placed(false, resource, desc)
+        };
+        let old = view(texture, 98, 4, 0x1000_0000);
+        let mut twice = texture;
+        (twice[4], twice[6], twice[7]) = (1024, 512, 0x9_0001);
+        let mut square = texture;
+        square[6] = 512;
+        let mut buffer = texture;
+        buffer[0] = 1;
+        let mut other_format = twice;
+        other_format[8] = 83;
+        let mut empty = texture;
+        (empty[4], empty[6]) = (0, 0);
+        assert!(can_stand_for(&old, &view(texture, 98, 4, 0x2000_0000)));
+        assert!(can_stand_for(&old, &view(twice, 98, 4, 0x2000_0000)));
+        assert!(!can_stand_for(&old, &view(square, 98, 4, 0x2000_0000)));
+        assert!(!can_stand_for(
+            &old,
+            &view(other_format, 98, 4, 0x2000_0000)
+        ));
+        assert!(!can_stand_for(&old, &view(twice, 83, 4, 0x2000_0000)));
+        assert!(!can_stand_for(&old, &view(texture, 98, 9, 0x2000_0000)));
+        assert!(!can_stand_for(&old, &view(buffer, 98, 4, 0x2000_0000)));
+        assert!(!can_stand_for(
+            &view(empty, 98, 4, 0x1000_0000),
+            &view(twice, 98, 4, 0x2000_0000)
+        ));
+        let View::Placed(_, resource, desc) = view(texture, 98, 4, 0x2000_0000) else {
+            unreachable!()
+        };
+        assert!(!can_stand_for(&old, &View::Placed(true, resource, desc)));
+        assert!(!can_stand_for(&old, &View::Shader(0, None)));
     }
 
     /// The texture that stands for missing ones can be made and viewed.
