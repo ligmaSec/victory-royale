@@ -95,7 +95,8 @@ target\release\victory.exe run <game dir>\<the title's exe> --execute --console 
 ```
 
 Series S lowers the scene resolution and can reduce memory usage. The UI
-uses a separate presentation plane and can still render at a higher resolution.
+uses a separate presentation plane. VIctory scales it to the scene output and
+composites it on top so the account picker, menus, and HUD can be shown.
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived

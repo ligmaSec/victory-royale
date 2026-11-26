@@ -10,14 +10,17 @@ use std::sync::{Mutex, OnceLock};
 use windows::Win32::Foundation::{
     DXGI_STATUS_OCCLUDED, HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM,
 };
-use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+use windows::Win32::Graphics::Direct3D::{
+    D3D_FEATURE_LEVEL_12_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
+};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{HRESULT, Interface, PCWSTR, w};
+use windows::core::{HRESULT, Interface, PCSTR, PCWSTR, s, w};
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -2989,6 +2992,8 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 }
 
 const BUFFERS: u32 = 2;
+mod compositor;
+use compositor::Compositor;
 
 /// Luminance bounds of the host display when HDR (HDR10 / PQ) is active on
 /// Windows.
@@ -3056,6 +3061,7 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     last_present_issue: Option<HRESULT>,
+    compositor: Option<Compositor>,
 }
 
 /// A successful DXGI status may still mean nothing was presented.
@@ -3239,14 +3245,33 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown or the diagnostic probe has no reading. Otherwise diagnostics
     /// builds report whether the sampled pixels were black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
+        self.present_with_compositor(
+            planes,
+            frame,
+            Compositor::new,
+            #[cfg(all(test, feature = "diagnostics"))]
+            |_, _| {},
+        )
+    }
+
+    fn present_with_compositor(
+        &self,
+        planes: &[(&ID3D12Resource, u32)],
+        frame: u64,
+        create_compositor: impl FnOnce(&ID3D12Device, DXGI_FORMAT) -> windows::core::Result<Compositor>,
+        #[cfg(all(test, feature = "diagnostics"))] inspect: impl FnOnce(
+            &ID3D12Resource,
+            &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        ),
+    ) -> Option<bool> {
+        let &(texture, state) = planes.first()?;
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         let mut retry = self.present_retry.lock().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
@@ -3255,6 +3280,33 @@ impl Host {
         if !retry.due(now) {
             return None;
         }
+        let planes = if planes.len() > 1 && !planes.iter().all(|(t, _)| compositor::can_sample(t)) {
+            &planes[..1]
+        } else {
+            planes
+        };
+        let cached_format = presenter
+            .as_ref()
+            .and_then(|p| p.compositor.as_ref())
+            .map(|c| c.format);
+        let mut new_compositor = None;
+        let planes = if planes.len() > 1 && cached_format != Some(format) {
+            match create_compositor(&self.device, format) {
+                Ok(c) => {
+                    new_compositor = Some(c);
+                    planes
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "presenting the primary plane after compositor initialization failed");
+                    &planes[..1]
+                }
+            }
+        } else {
+            planes
+        };
+        // Keep the scene plane's presentation size. The UI is sampled at its
+        // own resolution, then scaled to the existing output by the compositor.
+        let (width, height) = (desc.Width as u32, desc.Height);
         if presenter.is_none() {
             match self.presenter(width, height, format) {
                 Ok(p) => {
@@ -3288,6 +3340,9 @@ impl Host {
             }
         }
         let p = presenter.as_mut()?;
+        if let Some(c) = new_compositor {
+            p.compositor = Some(c);
+        }
         if (p.width, p.height, p.format) != (width, height, format) {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
@@ -3336,42 +3391,65 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
+            let written = if planes.len() == 1 {
+                let src = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                if state != src {
+                    list.ResourceBarrier(&[transition(texture, state, src)]);
+                }
+                list.ResourceBarrier(&[transition(
                     &back,
                     D3D12_RESOURCE_STATE_PRESENT,
                     D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            // Diagnostics: `VICTORY_SHOW_TARGET` shows one of the title's render targets instead.
-            #[cfg(feature = "diagnostics")]
-            let shown = crate::capture::show(list, &back);
-            #[cfg(not(feature = "diagnostics"))]
-            let shown = false;
-            if !shown {
+                )]);
                 list.CopyResource(&back, texture);
-            }
+                if state != src {
+                    list.ResourceBarrier(&[transition(texture, src, state)]);
+                }
+                D3D12_RESOURCE_STATE_COPY_DEST
+            } else {
+                p.compositor
+                    .as_ref()?
+                    .draw(&self.device, list, &back, planes, width, height);
+                D3D12_RESOURCE_STATE_RENDER_TARGET
+            };
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
-            #[cfg(feature = "diagnostics")]
-            let probe = crate::capture::probe(&self.device, list, texture);
-            #[cfg(not(feature = "diagnostics"))]
-            let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
+            let (capture, probe) = {
+                let mut written = written;
+                if crate::capture::show_spec().is_some() {
+                    if written != D3D12_RESOURCE_STATE_COPY_DEST {
+                        list.ResourceBarrier(&[transition(
+                            &back,
+                            written,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )]);
+                        written = D3D12_RESOURCE_STATE_COPY_DEST;
+                    }
+                    crate::capture::show(list, &back);
+                }
+                list.ResourceBarrier(&[transition(
                     &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    written,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let capture = (cfg!(test) || crate::capture::wanted(frame))
+                    .then(|| crate::capture::read_back(&self.device, list, &back))
+                    .flatten();
+                let probe = crate::capture::probe(&self.device, list, &back);
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
                     D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+                )]);
+                (capture, probe)
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            list.ResourceBarrier(&[transition(&back, written, D3D12_RESOURCE_STATE_PRESENT)]);
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
+                #[cfg(test)]
+                inspect(&buffer, &footprint);
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
@@ -3455,6 +3533,7 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 last_present_issue: None,
+                compositor: None,
             };
             p.sync_color_space(display_hdr_info().is_some());
             Ok(p)
@@ -4589,5 +4668,123 @@ mod present_retry {
         ] {
             assert!(!step.name().is_empty());
         }
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod present_plane_tests {
+    use super::*;
+
+    #[test]
+    fn compositor_failure_presents_primary_in_the_same_frame() {
+        let Some(host) = host() else {
+            assert!(
+                std::env::var_os("VICTORY_D3D12_WARP").is_none(),
+                "requested WARP device unavailable"
+            );
+            eprintln!("skipping PresentX recovery: no D3D12 device");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let make_plane = |width, height, color: &[f32; 4]| {
+            let mut texture = None;
+            // SAFETY: live device, valid render target description, and an open list.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: width,
+                            Height: height,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+                let texture = texture.unwrap();
+                list.list
+                    .ClearRenderTargetView(host.rtv(Some(&texture), None), color, None);
+                texture
+            }
+        };
+        let scene = make_plane(32, 32, &[1.0, 0.0, 0.0, 1.0]);
+        let overlay = make_plane(64, 64, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        list.close();
+        host.execute(&[&list]);
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        assert!(
+            host.present(&[(&scene, state)], 1).is_some(),
+            "single-plane control"
+        );
+        let first_pixel =
+            |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+                let mut mapped = std::ptr::null_mut();
+                // SAFETY: the present copy has completed. The footprint names
+                // a live RGBA pixel inside the readback buffer.
+                let rgba = unsafe {
+                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                    let rgba = mapped
+                        .cast::<u8>()
+                        .add(footprint.Offset as usize)
+                        .cast::<[u8; 4]>()
+                        .read();
+                    buffer.Unmap(0, None);
+                    rgba
+                };
+                (footprint.Footprint.Width, footprint.Footprint.Height, rgba)
+            };
+
+        let mut attempted = false;
+        let mut fallback = None;
+        let shown = host.present_with_compositor(
+            &[(&scene, state), (&overlay, state)],
+            2,
+            |_, _| {
+                attempted = true;
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ))
+            },
+            |buffer, footprint| fallback = Some(first_pixel(buffer, footprint)),
+        );
+        assert!(attempted);
+        assert!(
+            shown.is_some(),
+            "the primary plane must still be shown in this frame"
+        );
+        assert_eq!(fallback, Some((32, 32, [255, 0, 0, 255])));
+        let presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let swap_chain = presentation.as_ref().unwrap();
+        assert_eq!((swap_chain.width, swap_chain.height), (32, 32));
+        drop(presentation);
+
+        let mut composite = None;
+        assert!(
+            host.present_with_compositor(
+                &[(&scene, state), (&overlay, state)],
+                3,
+                Compositor::new,
+                |buffer, footprint| composite = Some(first_pixel(buffer, footprint)),
+            )
+            .is_some(),
+            "compositor initialization can be retried after failure"
+        );
+        // Premultiplied half-blue over opaque red.
+        assert_eq!(composite, Some((32, 32, [127, 0, 128, 255])));
     }
 }

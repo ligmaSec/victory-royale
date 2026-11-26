@@ -921,18 +921,6 @@ pub(crate) struct HostTexture {
     pub(crate) state: std::sync::atomic::AtomicU32,
 }
 
-/// Moves the host texture to `wanted` (a host texture state); the host
-/// resource and the state it leaves, if that is a change.
-#[cfg(windows)]
-pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
-    use windows::core::Interface;
-    let host = resource(this).host()?;
-    let before = host
-        .state
-        .swap(wanted, std::sync::atomic::Ordering::Relaxed);
-    (before != wanted).then(|| (host.texture.as_raw(), before))
-}
-
 /// The host GPU's copy of a title resource, if it has one.
 #[cfg(windows)]
 pub(crate) fn host_resource<'a>(
@@ -2646,7 +2634,11 @@ void main() {
         let readback = readback.unwrap();
         let host_image = host_resource(image).unwrap();
         let back = host.new_list().unwrap();
-        let (_, before) = host_transition(image, 0x800).unwrap();
+        let before = resource(image)
+            .host()
+            .unwrap()
+            .state
+            .swap(0x800, std::sync::atomic::Ordering::Relaxed);
         // The upload list holds the texture until it is reset.
         assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
         use windows::core::Interface;

@@ -266,7 +266,7 @@ fn dump_on() -> bool {
 
 /// `VICTORY_SHOW_TARGET=<w>x<h>-f<format>` (e.g. `2560x1440-f28`): the size and format of
 /// the render target to show in place of the title's frame.
-fn show_spec() -> Option<(u64, u32, i32)> {
+pub(crate) fn show_spec() -> Option<(u64, u32, i32)> {
     static SPEC: std::sync::OnceLock<Option<(u64, u32, i32)>> = std::sync::OnceLock::new();
     *SPEC.get_or_init(|| parse_show_spec(&std::env::var("VICTORY_SHOW_TARGET").ok()?))
 }

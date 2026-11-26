@@ -208,13 +208,15 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// PresentX plane layout. The frame token and resource array head each 0x48-byte record.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    _remaining: [u64; 6],
 }
+const _: () = assert!(size_of::<Plane>() == 0x48);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -333,10 +335,9 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
-///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+pub(crate) const MAX_PRESENT_PLANES: usize = 8;
+
+/// Queue the first resource of each display plane in the title's stacking order.
 extern "system" fn present(
     this: This,
     planes: u32,
@@ -345,27 +346,29 @@ extern "system" fn present(
 ) -> HRESULT {
     // Read now: the parameters are the title's, maybe on its stack. The
     // frame is shown in the queue's order, after the work before it.
-    let plane = if planes > 0 {
-        // SAFETY: the title passes `planes` plane descriptions.
-        unsafe { plane_parameters.as_ref() }
-    } else {
-        None
-    };
-    let resource = plane
-        .filter(|plane| plane.count > 0 && !plane.resources.is_null())
-        // SAFETY: the plane lists `count` resources.
-        .map(|plane| unsafe { *plane.resources })
-        .filter(|resource| !resource.is_null())
-        .map(object::Held::new);
+    let mut held: [Option<object::Held>; MAX_PRESENT_PLANES] = Default::default();
+    if !plane_parameters.is_null() {
+        for (i, slot) in held.iter_mut().take(planes as usize).enumerate() {
+            // SAFETY: PresentX supplies 0x48 bytes per plane, with this header.
+            let plane = unsafe { &*plane_parameters.add(i) };
+            if plane.count > 0 && !plane.resources.is_null() {
+                // SAFETY: the plane has at least one resource.
+                let resource = unsafe { *plane.resources };
+                if !resource.is_null() {
+                    *slot = Some(object::Held::new(resource));
+                }
+            }
+        }
+    }
     queue(this)
         .timeline
-        .submit(Op::Run(Box::new(move || show(resource))));
+        .submit(Op::Run(Box::new(move || show(held))));
     S_OK
 }
 
 /// A present, once the queue's work before it has run: counts the frame
-/// and shows the plane's first resource.
-fn show(resource: Option<object::Held>) {
+/// and shows its display planes.
+fn show(held: [Option<object::Held>; MAX_PRESENT_PLANES]) {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -403,22 +406,31 @@ fn show(resource: Option<object::Held>) {
         }
     }
     #[cfg(windows)]
-    if let Some(resource) = resource.as_ref().map(object::Held::get)
-        && let Some(texture) = crate::resource::host_resource(resource)
-        && let Some(host) = crate::host::host()
-    {
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+    if let Some(host) = crate::host::host() {
+        let copies = held.each_ref().map(|owner| {
+            let id = owner.as_ref()?.get();
+            Some((id, crate::resource::host_copy(id)?))
+        });
+        let mut layers = copies.iter().flatten();
+        if let Some((id, primary)) = layers.next() {
+            // Presentation restores every host texture before the queue proceeds.
+            // Aliased planes therefore read the same original tracked state.
+            let primary = (&primary.texture, primary.state.load(Ordering::Relaxed));
+            let mut sources = [primary; MAX_PRESENT_PLANES];
+            let mut count = 1;
+            for (_, copy) in layers {
+                sources[count] = (&copy.texture, copy.state.load(Ordering::Relaxed));
+                count += 1;
+            }
+            let shown = host.present(&sources[..count], frame);
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, *id, primary.1, shown);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = (id, shown);
+        }
     }
     #[cfg(not(windows))]
-    let _ = resource;
+    let _ = held;
 }
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
@@ -803,7 +815,10 @@ mod tests {
             S_OK
         );
         assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut done), S_OK);
-        let resource = crate::resource::test_buffer(256);
+        let resources = [
+            crate::resource::test_buffer(256),
+            crate::resource::test_buffer(256),
+        ];
 
         let signal = |q: This| slot::<Sync>(q, signal_slot(q));
         let wait = |q: This| slot::<Sync>(q, signal_slot(q) + 8);
@@ -817,13 +832,17 @@ mod tests {
         {
             // Caller's plane parameters may live on its stack and be gone
             // before the queue wakes.
-            let resources = Box::new([resource]);
-            let plane = Box::new(Plane {
+            let resources = Box::new(resources);
+            let planes = resources.each_ref().map(|resource| Plane {
                 token: 1,
                 count: 1,
-                resources: resources.as_ptr(),
+                resources: std::ptr::from_ref(resource),
+                _remaining: [0; 6],
             });
-            assert_eq!(present(waits)(waits, 1, &*plane, std::ptr::null()), S_OK);
+            assert_eq!(
+                present(waits)(waits, 2, planes.as_ptr(), std::ptr::null()),
+                S_OK
+            );
         }
         assert_eq!(signal(waits)(waits, done, 1), S_OK);
 
@@ -834,13 +853,17 @@ mod tests {
         );
         assert_eq!(completed(done), 0);
         // The queued present holds a reference of its own.
-        assert_eq!(add_ref(resource), 3);
-        assert_eq!(release(resource), 2);
+        for resource in resources {
+            assert_eq!(add_ref(resource), 3);
+            assert_eq!(release(resource), 2);
+        }
 
         assert_eq!(signal(signals)(signals, ready, 1), S_OK);
         assert_eq!(FRAMES.load(Ordering::Relaxed), before + 1);
         assert_eq!(completed(done), 1);
-        assert_eq!(release(resource), 0, "present gave back its reference");
+        for resource in resources {
+            assert_eq!(release(resource), 0, "present gave back its reference");
+        }
 
         // Not held any more: present runs at once.
         assert_eq!(

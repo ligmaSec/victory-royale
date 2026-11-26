@@ -93,6 +93,10 @@ jobs:
         env:
           VICTORY_D3D12_WARP: "1"
         run: cargo test -p victory-gpu --lib --features diagnostics --locked world_capture -- --test-threads=1
+      - name: Read back composed display planes on WARP
+        env:
+          VICTORY_D3D12_WARP: "1"
+        run: cargo test -p victory-gpu --lib --features diagnostics --locked present_plane_tests -- --test-threads=1
 
   msrv:
     needs: fmt-policy
