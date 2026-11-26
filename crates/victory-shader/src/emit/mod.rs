@@ -1014,6 +1014,154 @@ mod tests {
     }
 
     #[test]
+    fn mesh_reads_a_reused_scalar_only_after_its_guard() {
+        use crate::native::MeshIo;
+
+        let mut position = varying("SV_Position", 0, 0);
+        position.kind = 3;
+        let outputs = container::signature(&[position], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &outputs)]);
+        let container = Container::parse(&bytes).unwrap();
+        let build = |read_mask: bool| {
+            let words = [
+                0xD765_0000,
+                0x0001_00C1, // v_mbcnt_lo_u32_b32 v0, -1, 0
+                0x7E0C_02F2, // v_mov_b32 v6, 1.0
+                0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
+                0x020C_0CF3, // v_cndmask_b32 v6, -1.0, v6, vcc
+                0x7E0E_02F2, // v_mov_b32 v7, 1.0
+                0x7D84_0082, // v_cmp_eq_u32 vcc, 2, v0
+                0x020E_0EF3, // v_cndmask_b32 v7, -1.0, v7, vcc
+                0x7E10_02F0, // v_mov_b32 v8, 0.5
+                0x7E12_02F2, // v_mov_b32 v9, 1.0
+                0xF800_00CF,
+                0x0908_0706,                        // exp pos0 v6, v7, v8, v9
+                0x7E04_0505,                        // s2 = mesh group id
+                0xBF06_8002,                        // s_cmp_eq_u32 s2, 0
+                0xBF84_0003,                        // nonzero group goes to scalar assignment
+                0xBE90_047E,                        // s_mov_b64 s[16:17], exec
+                0xBE93_0380 | u32::from(read_mask), // s19 = 0 or 1 on the mask edge
+                0xBF82_0003,                        // join
+                0xBE91_03FF,
+                0x0020_0400, // s17 = packed indices 0, 1, 2
+                0xBE93_0381, // s19 = 1
+                0xBF06_8113, // s_cmp_eq_u32 s19, 1
+                0xBF84_0003, // skip export on a false guard
+                0x7E02_0211, // v_mov_b32 v1, s17
+                0xF800_0941,
+                0x0000_0001, // exp prim v1, off, off, off done
+                0xBF81_0000, // s_endpgm
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Ms,
+                wave64: true,
+                vgprs: 10,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ms(MeshIo {
+                    outputs: vec![],
+                    clip_cntl: 0,
+                    threads: 32,
+                    max_vertices: 32,
+                    max_primitives: 32,
+                    topology: 2,
+                    lds_bytes: 0,
+                }),
+                code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+            };
+            translate_native::<false>(
+                &container,
+                &native,
+                ComputeWaves::with_wave32(true),
+                None,
+                None,
+            )
+        };
+        let host = build(false).expect("register holds scalar data at the export");
+        assert_eq!(host.stage, HwStage::Ms);
+        #[cfg(windows)]
+        if let Some(mut v) = validator::Validator::for_test() {
+            v.validate(&mut host.dxil.clone()).unwrap();
+        }
+        let refusal = build(true).expect_err("the mask edge now reaches the export");
+        assert!(
+            matches!(
+                refusal,
+                ShaderError::Unsupported {
+                    what: "a lane mask read as data",
+                    ..
+                }
+            ),
+            "{refusal}"
+        );
+        #[cfg(windows)]
+        check_guarded_mesh_pixels(&host);
+    }
+
+    #[cfg(windows)]
+    fn check_guarded_mesh_pixels(mesh: &HostShader) {
+        use super::host::{Draw, Host};
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 device; skipped guarded mesh readback");
+            return;
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+        // SAFETY: the feature query writes its own Options7 structure.
+        let queried = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS7,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+        if queried.is_err() || options.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED {
+            eprintln!("no mesh shader support; skipped guarded mesh readback");
+            return;
+        }
+
+        let ps = HostShader {
+            dxil: constant_color(),
+            ..super::host::stub_ps()
+        };
+        let (root, pipeline) = host.mesh_pipeline(mesh, &ps).unwrap();
+        let draw = |mesh_groups| {
+            host.draw(
+                &root,
+                &pipeline,
+                &Draw {
+                    roots: vec![],
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &[],
+                    stride: 0,
+                    size: (8, 8),
+                    mesh_groups,
+                },
+            )
+            .unwrap()
+        };
+        let clear = [0.0; 4];
+        let color = [1.0, 0.5, 0.25, 1.0];
+        // Group zero takes the mask edge and leaves its primitives culled.
+        assert_eq!(draw(1), vec![clear; 64]);
+        // Group one takes the scalar edge and emits the lower-left triangle.
+        let pixels = draw(2);
+        assert_eq!(pixels.len(), 64);
+        for (i, pixel) in pixels.into_iter().enumerate() {
+            let (x, y) = (i % 8, i / 8);
+            if x < y {
+                assert_eq!(pixel, color, "inside triangle at ({x}, {y})");
+            } else if x > y {
+                assert_eq!(pixel, clear, "outside triangle at ({x}, {y})");
+            } else {
+                assert!(pixel == clear || pixel == color, "edge at ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
     fn oversized_mesh_keeps_only_exports_needed_by_its_pixel_shader() {
         use crate::native::{MeshIo, Usage, VsOutput};
 
