@@ -7,14 +7,14 @@
 //! title's GPU watchdog ended the run (decision 0007, "Pipelines made off
 //! the title's threads").
 //!
-//! A first use queues the pipeline and waits for it within a budget per
-//! frame, so the cheap ones (menus, one-off passes such as a colour-grading
-//! bake) are there at once as before; past the budget a draw or dispatch
-//! whose pipeline is not ready is dropped, as an untranslated one is.
+//! A first use queues the pipeline. Recording threads can wait up to half a
+//! second per frame and per pipeline. Cheap one-off passes, such as a
+//! colour-grading bake, can finish on first use. A draw or dispatch skips
+//! an unfinished pipeline after either allowance expires. Later frames
+//! can use the pipeline as soon as a worker finishes it.
 //!
-//! shortcut: the budget (half a second of waiting per title frame) is a
-//! guess; a pass the title runs only once and whose pipeline takes longer
-//! is lost.
+//! shortcut: the half-second allowance is a guess. A one-off pass can be
+//! lost if its pipeline finishes after the draw stops waiting.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -33,6 +33,8 @@ pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Arc<GraphicsState>>,
     queue_state: AtomicU8,
+    wait_budget: Mutex<PipelineWait>,
+    done: Condvar,
     made: OnceLock<Option<Arc<HostPipeline>>>,
     bindings: OnceLock<Vec<StructuredBinding>>,
     strides: Strides,
@@ -68,6 +70,8 @@ impl Pending {
             shaders,
             graphics: graphics.map(Arc::from),
             queue_state: AtomicU8::new(NOT_QUEUED),
+            wait_budget: Mutex::new(PipelineWait::default()),
+            done: Condvar::new(),
             made: OnceLock::new(),
             bindings: OnceLock::new(),
             strides: Vec::new(),
@@ -99,9 +103,8 @@ impl Pending {
                 HostPipeline::new(&shaders, self.graphics.as_deref(), &self.strides).map(Arc::new)
             }
         });
-        let (lock, done) = &DONE;
-        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-        done.notify_all();
+        let _held = self.wait_budget.lock().unwrap_or_else(|e| e.into_inner());
+        self.done.notify_all();
     }
 
     fn find_stride_bindings(&self) -> Option<Vec<StructuredBinding>> {
@@ -231,11 +234,35 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
-/// Signalled whenever a worker has made a pipeline.
-static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
-
 /// Waiting allowed per title frame, over all threads.
 const BUDGET: Duration = Duration::from_millis(500);
+
+/// Wall time for which at least one recording thread waited on this pipeline.
+#[derive(Default)]
+struct PipelineWait {
+    spent: Duration,
+    since: Option<Instant>,
+    threads: usize,
+}
+
+impl PipelineWait {
+    fn begin(&mut self, now: Instant) -> Duration {
+        let since = *self.since.get_or_insert(now);
+        self.threads += 1;
+        BUDGET.saturating_sub(self.spent + now.duration_since(since))
+    }
+
+    fn end(&mut self, now: Instant) {
+        self.threads -= 1;
+        if self.threads == 0 {
+            let since = self
+                .since
+                .take()
+                .expect("the first waiter started the clock");
+            self.spent = (self.spent + now.duration_since(since)).min(BUDGET);
+        }
+    }
+}
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -305,6 +332,8 @@ pub(super) fn ready_variant(
                 shaders: p.shaders.clone(),
                 graphics: p.graphics.clone(),
                 queue_state: AtomicU8::new(NOT_QUEUED),
+                wait_budget: Mutex::new(PipelineWait::default()),
+                done: Condvar::new(),
                 made: OnceLock::new(),
                 bindings: OnceLock::new(),
                 strides: strides.to_vec(),
@@ -333,7 +362,7 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
-/// Waits for `p` while frame `frame` has budget left.
+/// Waits while both the frame and this pipeline have budget left.
 fn wait(p: &Pending, frame: u64) {
     static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
     static WAITED_US: AtomicU64 = AtomicU64::new(0);
@@ -341,20 +370,32 @@ fn wait(p: &Pending, frame: u64) {
         WAITED_US.store(0, Ordering::Relaxed);
     }
     let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    if left.is_zero() || p.made.get().is_some() {
+        return;
+    }
+    let mut budget = p.wait_budget.lock().unwrap_or_else(|e| e.into_inner());
+    if budget.spent == BUDGET || p.made.get().is_some() {
+        return;
+    }
     let started = Instant::now();
-    let (lock, done) = &DONE;
-    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let left = left.min(budget.begin(started));
     while p.made.get().is_none() {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
         }
-        held = done
-            .wait_timeout(held, rest)
+        budget = p
+            .done
+            .wait_timeout(budget, rest)
             .unwrap_or_else(|e| e.into_inner())
             .0;
     }
-    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    let end = Instant::now();
+    budget.end(end);
+    WAITED_US.fetch_add(
+        end.duration_since(started).as_micros() as u64,
+        Ordering::Relaxed,
+    );
 }
 
 const NOT_QUEUED: u8 = 0;
@@ -497,11 +538,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pipeline_wait_spans_frames_and_counts_overlapping_waiters_once() {
+        let mut budget = PipelineWait::default();
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        assert_eq!(budget.begin(start), BUDGET);
+        assert_eq!(budget.begin(at(50)), BUDGET - Duration::from_millis(50));
+        budget.end(at(80));
+        budget.end(at(100));
+        // Idle time between draws does not consume the remaining allowance.
+        assert_eq!(budget.begin(at(1000)), BUDGET - Duration::from_millis(100));
+        budget.end(at(1401));
+        assert_eq!(budget.begin(at(2000)), Duration::ZERO);
+        budget.end(at(2000));
+    }
+
+    fn compute_shader() -> Arc<Shader> {
+        use victory_shader::native::{ComputeIo, StageIo};
+        use victory_shader::{HwStage, NativeProgram};
+        Shader::test_compute(NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 1,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code: 0xBF81_0000u32.to_le_bytes().to_vec(), // s_endpgm
+        })
+    }
+
+    #[test]
+    fn a_pipeline_that_finishes_after_its_allowance_still_runs() {
+        let _scope = crate::host::isolated_retire_scope();
+        if crate::host::host().is_none() {
+            return;
+        }
+        let p = Arc::new(Pending::new(vec![compute_shader()], None));
+        p.wait_budget.lock().unwrap().spent = BUDGET;
+        wait(&p, crate::frame::current());
+        assert!(p.made.get().is_none());
+        p.make();
+        assert!(ready(&p).is_some());
+    }
+
+    #[test]
     fn indirect_draws_without_a_pipeline_leave_budget_for_a_later_record() {
         use crate::object::{self, S_OK};
         use crate::pipeline::{PIPELINE_IIDS, Pipeline, hand_out};
-        use victory_shader::native::{ComputeIo, StageIo};
-        use victory_shader::{HwStage, NativeProgram};
 
         let _scope = crate::host::isolated_retire_scope();
         let Some(host) = crate::host::host() else {
@@ -519,18 +605,7 @@ mod tests {
             pipeline
         };
         let missing = create(vec![]); // no vertex or mesh stage
-        let compute = create(vec![Shader::test_compute(NativeProgram {
-            stage: HwStage::Cs,
-            wave64: false,
-            vgprs: 1,
-            layout: vec![],
-            used: vec![],
-            io: StageIo::Cs(ComputeIo {
-                rsrc2: 0,
-                threads: [1, 1, 1],
-            }),
-            code: 0xBF81_0000u32.to_le_bytes().to_vec(), // s_endpgm
-        })]);
+        let compute = create(vec![compute_shader()]);
         let list = host.new_list().unwrap();
         // Two skipped draws could consume the whole list budget. The last
         // record dispatches three groups through a working host pipeline.
@@ -593,5 +668,32 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
         assert!(queue.pop().is_none());
+    }
+}
+
+#[cfg(test)]
+mod wait_study {
+    use super::*;
+
+    #[test]
+    #[ignore = "twenty-frame wall-clock benchmark with one unfinished pipeline"]
+    fn repeated_frames() {
+        let pending = Pending::new(Vec::new(), None);
+        let resolved = Pending::new(Vec::new(), None);
+        assert!(resolved.made.set(None).is_ok());
+        for frame in 1..=20 {
+            let frame_start = Instant::now();
+            std::thread::sleep(Duration::from_millis(16));
+            let start = Instant::now();
+            wait(&pending, frame);
+            let pending_us = start.elapsed().as_micros();
+            let start = Instant::now();
+            wait(&resolved, frame);
+            let ready_us = start.elapsed().as_micros();
+            let frame_us = frame_start.elapsed().as_micros();
+            println!(
+                "frame={frame} frame_us={frame_us} pending_us={pending_us} ready_us={ready_us}"
+            );
+        }
     }
 }
