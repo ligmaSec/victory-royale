@@ -315,7 +315,7 @@ class RequestDelivery(unittest.TestCase):
         manifest.write_text(json.dumps(changed), encoding="utf-8")
         title = self.root / "fixture.exe"
         title.touch()
-        def launch(side, folder, game, results, windows, console):
+        def launch(side, folder, game, results, windows, console, fresh_profile):
             self.assertEqual(console, "series-s")
             (results / (side + ".log")).write_text("synthetic run")
         def menu(title, context, lines, actions, default, cancel):

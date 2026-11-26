@@ -141,13 +141,18 @@ def choose_title():
     return Path(chosen).expanduser()
 
 
-def launch(side, folder, title, results, windows, console="series-x"):
+def launch(side, folder, title, results, windows, console="series-x", fresh_profile=False):
     env = os.environ.copy()
     # Ignore a developer override that could silently substitute a different build.
     env.pop("VICTORY_EXE", None)
     env["VICTORY_TRACE_PIPELINES"] = "1"
-    cache = folder / "cache"
-    env["VICTORY_CACHE_DIR"] = str(cache) if windows else "Z:" + str(cache).replace("/", "\\")
+    def guest_path(path):
+        return str(path) if windows else "Z:" + str(path).replace("/", "\\")
+
+    env["VICTORY_CACHE_DIR"] = guest_path(folder / "cache")
+    if fresh_profile:
+        profile = Path(tempfile.mkdtemp(prefix="player-data-", dir=folder))
+        env["VICTORY_DATA_DIR"] = guest_path(profile)
     args = [str(title), "--console", console]
     if windows:
         command = [str(folder / "victory.exe"), "run", str(title), "--execute", "--console", console]
@@ -303,6 +308,8 @@ def run():
     parser.add_argument("request", nargs="?", help="PR number, test kit ZIP or request JSON")
     parser.add_argument("--list", action="store_true", help="list hardware test requests")
     parser.add_argument("--output-dir", type=Path, help="parent directory for the unique report")
+    parser.add_argument("--fresh-profile", action="store_true",
+                        help="start each build with its own empty temporary player data directory")
     parser.add_argument("--plan", action="store_true", help="preview the selected test without launching")
     parser.add_argument("--title", type=Path, help="use this executable instead of the file chooser")
     options = parser.parse_args()
@@ -535,11 +542,13 @@ def side_metrics(results, side, windows, frame_log, submission_log, timeline):
     return rows
 
 
-def diagnostic_summary(request, results, windows, complete, destination):
+def diagnostic_summary(request, results, windows, complete, destination, fresh_profile=False):
     shader_ids = {}
     rows = [f"{console_name(request.get('console', 'series-x'))} hardware test | PR #{request['pr']} | " + ("Windows" if windows else "Linux/Proton"),
             "Comparison completed" if complete else "Partial comparison",
             "Timings cover all recorded phases, including menus."]
+    if fresh_profile:
+        rows.append("Each build started with empty player data.")
     for side in ("main", "candidate"):
         rows.extend(["", f"{side.capitalize()} | {request[side]['revision']}"])
         exit_path = results / (side + "-exit.txt")
@@ -853,6 +862,8 @@ def run_request(manifest, options):
     console = request.get("console", "series-x")
     print(f"VIctory PR #{request['pr']} | {console_name(console)} | two launches", flush=True)
     instruction_block(PRIVACY_HEADING, LOG_PRIVACY + " Your reports stay on this machine until you choose to share.")
+    if options.fresh_profile:
+        print("Each build will use its own empty, temporary player data directory.", flush=True)
     if options.plan:
         if binding:
             owner = binding["requester"]["login"]
@@ -890,7 +901,7 @@ def run_request(manifest, options):
         try:
             for number, side in enumerate(("main", "candidate"), start=1):
                 instruction_block(f"RUN {number} OF 2  |  {side.upper()}  |  WHAT TO DO", request["scenario"])
-                launch(side, Path(work) / side, title, results, windows, console)
+                launch(side, Path(work) / side, title, results, windows, console, options.fresh_profile)
             complete = True
         finally:
             if any(results.glob("*.log")):
@@ -902,7 +913,7 @@ def run_request(manifest, options):
                         out.write(path, path.name)
                 heading = "REPORT READY" if complete else "TEST INTERRUPTED"
                 instruction_block(heading, "Keep this full troubleshooting archive on your machine.", f"Local logs: {bundle}")
-                report = diagnostic_summary(request, results, windows, complete, destination)
+                report = diagnostic_summary(request, results, windows, complete, destination, options.fresh_profile)
                 summary_path = destination / "summary.txt"
                 summary_path.write_text(report, encoding="utf-8")
                 share = destination / "share"

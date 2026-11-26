@@ -202,14 +202,15 @@ class HardwareRequest(unittest.TestCase):
         temp.mkdir()
         stdout = io.StringIO()
 
-        def launched(side, folder, title, results, windows, console):
+        def launched(side, folder, title, results, windows, console, fresh_profile):
+            self.assertTrue(fresh_profile)
             number = 1 if side == "main" else 2
             lines = stdout.getvalue().rstrip().splitlines()
             self.assertEqual(lines[-3], f"RUN {number} OF 2  |  {side.upper()}  |  WHAT TO DO")
             self.assertEqual(lines[-1], self.request["scenario"])
             (results / (side + ".log")).write_text(side)
 
-        args = ["runner", str(self.manifest), "--title", str(self.title)]
+        args = ["runner", str(self.manifest), "--title", str(self.title), "--fresh-profile"]
         with mock.patch.object(sys, "argv", args), mock.patch.object(tempfile, "tempdir", str(temp)), \
                 mock.patch.dict(os.environ, {"COLUMNS": "52"}), \
                 mock.patch.object(shutil, "which", return_value="tool"), \
@@ -243,7 +244,8 @@ class HardwareRequest(unittest.TestCase):
     def test_fresh_pair_and_partial(self):
         self.request.update(version=2, console="series-s")
         self.manifest.write_text(json.dumps(self.request))
-        def launched(side, folder, title, results, windows, console):
+        def launched(side, folder, title, results, windows, console, fresh_profile):
+            self.assertFalse(fresh_profile)
             self.assertEqual(console, "series-s")
             self.assertEqual(title, self.title)
             (results / (side + ".log")).write_text(side)
@@ -645,6 +647,7 @@ class HardwareRequest(unittest.TestCase):
                 def start(args, **kwargs):
                     self.assertEqual(kwargs["cwd"], self.title.parent)
                     self.assertNotIn("VICTORY_EXE", kwargs["env"])
+                    self.assertEqual(kwargs["env"]["VICTORY_DATA_DIR"], "player-data-override")
                     self.assertIn(str(self.title), args)
                     self.assertEqual(args[-2:], ["--console", console])
                     if windows:
@@ -656,12 +659,45 @@ class HardwareRequest(unittest.TestCase):
                         self.assertEqual(kwargs["env"]["VKD3D_SHADER_CACHE_PATH"], str(self.root / "vkd3d"))
                     return popen([sys.executable, "-c", "import sys; print(sys.argv[1]); sys.exit(42)",
                                   f"Report: {report} (launcher exit 42)"], **kwargs)
-                with mock.patch.dict(os.environ, {"VICTORY_EXE": "old.exe"}), \
+                with mock.patch.dict(os.environ, {"VICTORY_EXE": "old.exe", "VICTORY_DATA_DIR": "player-data-override"}), \
                         mock.patch.object(subprocess, "Popen", side_effect=start):
                     runner.launch("main", self.root, self.title, results, windows, console)
                 self.assertEqual((results / "main-exit.txt").read_text().strip(), "42")
                 if not windows:
                     self.assertEqual((results / "main.tar.gz").read_bytes(), b"this launch")
+
+    def test_fresh_profile_keeps_each_launch_out_of_the_normal_save_directory(self):
+        normal = self.root / "player data"
+        normal.mkdir()
+        (normal / "existing save").write_text("original")
+        for windows in (True, False):
+            with self.subTest(windows=windows):
+                target = self.root / ("Windows runs" if windows else "Proton runs")
+                target.mkdir()
+                report = target / "report.tar.gz"
+                report.touch()
+                seen = []
+                popen = subprocess.Popen
+                def capture(args, **kwargs):
+                    value = kwargs["env"]["VICTORY_DATA_DIR"]
+                    if not windows:
+                        self.assertTrue(value.startswith("Z:"))
+                        value = value[2:].replace("\\", "/")
+                    profile = Path(value)
+                    self.assertNotEqual(profile, normal)
+                    self.assertEqual(list(profile.iterdir()), [])
+                    (profile / "first launch marker").touch()
+                    seen.append(profile)
+                    return popen([sys.executable, "-c", "import sys; print(sys.argv[1])",
+                                  f"Report: {report} (launcher exit 0)"], **kwargs)
+                with mock.patch.dict(os.environ, {"VICTORY_DATA_DIR": str(normal)}), \
+                        mock.patch.object(subprocess, "Popen", side_effect=capture):
+                    for side in ("main", "candidate"):
+                        folder = target / side
+                        folder.mkdir()
+                        runner.launch(side, folder, self.title, target, windows, "series-s", fresh_profile=True)
+                self.assertNotEqual(*seen)
+        self.assertEqual((normal / "existing save").read_text(), "original")
 
     def test_main_ci_refresh_after_a_docs_only_push(self):
         prefix = "victory-proton-x86_64-"

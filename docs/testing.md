@@ -74,7 +74,10 @@ runtime on first use.
 The checkout menu uses a signed-in GitHub CLI (`gh auth login`). Type the PR number
 shown in the menu, or press Enter to cancel. If a request includes a number, you
 can append it directly to the checkout command. Add `--plan` to preview the scenario
-and build revisions. An extracted kit includes both builds and needs no GitHub login.
+and build revisions. For first-run scenarios, add `--fresh-profile` to give each
+build its own empty player data directory. These temporary directories are removed
+after the test. For comparisons using an existing save, use the normal command.
+An extracted kit includes both builds and needs no GitHub login.
 
 1. Select your game's `.exe` when prompted. The runner checks both packages and starts
    **main** first. Follow **WHAT TO DO** above the launch and close the game at the point
