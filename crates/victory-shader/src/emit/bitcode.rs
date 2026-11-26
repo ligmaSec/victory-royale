@@ -508,7 +508,6 @@ impl Module {
         self.funcs.iter().any(|f| f.name.starts_with("dx.op.wave"))
     }
 
-    #[cfg(test)]
     pub(crate) fn has_dx_op(&self, name: &str, opcode: i64) -> bool {
         self.insts.iter().any(|inst| match &inst.op {
             Op::Call(fid, args) => {

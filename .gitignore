@@ -10,6 +10,7 @@
 # Build output
 /target/
 /tests/fixtures/*/target/
+/scripts/hardware-test/__pycache__/*.pyc
 
 # Local configuration (contains paths to YOUR files)
 /victory.toml
