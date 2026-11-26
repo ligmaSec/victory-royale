@@ -55,6 +55,9 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    pub written_root_uavs: Vec<u8>,
+    /// A translated store or atomic can write through the guest page directory.
+    pub writes_guest_memory: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
@@ -2439,6 +2442,8 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            written_root_uavs: std::mem::take(&mut self.s.written_root_uavs),
+            writes_guest_memory: self.s.writes_guest_memory,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -3187,6 +3192,7 @@ impl<'a> Lower<'a> {
                 &args,
             );
             self.end_guarded(at, &[]);
+            self.s.writes_guest_memory = true;
             return Ok(());
         }
         let Some(op) = name.strip_prefix("global_atomic_") else {
@@ -3291,6 +3297,7 @@ impl<'a> Lower<'a> {
             }
         };
         let was = self.end_guarded(at, &[(was, old)])[0];
+        self.s.writes_guest_memory = true;
         if let Some(reg) = back {
             self.write(inst, Reg::V(reg), was, None);
         }

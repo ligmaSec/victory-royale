@@ -240,10 +240,16 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
+    for slots in [
+        &s.root_cbvs,
+        &s.root_srvs,
+        &s.root_uavs,
+        &s.written_root_uavs,
+    ] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, u32::from(s.writes_guest_memory));
     word(&mut out, s.root_indexed_views.len() as u32);
     for view in &s.root_indexed_views {
         for value in [
@@ -313,6 +319,12 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
+    let written_root_uavs = r.list()?;
+    let writes_guest_memory = match r.word()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
     let n = r.word()? as usize;
     let mut root_indexed_views = Vec::with_capacity(n.min(256));
     for _ in 0..n {
@@ -333,6 +345,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        written_root_uavs,
+        writes_guest_memory,
         root_indexed_views,
     })
 }
@@ -361,6 +375,8 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![1],
+            written_root_uavs: vec![1],
+            writes_guest_memory: true,
             root_indexed_views: vec![RootIndexedView {
                 table_slot: 1,
                 constant_slot: 2,

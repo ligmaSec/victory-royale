@@ -916,7 +916,11 @@ impl State {
         list: &HostList,
         compute: bool,
         writes: bool,
+        host: &victory_shader::emit::HostShader,
     ) -> Option<crate::memory::Ready> {
+        // Of the writes the builder has not quarantined, only copy back
+        // guest memory the shader can actually store to (DexNom `bc3cd4b`).
+        let writes = writes && (!write_skip() || host.writes_guest_memory);
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
@@ -1109,15 +1113,16 @@ impl State {
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
-            let writes = (t.stores || !write_skip())
-                && !crate::pipeline::builder_quarantined(self.pipeline as This);
+            let publish = !crate::pipeline::builder_quarantined(self.pipeline as This);
+            let writes = publish && (t.stores || !write_skip());
+            let raw_writes = publish && (t.host.writes_guest_memory || !write_skip());
             // Title memory by address: what the shader finds it by.
             let memory = if t
                 .host
                 .root_srvs
                 .contains(&victory_shader::emit::SLOT_MEMORY)
             {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let Some(ready) = self.memory_ready(list, compute, raw_writes, &t.host) else {
                     once!(
                         "a shader that reads title memory by address without a view heap to hold its views: the draw is dropped"
                     );
@@ -1259,7 +1264,12 @@ impl State {
                         None
                     }
                 };
-                if !self.root_uav(list, address, param, compute, writes) {
+                // A root UAV the shader never stores to stays as the title
+                // wrote it. The builder binds counters and structure views
+                // in the same list.
+                let writes_slot =
+                    writes && (!write_skip() || t.host.written_root_uavs.contains(&slot));
+                if !self.root_uav(list, address, param, compute, writes_slot) {
                     return false;
                 }
             }
