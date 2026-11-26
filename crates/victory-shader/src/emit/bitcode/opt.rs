@@ -649,6 +649,9 @@ impl Module {
             Op::Cmp(p, a, b) => Key::Cmp(*p, *a, *b),
             Op::Select(c, t, f) => Key::Select(*c, *t, *f),
             Op::Extract(a, n) => Key::Extract(*a, *n),
+            // AMD's RDNA4 D3D12 compiler can crash when one size query
+            // serves the uses of an equal query in a dominated block.
+            Op::Call(f, _) if self.funcs[*f as usize].name == "dx.op.getDimensions" => return None,
             Op::Call(f, args) => Key::Call(*f, args.clone()),
             Op::Gep(ty, p, idx) => Key::Gep(*ty, *p, idx.clone()),
             Op::Load(p) => Key::Load(*p),
@@ -1404,6 +1407,31 @@ mod tests {
         assert_eq!(body(&m, then), 2);
         assert_eq!(body(&m, other), 2);
         assert_eq!(body(&m, join), 2);
+        m.write(false);
+    }
+
+    #[test]
+    fn a_size_query_is_not_reused() {
+        let Diamond {
+            k: Kit {
+                mut m, b, writes, ..
+            },
+            x,
+            y,
+            then,
+            ..
+        } = diamond();
+        let i32t = m.int(32);
+        let fty = m.func_ty(i32t, vec![i32t, i32t]);
+        m.ptr(fty);
+        let dims = m.function("dx.op.getDimensions", fty, Some(Attr::ReadOnly), false);
+        let top = m.call(b, dims, vec![x, y]);
+        m.call(b, writes, vec![top, top]);
+        let again = m.call(then, dims, vec![x, y]);
+        m.call(then, writes, vec![again, again]);
+        m.optimise(REUSE);
+        assert_eq!(stores(&m, then), [[again, again]]);
+        assert_eq!(body(&m, then), 2);
         m.write(false);
     }
 
