@@ -80,7 +80,7 @@ def report_headers(report):
 
 def proton_version(header):
     """Use the build identity in Proton's own header, before the command line."""
-    match = re.match(rb"(?:=+\r?\n)?Proton: ([0-9]{1,12} [A-Za-z0-9][A-Za-z0-9.+_() -]{0,95})\r?\n", header)
+    match = re.match(rb"(?:=+\r?\n)?Proton: ((?:[0-9]{1,20} )?[A-Za-z0-9][A-Za-z0-9.+_() -]{0,95})\r?\n", header)
     return match.group(1).decode("ascii").rstrip() if match else None
 
 

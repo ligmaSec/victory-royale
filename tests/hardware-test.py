@@ -590,6 +590,7 @@ sys.exit(90)
         steam = report / "steam-12345.log"
         steam.write_bytes(header)
         self.assertEqual(runner.session.reported_proton(report), "1795031687 UMU-Proton-11.0-2e")
+        self.assertEqual(runner.session.proton_version(b"Proton: GE-Proton10-27\n"), "GE-Proton10-27")
         self.assertIsNone(runner.session.proton_version(b"Command: other\n" + header))
         self.assertIsNone(runner.session.proton_version(b"Proton: 123 /private/user/path\n"))
         archive = self.root / "run-fast.tar.gz"
@@ -605,6 +606,13 @@ sys.exit(90)
         self.assertIn("Proton version: 1795031687 UMU-Proton-11.0-2e", body)
         self.assertIn("custom build (see local log)", body)
         self.assertNotIn("private custom name", body)
+        (self.root / "main-proton.txt").write_bytes(b"GE-Proton10-27\n")
+        (self.root / "candidate-proton.txt").write_bytes(b"unreported\n")
+        dest = self.root / "without-timestamps"
+        dest.mkdir()
+        body = runner.diagnostic_summary(self.request, self.root, False, False, dest)
+        self.assertIn("Proton version: GE-Proton10-27", body)
+        self.assertIn("Proton version: unreported", body)
 
     def test_proton_uses_recognized_output_with_a_nondefault_game_id(self):
         (self.root / "main.log").write_bytes(b"wrapper")

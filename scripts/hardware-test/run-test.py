@@ -686,7 +686,7 @@ def diagnostic_summary(request, results, windows, complete, destination, stop=No
             version = session.proton_version(b"Proton: " + info.read_bytes()) if info.is_file() else None
             # A custom build label can contain private text. Share recognized
             # distribution identifiers only; the local log retains the actual label.
-            if version and not re.fullmatch(r"[0-9]+ (?:UMU-Proton|GE-Proton|Proton-GE|Proton|experimental|hotfix)[-._ ]?[0-9][A-Za-z0-9._+-]*",
+            if version and version != "unreported" and not re.fullmatch(r"(?:[0-9]+ )?(?:UMU-Proton|GE-Proton|Proton-GE|Proton|experimental|hotfix|stable)[-._ ]?[0-9][A-Za-z0-9._+-]*",
                                             version, re.IGNORECASE):
                 version = "custom build (see local log)"
             rows.append("Proton version: " + (version or "unreported"))
