@@ -550,11 +550,14 @@ fn an_entry_first_lane_read_is_shared_across_the_full_group() {
         build_lds_program::<false>(&masked, true, [64, 1, 1], waves, 0).unwrap();
     assert_eq!(wave_range(&other), [64, 64]);
     assert_eq!(barriers, 0);
-    // A three-iteration loop contains the read. The native wave is retained.
+    // Keep the first-lane read on entry. Only the swizzle is in the loop,
+    // so the native wave here depends on rejecting the back edge itself.
     let looped = [
         &before[..],
-        &[0xbe83_0383, first, 0x8083_8103, 0xbf07_8003, 0xbf85_fffc],
-        &finish,
+        &[first, 0xbe83_0383],                    // s3 = 3
+        &finish[..3],                             // swizzle and wait
+        &[0x8083_8103, 0xbf07_8003, 0xbf85_fffa], // decrement, compare, repeat
+        &finish[3..],
     ]
     .concat();
     let (other, barriers) =
