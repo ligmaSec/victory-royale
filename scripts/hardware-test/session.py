@@ -283,6 +283,25 @@ def game_screenshot(process, windows, env, destination):
     return False
 
 
+def keep_window_sample(screenshot, seconds):
+    # Each capture atomically replaces the preview. A hard link keeps those pixels
+    # available when the next capture shows a menu, a fade or the closing window.
+    sample = screenshot.with_name(f"{screenshot.stem}-{seconds:05d}s.png")
+    if sample.exists():
+        return
+    try:
+        os.link(screenshot, sample)
+    except OSError:
+        try:
+            shutil.copyfile(screenshot, sample)
+        except OSError:
+            sample.unlink(missing_ok=True)
+            return
+    samples = sorted(screenshot.parent.glob(f"{screenshot.stem}-*s.png"))
+    if len(samples) > 8:
+        samples[1].unlink()  # Keep the first image and the seven most recent.
+
+
 def monitor(process, log, windows, env, stop, close_file, screenshot=None):
     tail = Tail()
     report_dir = None
@@ -330,13 +349,15 @@ def monitor(process, log, windows, env, stop, close_file, screenshot=None):
             break
         if screenshot and now >= next_capture:
             saved = game_screenshot(process, windows, env, screenshot)
+            if saved:
+                keep_window_sample(screenshot, int(time.monotonic() - start))
             next_capture = time.monotonic() + (45 if saved else 10)
         time.sleep(0.25)
     else:
         return early, False, report_dir
     print(f"Hardware test: {reason}. Closing this build.", flush=True)
-    if screenshot:
-        game_screenshot(process, windows, env, screenshot)
+    if screenshot and game_screenshot(process, windows, env, screenshot):
+        keep_window_sample(screenshot, int(time.monotonic() - start))
     if cooperative:
         close_file.touch()
         try:

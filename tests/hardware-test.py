@@ -409,6 +409,18 @@ sys.exit(90)
                 runner.session.stopping("device-ready", 0, 30), self.root / "close.request")
         self.assertEqual((reason, forced), ("condition reached", False))
 
+    def test_capture_history_keeps_first_and_latest_without_overwriting_earlier_pixels(self):
+        preview = self.root / "main-screenshot.png"
+        for i in range(10):
+            tmp = preview.with_suffix(".partial")
+            tmp.write_bytes(bytes([i]))
+            os.replace(tmp, preview)
+            runner.session.keep_window_sample(preview, i * 45)
+        samples = sorted(self.root.glob("main-screenshot-*s.png"))
+        self.assertEqual([sample.read_bytes() for sample in samples], [bytes([i]) for i in (0, 3, 4, 5, 6, 7, 8, 9)])
+        self.assertEqual(samples[-1].name, "main-screenshot-00405s.png")
+        self.assertEqual(preview.read_bytes(), bytes([9]))
+
     @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("Xvfb"), "requires Xvfb")
     def test_capture_obscured_x11_game_excludes_covering_window(self):
         server = subprocess.Popen(["Xvfb", "-displayfd", "1", "-screen", "0", "400x300x24", "-nolisten", "tcp"],

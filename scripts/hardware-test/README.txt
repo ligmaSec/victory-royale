@@ -32,7 +32,9 @@ Raw logs may include usernames, file paths, credentials and game output.
 Keep the full archive local. Review the filtered ZIP before choosing to share.
 During automatic runs the runner tries to capture the game window every 45 seconds
 and before closing. The latest successful capture per build is kept next to
-summary.txt. On Linux this needs X11 or XWayland and XComposite. Windows uses
+summary.txt. The private report.zip keeps the first and up to seven later samples
+per build with seconds from launch in their names. A first mesh bind can happen
+while loading. Record what scene was visible, or mark it unknown. On Linux this needs X11 or XWayland and XComposite. Windows uses
 the game window's own drawing surface. Black images are possible with some drivers.
 Use Review automatic screenshots to preview and select images for private delivery.
 After the runs, use the full-screen results menu. Use Up/Down to highlight a

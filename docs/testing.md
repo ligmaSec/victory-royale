@@ -85,7 +85,9 @@ The runner closes it after the observation period and starts the next build. A f
 or a title present request identifies renderer activity. Describe the actual image in your notes.
 On Windows and X11/XWayland the runner tries to save the game window during the run
 and before shutdown. Each build retains its latest successful screenshot next to the
-summary. Choose **Review automatic screenshots** to preview, remove or include images
+summary. The private `report.zip` also keeps the first image and up to seven later
+samples per build, named by seconds from launch. Use these to distinguish loading,
+gameplay and shutdown when reporting the scene. Choose **Review automatic screenshots** to preview, remove or include images
 in private diagnostics. Screenshots stay out of public summaries. A crash, an early
 close, or a timeout leaves a partial comparison. Both builds still get a turn.
 New builds use the game's normal suspend path. Older Windows builds receive a close request.

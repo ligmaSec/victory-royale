@@ -661,6 +661,7 @@ def diagnostic_summary(request, results, windows, complete, destination, stop=No
             f"Starting save: {TITLE_ID} (separate copies)",
             "Timings cover all recorded phases, including menus."]
     if stop:
+        rows.append("Scene reached: unconfirmed by runtime markers. See each tester observation for the visible scene.")
         rows.append(f"Requested endpoint: {stop['marker']} plus {stop['observe_seconds']} s "
                     f"(timeout {stop['timeout_seconds']} s per build)")
     for side in ("main", "candidate"):
@@ -1091,6 +1092,7 @@ def run_request(manifest, options):
                         saved = destination / name
                         shutil.copyfile(image, saved)
                         print(f"Local game screenshot: {saved}", flush=True)
+                        print(f"Earlier images in report.zip: {image.stem}-<seconds>s.png", flush=True)
                     elif stop:
                         print(f"No game window captured for {name.split('-')[0]}.", flush=True)
                 share_result(request["pr"], filtered, options.review_kit, binding, console)
