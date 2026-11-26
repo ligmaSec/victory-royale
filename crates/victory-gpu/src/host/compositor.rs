@@ -196,14 +196,23 @@ impl Compositor {
 // A shader sampling float4 needs a filterable color view. Resolve a
 // typeless texture in its own family and preserve typed numeric formats.
 fn view_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
-    Some(match format.0 {
-        9 => DXGI_FORMAT_R16G16B16A16_FLOAT,
-        23 => DXGI_FORMAT_R10G10B10A2_UNORM,
-        27 => DXGI_FORMAT_R8G8B8A8_UNORM,
-        90 => DXGI_FORMAT_B8G8R8A8_UNORM,
-        10 | 11 | 13 | 24 | 26 | 28 | 29 | 31 | 87 | 91 => format,
-        _ => return None,
-    })
+    match format {
+        DXGI_FORMAT_R16G16B16A16_TYPELESS
+        | DXGI_FORMAT_R10G10B10A2_TYPELESS
+        | DXGI_FORMAT_R8G8B8A8_TYPELESS
+        | DXGI_FORMAT_B8G8R8A8_TYPELESS => super::swap_format(format),
+        DXGI_FORMAT_R16G16B16A16_FLOAT
+        | DXGI_FORMAT_R16G16B16A16_UNORM
+        | DXGI_FORMAT_R16G16B16A16_SNORM
+        | DXGI_FORMAT_R10G10B10A2_UNORM
+        | DXGI_FORMAT_R11G11B10_FLOAT
+        | DXGI_FORMAT_R8G8B8A8_UNORM
+        | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+        | DXGI_FORMAT_R8G8B8A8_SNORM
+        | DXGI_FORMAT_B8G8R8A8_UNORM
+        | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => Some(format),
+        _ => None,
+    }
 }
 pub(super) fn can_sample(texture: &ID3D12Resource) -> bool {
     // SAFETY: the caller holds the resource throughout presentation.
@@ -215,6 +224,7 @@ pub(super) fn can_sample(texture: &ID3D12Resource) -> bool {
         && view_format(d.Format).is_some()
 }
 impl Compositor {
+    // shortcut: PresentX placement fields are not decoded. Each overlay fills the primary output.
     /// Draw the planes onto the back buffer, leaving it in RENDER_TARGET
     /// and restoring the original state of each sampled source.
     pub(super) fn draw(

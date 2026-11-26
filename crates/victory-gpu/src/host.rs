@@ -3062,6 +3062,7 @@ struct Presenter {
     meter: Meter,
     last_present_issue: Option<HRESULT>,
     compositor: Option<Compositor>,
+    compositor_failure: Option<(DXGI_FORMAT, Retry)>,
 }
 
 /// A successful DXGI status may still mean nothing was presented.
@@ -3071,6 +3072,46 @@ fn present_result(status: HRESULT) -> windows::core::Result<bool> {
 }
 
 impl Presenter {
+    /// A failed compositor must leave primary-only presentation available during backoff.
+    fn ensure_compositor(
+        &mut self,
+        device: &ID3D12Device,
+        format: DXGI_FORMAT,
+        create: impl FnOnce(&ID3D12Device, DXGI_FORMAT) -> windows::core::Result<Compositor>,
+    ) -> bool {
+        if self.compositor.as_ref().is_some_and(|c| c.format == format) {
+            return true;
+        }
+        if self
+            .compositor_failure
+            .as_ref()
+            .is_some_and(|(f, r)| *f == format && !r.due(std::time::Instant::now()))
+        {
+            return false;
+        }
+        match create(device, format) {
+            Ok(c) => {
+                self.compositor = Some(c);
+                self.compositor_failure = None;
+                true
+            }
+            Err(e) => {
+                let (failed_format, retry) = self
+                    .compositor_failure
+                    .get_or_insert((format, Retry::new()));
+                if *failed_format != format {
+                    *failed_format = format;
+                    retry.reset();
+                }
+                retry.failed(std::time::Instant::now());
+                if retry.attempts == 1 {
+                    tracing::warn!(error = %e, format = format.0, "presenting the primary plane while compositor initialization backs off");
+                }
+                false
+            }
+        }
+    }
+
     fn sync_color_space(&mut self, hdr_active: bool) {
         let wanted = desired_color_space(self.format, hdr_active);
         if self.color_space == wanted {
@@ -3241,10 +3282,8 @@ impl Meter {
 }
 
 impl Host {
-    /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown or the diagnostic probe has no reading. Otherwise diagnostics
-    /// builds report whether the sampled pixels were black.
+    /// Presents the planes in order and restores each resource's incoming state.
+    /// Diagnostics capture the displayed frame and check plane zero for a black scene.
     pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
         self.present_with_compositor(
             planes,
@@ -3280,30 +3319,6 @@ impl Host {
         if !retry.due(now) {
             return None;
         }
-        let planes = if planes.len() > 1 && !planes.iter().all(|(t, _)| compositor::can_sample(t)) {
-            &planes[..1]
-        } else {
-            planes
-        };
-        let cached_format = presenter
-            .as_ref()
-            .and_then(|p| p.compositor.as_ref())
-            .map(|c| c.format);
-        let mut new_compositor = None;
-        let planes = if planes.len() > 1 && cached_format != Some(format) {
-            match create_compositor(&self.device, format) {
-                Ok(c) => {
-                    new_compositor = Some(c);
-                    planes
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "presenting the primary plane after compositor initialization failed");
-                    &planes[..1]
-                }
-            }
-        } else {
-            planes
-        };
         // Keep the scene plane's presentation size. The UI is sampled at its
         // own resolution, then scaled to the existing output by the compositor.
         let (width, height) = (desc.Width as u32, desc.Height);
@@ -3340,9 +3355,6 @@ impl Host {
             }
         }
         let p = presenter.as_mut()?;
-        if let Some(c) = new_compositor {
-            p.compositor = Some(c);
-        }
         if (p.width, p.height, p.format) != (width, height, format) {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
@@ -3382,6 +3394,28 @@ impl Host {
         } else {
             p.sync_color_space(false);
         }
+        let target_format = match desc.Format {
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => desc.Format,
+            _ => format,
+        };
+        let planes = if planes.len() == 1 {
+            planes
+        } else if let Some((texture, _)) = planes.iter().find(|(t, _)| !compositor::can_sample(t)) {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                // SAFETY: the queued plane holds a live resource.
+                let desc = unsafe { texture.GetDesc() };
+                tracing::warn!(
+                    format = desc.Format.0,
+                    "presenting only the primary plane because a plane cannot be sampled"
+                );
+            });
+            &planes[..1]
+        } else if p.ensure_compositor(&self.device, target_format, create_compositor) {
+            planes
+        } else {
+            &planes[..1]
+        };
         let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
@@ -3391,20 +3425,26 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            let written = if planes.len() == 1 {
-                let src = D3D12_RESOURCE_STATE_COPY_SOURCE;
-                if state != src {
-                    list.ResourceBarrier(&[transition(texture, state, src)]);
-                }
+            let primary_only = planes.len() == 1;
+            let src = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            let read_scene = primary_only || cfg!(feature = "diagnostics");
+            if read_scene && state != src {
+                list.ResourceBarrier(&[transition(texture, state, src)]);
+            }
+            #[cfg(feature = "diagnostics")]
+            let probe = crate::capture::probe(&self.device, list, texture);
+            if primary_only {
                 list.ResourceBarrier(&[transition(
                     &back,
                     D3D12_RESOURCE_STATE_PRESENT,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 )]);
                 list.CopyResource(&back, texture);
-                if state != src {
-                    list.ResourceBarrier(&[transition(texture, src, state)]);
-                }
+            }
+            if read_scene && state != src {
+                list.ResourceBarrier(&[transition(texture, src, state)]);
+            }
+            let written = if primary_only {
                 D3D12_RESOURCE_STATE_COPY_DEST
             } else {
                 p.compositor
@@ -3413,7 +3453,7 @@ impl Host {
                 D3D12_RESOURCE_STATE_RENDER_TARGET
             };
             #[cfg(feature = "diagnostics")]
-            let (capture, probe) = {
+            let capture = {
                 let mut written = written;
                 if crate::capture::show_spec().is_some() {
                     if written != D3D12_RESOURCE_STATE_COPY_DEST {
@@ -3434,13 +3474,12 @@ impl Host {
                 let capture = (cfg!(test) || crate::capture::wanted(frame))
                     .then(|| crate::capture::read_back(&self.device, list, &back))
                     .flatten();
-                let probe = crate::capture::probe(&self.device, list, &back);
                 list.ResourceBarrier(&[transition(
                     &back,
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                     D3D12_RESOURCE_STATE_PRESENT,
                 )]);
-                (capture, probe)
+                capture
             };
             #[cfg(not(feature = "diagnostics"))]
             list.ResourceBarrier(&[transition(&back, written, D3D12_RESOURCE_STATE_PRESENT)]);
@@ -3534,6 +3573,7 @@ impl Host {
                 meter: Meter::new(),
                 last_present_issue: None,
                 compositor: None,
+                compositor_failure: None,
             };
             p.sync_color_space(display_hdr_info().is_some());
             Ok(p)
@@ -4686,7 +4726,7 @@ mod present_plane_tests {
             return;
         };
         let list = host.new_list().unwrap();
-        let make_plane = |width, height, color: &[f32; 4]| {
+        let make_plane = |width, height, format, color: &[f32; 4]| {
             let mut texture = None;
             // SAFETY: live device, valid render target description, and an open list.
             unsafe {
@@ -4703,7 +4743,7 @@ mod present_plane_tests {
                             Height: height,
                             DepthOrArraySize: 1,
                             MipLevels: 1,
-                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            Format: format,
                             SampleDesc: DXGI_SAMPLE_DESC {
                                 Count: 1,
                                 Quality: 0,
@@ -4722,8 +4762,20 @@ mod present_plane_tests {
                 texture
             }
         };
-        let scene = make_plane(32, 32, &[1.0, 0.0, 0.0, 1.0]);
-        let overlay = make_plane(64, 64, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let scene = make_plane(32, 32, DXGI_FORMAT_R8G8B8A8_UNORM, &[1.0, 0.0, 0.0, 1.0]);
+        let overlay = make_plane(
+            64,
+            64,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0],
+        );
+        let dark = make_plane(32, 32, DXGI_FORMAT_R8G8B8A8_UNORM, &[0.0, 0.0, 0.0, 1.0]);
+        let midtone = make_plane(
+            32,
+            32,
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            &[0.25, 0.25, 0.25, 1.0],
+        );
         let left = RECT {
             left: 0,
             top: 0,
@@ -4775,16 +4827,46 @@ mod present_plane_tests {
         assert!(attempted);
         let red = [255, 0, 0, 255];
         assert_eq!(fallback, Some((32, 32, [red, red])));
-        let presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
-        let swap_chain = presentation.as_ref().unwrap();
-        assert_eq!((swap_chain.width, swap_chain.height), (32, 32));
-        drop(presentation);
+        {
+            let mut presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
+            let presenter = presentation.as_mut().unwrap();
+            assert_eq!((presenter.width, presenter.height), (32, 32));
+            let (_, retry) = presenter
+                .compositor_failure
+                .as_mut()
+                .expect("failed compositor");
+            assert_eq!(retry.attempts, 1);
+            // Hold the backoff across a real present regardless of host speed.
+            retry.next = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        }
+        let mut waiting = None;
+        host.present_with_compositor(
+            &[(&scene, state), (&overlay, state)],
+            3,
+            |_, _| panic!("retried before the backoff elapsed"),
+            |buffer, footprint| waiting = Some(sample(buffer, footprint)),
+        );
+        assert_eq!(fallback, waiting);
+        host.presenter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .unwrap()
+            .compositor_failure
+            .as_mut()
+            .unwrap()
+            .1
+            .next = None;
 
         let mut composite = None;
         host.present_with_compositor(
             &[(&scene, state), (&overlay, state)],
             3,
-            Compositor::new,
+            |device, format| {
+                Ok(Compositor::new(device, format).expect(
+                    "initialize the D3D12 plane compositor and compile both display shaders",
+                ))
+            },
             |buffer, footprint| composite = Some(sample(buffer, footprint)),
         );
         assert_eq!(composite, Some((32, 32, [red, [127, 0, 128, 255]])));
@@ -4797,5 +4879,45 @@ mod present_plane_tests {
             |buffer, footprint| primary = Some(sample(buffer, footprint)),
         );
         assert_eq!(primary, Some((32, 32, [red, red])));
+        let mut shown = None;
+        let black = host.present_with_compositor(
+            &[(&dark, state), (&overlay, state)],
+            5,
+            Compositor::new,
+            |buffer, footprint| shown = Some(sample(buffer, footprint)),
+        );
+        assert_eq!(
+            black,
+            Some(true),
+            "the probe measures the black scene under the overlay"
+        );
+        assert_eq!(shown, Some((32, 32, [[0, 0, 0, 255], [0, 0, 128, 255]])));
+        let mut copied = None;
+        host.present_with_compositor(&[(&midtone, state)], 6, Compositor::new, |buf, fp| {
+            copied = Some(sample(buf, fp).2)
+        });
+        let mut blended = None;
+        host.present_with_compositor(
+            &[(&midtone, state), (&overlay, state)],
+            7,
+            |device, format| {
+                Ok(Compositor::new(device, format).expect("initialize the sRGB compositor"))
+            },
+            |buf, fp| blended = Some(sample(buf, fp).2),
+        );
+        let [clear, blue] = blended.expect("read back sRGB output");
+        let source = copied.expect("read back direct sRGB copy")[0];
+        assert!(
+            source[0] > 64 && source[0] < 192,
+            "expected an encoded midtone"
+        );
+        assert!(
+            clear.iter().zip(source).all(|(&a, b)| a.abs_diff(b) <= 1),
+            "transparent overlay changed sRGB scene from {source:?} to {clear:?}"
+        );
+        assert!(
+            blue[2] > clear[2] && blue[0] < clear[0],
+            "the sRGB overlay must still be drawn"
+        );
     }
 }
