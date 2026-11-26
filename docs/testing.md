@@ -39,7 +39,7 @@ the full UMU/Proton runtime still require a separate workstation test.
 Successful main builds deliver `victory-proton-x86_64-<commit>` for 14 days.
 Code PRs deliver `victory-proton-x86_64-pr-<number>-<merge-commit>` for three
 days. The latter contains the revision GitHub tested with the base branch.
-For a requested comparison, use the [interactive Series X test](#run-a-series-x-hardware-test)
+For a requested comparison, use the [interactive hardware test](#run-a-hardware-test)
 to get both matched builds. For a single run, Windows testers can launch the extracted
 `victory.exe` with the [usual Windows launch command](../README.md#getting-started).
 
@@ -53,7 +53,9 @@ tar -xf victory-proton-x86_64.tar.gz
 ./victory/victory-proton.sh --run "/path/to/game/title.exe"
 ```
 
-## Run a Series X hardware test
+<a id="run-a-series-x-hardware-test"></a>
+
+## Run a hardware test
 
 You'll need Python 3.9 or newer and your own title executable outside the VIctory checkout.
 > [!WARNING]
@@ -190,7 +192,8 @@ request against the copy pinned in its bundled runner.
 ## Requesting a hardware comparison
 
 Run the [hardware kit workflow](../.github/workflows/hardware-request.yml) on
-`main` with the PR number and a short Series X scenario. Specify where to start,
+`main` with the PR number, console profile (Series X by default), and a short scenario.
+Both builds use that profile. Specify where to start,
 what to observe and when to close each run. If someone else asked for the test,
 have them comment on this PR with `/victory hardware-test` on its own first line
 followed by their scenario. Put that comment URL in **requester_comment** when

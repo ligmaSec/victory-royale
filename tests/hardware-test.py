@@ -109,7 +109,7 @@ class HardwareRequest(unittest.TestCase):
                                   [{"id": 10, "status": "completed", "conclusion": "success"},
                                    {"id": 12, "status": "completed", "conclusion": "success"},
                                    {"id": 14, "status": "completed", "conclusion": "failure"},
-                                   {"id": 15, "status": "in_progress", "conclusion": None}], [], [{"name": "victory-series-x-pr-9"},
+                                   {"id": 15, "status": "in_progress", "conclusion": None}], [], [{"name": "victory-series-s-pr-9"},
                                                    {"name": "victory-series-x-pr-7"}]]
             runner.run()
             self.assertIn("#7  First scene", out.getvalue())
@@ -126,7 +126,7 @@ class HardwareRequest(unittest.TestCase):
             self.assertIn("expired == false", github.call_args_list[2].args[1])
             github.side_effect = [[]]
             runner.run()
-            self.assertIn("no open Series X", out.getvalue())
+            self.assertIn("no open hardware", out.getvalue())
 
     def test_request_without_main_kit(self):
         request = {8: ({"title": "Check lights", "wanted": True}, None, None)}
@@ -202,7 +202,7 @@ class HardwareRequest(unittest.TestCase):
         temp.mkdir()
         stdout = io.StringIO()
 
-        def launched(side, folder, title, results, windows):
+        def launched(side, folder, title, results, windows, console):
             number = 1 if side == "main" else 2
             lines = stdout.getvalue().rstrip().splitlines()
             self.assertEqual(lines[-3], f"RUN {number} OF 2  |  {side.upper()}  |  WHAT TO DO")
@@ -234,8 +234,17 @@ class HardwareRequest(unittest.TestCase):
         with zipfile.ZipFile(report) as archive:
             self.assertEqual(set(archive.namelist()), {"request.json", "main.log", "candidate.log"})
 
+    def test_console_profile_requires_a_compatible_runner(self):
+        self.assertEqual(runner.parse_request(json.dumps(self.request)), self.request)
+        for version, console in ((1, "series-s"), (2, "series-x"), (2, "unknown"), (True, "series-x")):
+            with self.subTest(version=version, console=console), self.assertRaises(ValueError):
+                runner.parse_request(json.dumps(dict(self.request, version=version, console=console)))
+
     def test_fresh_pair_and_partial(self):
-        def launched(side, folder, title, results, windows):
+        self.request.update(version=2, console="series-s")
+        self.manifest.write_text(json.dumps(self.request))
+        def launched(side, folder, title, results, windows, console):
+            self.assertEqual(console, "series-s")
             self.assertEqual(title, self.title)
             (results / (side + ".log")).write_text(side)
 
@@ -624,9 +633,10 @@ class HardwareRequest(unittest.TestCase):
                 self.assertNotIn(forbidden, text + body)
 
     def test_platform_commands_and_cache_paths(self):
-        for windows in (False, True):
-            with self.subTest(windows=windows):
-                results = self.root / ("windows" if windows else "linux")
+        for windows, console in ((False, "series-x"), (False, "series-s"),
+                                 (True, "series-x"), (True, "series-s")):
+            with self.subTest(windows=windows, console=console):
+                results = self.root / (("windows-" if windows else "linux-") + console)
                 results.mkdir()
                 report = self.root / "current.tar.gz"
                 report.write_bytes(b"this launch")
@@ -636,7 +646,7 @@ class HardwareRequest(unittest.TestCase):
                     self.assertEqual(kwargs["cwd"], self.title.parent)
                     self.assertNotIn("VICTORY_EXE", kwargs["env"])
                     self.assertIn(str(self.title), args)
-                    self.assertEqual(args[-2:], ["--console", "series-x"])
+                    self.assertEqual(args[-2:], ["--console", console])
                     if windows:
                         self.assertEqual(args[:2], [str(self.root / "victory.exe"), "run"])
                         self.assertIn("--execute", args)
@@ -648,7 +658,7 @@ class HardwareRequest(unittest.TestCase):
                                   f"Report: {report} (launcher exit 42)"], **kwargs)
                 with mock.patch.dict(os.environ, {"VICTORY_EXE": "old.exe"}), \
                         mock.patch.object(subprocess, "Popen", side_effect=start):
-                    runner.launch("main", self.root, self.title, results, windows)
+                    runner.launch("main", self.root, self.title, results, windows, console)
                 self.assertEqual((results / "main-exit.txt").read_text().strip(), "42")
                 if not windows:
                     self.assertEqual((results / "main.tar.gz").read_bytes(), b"this launch")
