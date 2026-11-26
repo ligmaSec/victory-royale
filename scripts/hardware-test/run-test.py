@@ -243,7 +243,8 @@ def launch(side, folder, title, results, windows, console="series-x", *, stop=No
         reason, forced, live_report = "manual scenario", False, None
         if stop:
             try:
-                reason, forced, live_report = session.monitor(process, log_path, windows, env, stop, close_file)
+                reason, forced, live_report = session.monitor(
+                    process, log_path, windows, env, stop, close_file, results / (side + "-screenshot.png"))
             except BaseException:
                 session.terminate_run(process, windows, env)
                 raise
@@ -891,6 +892,9 @@ def share_result(pr, filtered, kit, binding=None, console="series-x"):
             if names:
                 actions.append(("r", "Edit in my own editor" if folder_mode else "Review and edit files",
                                 "Edit or exclude outgoing files. Applying your edits saves them locally."))
+            capture_dir = filtered.parent.parent
+            if any((capture_dir / name).is_file() for name in observations.PICTURES):
+                actions.append(("a", "Review automatic screenshots", "Preview the local game-window captures. Save selected images to your private diagnostics."))
             actions.append(("o", "Describe what you saw", "Add main and candidate notes or paste screenshots in a local browser window."))
             if names and not folder_mode:
                 actions.append(("e", "Edit in my own editor", "Open working copies, edit or remove files, then apply locally."))
@@ -941,9 +945,12 @@ def share_result(pr, filtered, kit, binding=None, console="series-x"):
                 except (OSError, subprocess.CalledProcessError):
                     public_status = "Public summary: posting unconfirmed. Check the PR."
                 continue
-            if action == "o":
+            if action in ("o", "a"):
                 try:
-                    observations.edit(filtered)
+                    if action == "a":
+                        observations.edit(filtered, capture_dir)
+                    else:
+                        observations.edit(filtered)
                 except (ValueError, OSError) as error:
                     status = f"Could not open the observations editor. {error}"
                 continue
@@ -995,6 +1002,7 @@ def run_request(manifest, options):
     if stop == "manual":
         stop = None
     if stop:
+        print("Automatic screenshots use the game window. The latest image for each build stays in the local report.", flush=True)
         print(f"Automatic close: {stop['observe_seconds']} s after {stop['marker']}; "
               f"timeout {stop['timeout_seconds']} s from launch.", flush=True)
     if options.plan:
@@ -1077,6 +1085,14 @@ def run_request(manifest, options):
                         # Fixed ZIP metadata avoids recording local times or file modes.
                         entry = zipfile.ZipInfo(name)
                         out.writestr(entry, (destination / name).read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
+                for name in observations.PICTURES:
+                    image = results / name
+                    if image.is_file():
+                        saved = destination / name
+                        shutil.copyfile(image, saved)
+                        print(f"Local game screenshot: {saved}", flush=True)
+                    elif stop:
+                        print(f"No game window captured for {name.split('-')[0]}.", flush=True)
                 share_result(request["pr"], filtered, options.review_kit, binding, console)
 
 

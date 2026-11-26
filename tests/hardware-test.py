@@ -406,6 +406,33 @@ sys.exit(90)
                 runner.session.stopping("device-ready", 0, 30), self.root / "close.request")
         self.assertEqual((reason, forced), ("condition reached", False))
 
+    @unittest.skipUnless(sys.platform == "win32", "uses a native Windows Forms window")
+    def test_capture_owned_windows_client(self):
+        ready = self.root / "shown"
+        destination = self.root / "captured.png"
+        env = dict(os.environ, FIXTURE_READY=str(ready))
+        script = ("Add-Type -AssemblyName System.Windows.Forms; "
+                  "$f = New-Object Windows.Forms.Form; $f.BackColor = [Drawing.Color]::Lime; "
+                  "$f.Add_Shown({[IO.File]::WriteAllText($env:FIXTURE_READY, 'ready')}); "
+                  "[Windows.Forms.Application]::Run($f)")
+        child = subprocess.Popen(["powershell.exe", "-NoProfile", "-Command", script], env=env)
+        try:
+            import time
+            for _ in range(150):
+                if ready.exists():
+                    break
+                time.sleep(.1)
+            self.assertTrue(ready.exists())
+            self.assertTrue(runner.session.game_screenshot(child, True, env, destination))
+            verify = ("Add-Type -AssemblyName System.Drawing; $b = New-Object Drawing.Bitmap($env:FIXTURE_PNG); "
+                      "$p = $b.GetPixel([int]($b.Width/2), [int]($b.Height/2)); "
+                      "if ($p.G -lt 240 -or $p.R -gt 10 -or $p.B -gt 10) { exit 1 }")
+            subprocess.run(["powershell.exe", "-NoProfile", "-Command", verify], check=True,
+                           env=dict(env, FIXTURE_PNG=str(destination)))
+        finally:
+            child.kill()
+            child.wait()
+
     def test_console_profile_requires_a_compatible_runner(self):
         self.assertEqual(runner.parse_request(json.dumps(self.request)), self.request)
         for version, console in ((1, "series-s"), (2, "series-x"), (2, "unknown"), (True, "series-x")):

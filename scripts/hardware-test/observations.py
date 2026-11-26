@@ -20,13 +20,17 @@ MAX_BODY = 12 * 1024 * 1024
 PAGE = Path(__file__).with_name("observations.html")
 
 
-def read_draft(archive):
+def read_draft(archive, capture_dir=None):
     draft = {}
     for side, note, image in zip(SIDES, NOTES, PICTURES):
         draft[side] = {
             "note": archive.read(note).decode() if note in archive.namelist() else "",
             "image": base64.b64encode(archive.read(image)).decode() if image in archive.namelist() else "",
         }
+        if capture_dir and not draft[side]["image"]:
+            local = capture_dir / image
+            if local.is_file() and local.stat().st_size <= MAX_IMAGE:
+                draft[side]["image"] = base64.b64encode(local.read_bytes()).decode()
     return draft
 
 
@@ -85,7 +89,7 @@ def save_draft(filtered, draft):
         os.replace(reviewed, filtered)
 
 
-def edit(filtered):
+def edit(filtered, capture_dir=None):
     # The unguessable route and origin check confine writes to this local form.
     route = "/" + secrets.token_urlsafe(32)
     done = False
@@ -115,7 +119,7 @@ def edit(filtered):
                 self.reply(200, PAGE.read_bytes(), "text/html")
             elif self.path == route + "/draft":
                 with zipfile.ZipFile(filtered) as archive:
-                    self.reply(200, json.dumps(read_draft(archive)).encode(), "application/json")
+                    self.reply(200, json.dumps(read_draft(archive, capture_dir)).encode(), "application/json")
             else:
                 self.reply(404, b"Missing.")
 

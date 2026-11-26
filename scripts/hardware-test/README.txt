@@ -30,6 +30,11 @@ WARNING: LOGS MAY CONTAIN SENSITIVE INFORMATION
 ====================================================================
 Raw logs may include usernames, file paths, credentials and game output.
 Keep the full archive local. Review the filtered ZIP before choosing to share.
+During automatic runs the runner tries to capture the game window every 45 seconds
+and before closing. The latest successful capture per build is kept next to
+summary.txt. On Linux this needs X11 or XWayland and XComposite. Windows uses
+the game window's own drawing surface. Black images are possible with some drivers.
+Use Review automatic screenshots to preview and select images for private delivery.
 After the runs, use the full-screen results menu. Use Up/Down to highlight a
 choice, Enter to select, Esc to go back and PgUp/PgDn to scroll the details.
 Choose Describe what you saw to write notes for main and candidate in your browser.

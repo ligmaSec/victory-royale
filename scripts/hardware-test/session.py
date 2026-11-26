@@ -10,6 +10,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -254,13 +255,42 @@ def terminate_run(process, windows, env):
     process.wait()
 
 
-def monitor(process, log, windows, env, stop, close_file):
+def game_screenshot(process, windows, env, destination):
+    if process.poll() is not None:
+        return False
+    if windows:
+        command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                   "-File", str(Path(__file__).with_name("window_capture.ps1")), str(process.pid)]
+    else:
+        if not env.get("DISPLAY"):
+            return False
+        pids = title_processes(env["VICTORY_DATA_DIR"])
+        if not pids:
+            return False
+        command = [sys.executable, str(Path(__file__).with_name("window_capture.py"))]
+    temp = destination.with_suffix(".partial")
+    args = [str(temp)] if windows else [str(temp), *map(str, pids)]
+    try:
+        result = subprocess.run([*command, *args], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=4)
+        if result.returncode == 0 and temp.is_file() and 0 < temp.stat().st_size <= 4 * 1024 * 1024:
+            os.replace(temp, destination)
+            return True
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    finally:
+        temp.unlink(missing_ok=True)
+    return False
+
+
+def monitor(process, log, windows, env, stop, close_file, screenshot=None):
     tail = Tail()
     report_dir = None
     home = Path(env.get("XDG_DATA_HOME") or Path.home() / ".local/share")
     reports = (home if home.is_absolute() else Path.home() / ".local/share") / "victory/reports"
     start = time.monotonic()
     deadline = start + stop["timeout_seconds"]
+    next_capture = start + 5
     matched = None
     cooperative = False
     early = "exited before completion"
@@ -298,10 +328,15 @@ def monitor(process, log, windows, env, stop, close_file):
         if now >= deadline:
             reason = "timeout before completion"
             break
+        if screenshot and now >= next_capture:
+            saved = game_screenshot(process, windows, env, screenshot)
+            next_capture = time.monotonic() + (45 if saved else 10)
         time.sleep(0.25)
     else:
         return early, False, report_dir
     print(f"Hardware test: {reason}. Closing this build.", flush=True)
+    if screenshot:
+        game_screenshot(process, windows, env, screenshot)
     if cooperative:
         close_file.touch()
         try:

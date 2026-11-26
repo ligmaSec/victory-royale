@@ -128,7 +128,7 @@ def prepare():
             runner = runner.replace(b"PUBLISHED_SHA256 = None", f'PUBLISHED_SHA256 = "{stamp}"'.encode(), 1)
         out.writestr("run-test.py", runner)
         out.write(ROOT / "report_keys.py", "report_keys.py")
-        for name in ("report_ui.py", "observations.py", "observations.html", "session.py"):
+        for name in ("report_ui.py", "observations.py", "observations.html", "session.py", "window_capture.py", "window_capture.ps1"):
             out.write(ROOT / name, name)
         out.write(ROOT.parents[1] / ".victoryconfig.example", ".victoryconfig.example")
         out.write(ROOT.parents[1] / "LICENSE", "LICENSE")

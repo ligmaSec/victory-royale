@@ -83,7 +83,11 @@ For an automatic scenario, the preview lists the milestone, observation time, an
 timeout. Each build starts its own clock. Perform the requested inputs and leave the window open.
 The runner closes it after the observation period and starts the next build. A first mesh bind
 or a title present request identifies renderer activity. Describe the actual image in your notes.
-A crash, an early close, or a timeout leaves a partial comparison. Both builds still get a turn.
+On Windows and X11/XWayland the runner tries to save the game window during the run
+and before shutdown. Each build retains its latest successful screenshot next to the
+summary. Choose **Review automatic screenshots** to preview, remove or include images
+in private diagnostics. Screenshots stay out of public summaries. A crash, an early
+close, or a timeout leaves a partial comparison. Both builds still get a turn.
 New builds use the game's normal suspend path. Older Windows builds receive a close request.
 On Linux, `wmctrl` enables window close for older builds on compatible desktops. If that fails,
 the runner terminates its test process and marks the ending in the report. `--manual` gives

@@ -46,7 +46,10 @@ which configurations still need a run and remove the label when those results
 are in or the request is withdrawn. For a test that runs by PR number, publish
 the [matched kit](docs/testing.md#run-a-hardware-test) from `main` and
 check `python3 scripts/hardware-test/run-test.py PR_NUMBER --plan` before sharing
-the command. Put any manual test instructions in the PR.
+the command. For an automatic request, exercise the downloaded runner through both
+launches with stdin closed. Verify the stop reasons, separate save copies and local
+screenshot handling. Post the download and exact command in a new PR comment,
+including any missing platform or hardware coverage.
 
 ## Help by reviewing pull requests
 
