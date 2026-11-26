@@ -42,14 +42,13 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
-    /// The copy's bytes before the submission ran, from an offset on,
-    /// covering the ranges its shaders write: what the GPU wrote differs.
+    /// Bytes seen when each shader-write range was first declared in this submission.
     before: Mutex<Before>,
 }
 
 #[derive(Default)]
 struct Before {
-    snapshot: Option<(usize, Vec<u8>)>,
+    segments: Vec<(usize, Vec<u8>)>,
     unchanged: UnchangedPages,
 }
 
@@ -222,43 +221,34 @@ impl Shadow {
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
-    /// write this range. Its bytes are kept to tell later what the GPU wrote:
-    /// one snapshot per copy and submission, grown to cover every range the
-    /// submission declares (the world declares overlapping views of its
-    /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
-    /// ~2.3 million page faults per world frame).
+    /// write this range. Save newly declared bytes after their refresh. Keep
+    /// earlier snapshots intact when another range overlaps. The bytes between
+    /// disjoint ranges can still be refreshed before a later declaration.
     pub(crate) fn writing(&self, address: usize, len: usize) {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
         let (from, to) = self.inside(address, len);
-        // SAFETY: inside the mapping.
-        let host =
-            |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let before = &mut before.snapshot;
-        let (start, end) = match &*before {
-            Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
-            None => (from, to),
-        };
-        if let Some((at, bytes)) = &*before
-            && (*at, at + bytes.len()) == (start, end)
-        {
-            return;
-        }
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        match before.take() {
-            Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
-                give_back(bytes);
+        let segments = &mut before.segments;
+        let mut i = segments.partition_point(|(start, bytes)| start + bytes.len() <= from);
+        let mut at = from;
+        while at < to {
+            let next = segments.get(i).map_or(to, |(start, _)| to.min(*start));
+            if at < next {
+                let mut bytes = pooled(next - at);
+                // SAFETY: inside the mapped copy; this gap is newly declared.
+                bytes.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(self.data.add(at), next - at)
+                });
+                segments.insert(i, (at, bytes));
+                at = next;
+            } else {
+                at = segments[i].0 + segments[i].1.len();
             }
-            None => grown.extend_from_slice(host(start, end)),
+            i += 1;
         }
-        *before = Some((start, grown));
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -271,54 +261,55 @@ impl Shadow {
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let Before {
-            snapshot,
+            segments,
             unchanged,
         } = &mut *before;
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
-            && *taken <= from
-            && to <= taken + before.len()
+        if let (Some((first, _)), Some((last, bytes))) = (segments.first(), segments.last())
             && from < to
         {
-            unchanged.begin(start + taken, start + taken + before.len());
-            let before = &before[from - taken..to - taken];
-            // By 64 KiB piece: the copy compared with its bytes before the
-            // submission, title memory read only where the GPU wrote.
-            // An unchanged page is never modified by copy-back, so later
-            // overlapping ranges can skip it for the rest of the submission.
+            unchanged.begin(start + first, start + last + bytes.len());
             let mut title = None;
             let mut synced = Vec::new();
-            let mut at = from;
-            while at < to {
-                let n = (PAGE - (start + at) % PAGE).min(to - at);
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                if unchanged.differs(start + at, host, old)
-                    && let title = &mut title.get_or_insert_with(|| vec![0u8; PAGE])[..n]
-                    && crate::host::read_into((start + at) as *const u8, title)
-                {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
+            let first = segments.partition_point(|(at, bytes)| at + bytes.len() <= from);
+            for (taken, bytes) in segments[first..].iter().take_while(|(at, _)| *at < to) {
+                let mut at = from.max(*taken);
+                let end = to.min(taken + bytes.len());
+                while at < end {
+                    let n = (PAGE - (start + at) % PAGE).min(end - at);
+                    // SAFETY: inside the mapping; only the submitting thread
+                    // writes it.
+                    let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                    let old = &bytes[at - taken..at - taken + n];
+                    if unchanged.differs(start + at, host, old)
+                        && let title = &mut title.get_or_insert_with(|| vec![0u8; PAGE])[..n]
+                        && crate::host::read_into((start + at) as *const u8, title)
+                    {
+                        // Title memory with the GPU's bytes put in; the copy
+                        // takes the title's bytes in turn.
+                        let mut changed = false;
+                        for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                            if *h != *o && *t != *h {
+                                *t = *h;
+                                changed = true;
+                            }
+                            *h = *t;
                         }
-                        *h = *t;
+                        if changed {
+                            crate::watch::writing(start + at, n);
+                            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                            written += n;
+                        }
+                        // A neighboring segment on this page can still have a newer
+                        // title write. Only a full-page merge made the whole copy current.
+                        if n == PAGE {
+                            synced.push((start + at) / PAGE);
+                        }
                     }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
-                    synced.push((start + at) / PAGE);
+                    at += n;
                 }
-                at += n;
             }
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
@@ -340,11 +331,11 @@ impl Shadow {
         // submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
+        if pending.is_empty() {
             unchanged.clear();
-            give_back(bytes);
+            for (_, bytes) in segments.drain(..) {
+                give_back(bytes);
+            }
         }
         written
     }
@@ -933,6 +924,76 @@ mod tests {
             cached[2],
             baseline[2].as_secs_f64() / cached[2].as_secs_f64(),
         );
+    }
+
+    #[test]
+    fn later_gpu_write_range_keeps_the_titles_newer_bytes() {
+        let _retire = crate::host::isolated_retire_scope();
+        if host().is_none() {
+            eprintln!("skipping shadow copy-back test: no D3D12 device");
+            assert!(
+                std::env::var_os("VICTORY_D3D12_WARP").is_none(),
+                "WARP unavailable"
+            );
+            return;
+        }
+        let mut title = vec![0u8; 2 * PAGE];
+        let start = title.as_mut_ptr() as usize;
+        let edge = (start + 2).next_multiple_of(PAGE);
+        let offset = edge - 2 - start;
+        let resource = 0xdead_beef_0011;
+        register(resource, start as u64, title.len() as u64);
+        let copy = find(start as u64, title.len() as u64).expect("shadow");
+        copy.update(start, title.len());
+        copy.writing(edge - 2, 1);
+        copy.writing(edge + 1, 1);
+
+        // The two middle bytes cross a page boundary. Their first declaration
+        // follows a refresh of values written after the outer declarations.
+        title[offset + 1..offset + 3].copy_from_slice(&[0x44, 0x45]);
+        copy.update(edge - 1, 2);
+        assert_eq!(copy.bytes((edge - 1) as u64, 2), Some(&[0x44, 0x45][..]));
+        copy.writing(edge - 2, 4);
+        title[offset + 1..offset + 3].copy_from_slice(&[0x55, 0x56]);
+        // SAFETY: the test owns the mapped buffer and simulates its GPU write.
+        unsafe { copy.data.add(offset + 3).write(0xaa) };
+        copy.copy_back(edge - 2, 1);
+        copy.copy_back(edge + 1, 1);
+        copy.copy_back(edge - 2, 4);
+        unregister(resource, start as u64);
+        assert_eq!(&title[offset..offset + 4], &[0, 0x55, 0x56, 0xaa]);
+    }
+
+    #[test]
+    #[ignore = "times overlapping GPU-write declarations on a D3D12 host"]
+    fn time_growing_gpu_write_snapshots() {
+        let _retire = crate::host::isolated_retire_scope();
+        let mut title = vec![0u8; 8 << 20];
+        let start = title.as_mut_ptr() as usize;
+        let resource = 0xdead_beef_0012;
+        register(resource, start as u64, title.len() as u64);
+        let copy = find(start as u64, title.len() as u64).expect("D3D12 shadow");
+        copy.update(start, title.len());
+        let step = title.len() / 32;
+        for growing in [true, false] {
+            let lengths: Vec<_> = (1..=32)
+                .map(|i| if growing { i * step } else { (33 - i) * step })
+                .collect();
+            for batch in 0..10 {
+                let begin = std::time::Instant::now();
+                for &len in &lengths {
+                    copy.writing(start, len);
+                }
+                let time = begin.elapsed();
+                for &len in &lengths {
+                    copy.copy_back(start, len);
+                }
+                if batch >= 2 {
+                    println!("growing={growing} snapshot_us={}", time.as_micros());
+                }
+            }
+        }
+        unregister(resource, start as u64);
     }
 
     #[cfg(windows)]
