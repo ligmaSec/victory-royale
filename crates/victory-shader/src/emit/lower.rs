@@ -47,6 +47,9 @@ pub(crate) struct Lowered {
     pub has_coverage_op: bool,
     #[cfg(test)]
     pub has_quad_read: bool,
+    /// Wave reduction, indexed lane read and first-lane read in the DXIL module.
+    #[cfg(test)]
+    pub lane_ops: [usize; 3],
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -1232,6 +1235,12 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             has_quad_read: self.s.m.has_dx_op("dx.op.quadReadLaneAt.i32", 122),
+            #[cfg(test)]
+            lane_ops: [
+                self.s.m.dx_op_count("dx.op.waveActiveOp.i32", 119),
+                self.s.m.dx_op_count("dx.op.waveReadLaneAt.i32", 117),
+                self.s.m.dx_op_count("dx.op.waveReadLaneFirst.i32", 118),
+            ],
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -9292,6 +9301,35 @@ mod tests {
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         lower_words(words, rsrc2).map(|_| ())
+    }
+
+    #[test]
+    fn mapped_first_lane_uses_a_wave_reduction_only_under_a_guard() {
+        for (narrow, guarded) in [(0xBF80_0000, false), (0x7DA6_0082, true)] {
+            let mut words = [
+                0x4A02_0081, // v1 = thread index + 1
+                0xD760_0012,
+                0x0001_0101, // read lane zero; requires console lane order
+                0xBE8C_037E, // save EXEC
+                narrow,      // nop, or mask off lanes below 2
+                0x7E06_0501, // read first lane of v1
+                0xBEFE_030C, // restore EXEC
+                S_ENDPGM,
+            ];
+            let result = lower_words(&words, 0).unwrap();
+            // Mask evaluation can emit its own wave operations. Compare the
+            // same program with only the first-lane instruction removed.
+            words[5] = 0xBF80_0000;
+            let [min, indexed, first] = lower_words(&words, 0).unwrap().lane_ops;
+            assert_eq!(
+                result.lane_ops,
+                [
+                    min + usize::from(guarded),
+                    indexed + usize::from(guarded),
+                    first + usize::from(!guarded)
+                ]
+            );
+        }
     }
 
     #[test]

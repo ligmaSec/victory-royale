@@ -506,7 +506,12 @@ impl Module {
 
     #[cfg(test)]
     pub(crate) fn has_dx_op(&self, name: &str, opcode: i64) -> bool {
-        self.insts.iter().any(|inst| match &inst.op {
+        self.dx_op_count(name, opcode) != 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dx_op_count(&self, name: &str, opcode: i64) -> usize {
+        self.insts.iter().filter(|inst| match &inst.op {
             Op::Call(fid, args) => {
                 self.funcs[*fid as usize].name == name
                     && matches!(
@@ -515,7 +520,7 @@ impl Module {
                     )
             }
             _ => false,
-        })
+        }).count()
     }
 
     #[cfg(test)]
