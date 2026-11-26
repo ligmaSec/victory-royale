@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -25,6 +26,7 @@ PACKAGE = "victory-proton-x86_64.tar.gz"
 # Stamped into the official extracted runner. A loose request cannot supply this value.
 PUBLISHED_SHA256 = None
 ROOT = Path(__file__).resolve().parent
+TITLE_ID = "7952987A"
 OUTGOING = ("summary.txt", "main-frames.csv", "candidate-frames.csv", "main-submissions.csv",
             "candidate-submissions.csv", "main-events.csv", "candidate-events.csv")
 REVIEWER = "victory-report-review" + (".exe" if sys.platform == "win32" else "")
@@ -77,10 +79,10 @@ def console_name(console):
 def parse_request(data):
     request = json.loads(data)
     console = request.get("console", "series-x")
-    fresh_profile = request.get("fresh_profile", False)
-    version = 3 if fresh_profile else 2 if console == "series-s" else 1
-    if (type(fresh_profile) is not bool or console not in ("series-x", "series-s")
-            or type(request["version"]) is not int or request["version"] != version
+    version = request["version"]
+    legacy = (version, console) in ((1, "series-x"), (2, "series-s")) and "save" not in request
+    standard = version == 4 and request.get("save") == TITLE_ID and console in ("series-x", "series-s")
+    if (type(version) is not int or not (legacy or standard)
             or type(request["pr"]) is not int or request["pr"] < 1
             or not isinstance(request["scenario"], str) or not request["scenario"].strip()
             or not request["scenario"].isprintable()):
@@ -144,18 +146,39 @@ def choose_title():
     return Path(chosen).expanduser()
 
 
-def launch(side, folder, title, results, windows, console="series-x", fresh_profile=False):
+def default_save():
+    checkout = ROOT.parent.parent
+    base = checkout if ROOT == checkout / "scripts" / "hardware-test" and (checkout / ".victory-root").is_file() else ROOT
+    return base / "saves" / TITLE_ID
+
+
+def copy_save(source, destination):
+    # Only persistent player data belongs in the test. In particular, a title's
+    # temp directory may contain unrelated files or logs from an earlier run.
+    def check_entries(folder, names):
+        for name in names:
+            path = Path(folder) / name
+            info = path.lstat()
+            if (not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode))
+                    or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                raise ValueError(f"Use a self-contained save. Unsupported entry in {path}.")
+        return []
+
+    for name in ("saves", "storage"):
+        path = source / name
+        if name == "saves" or path.exists():
+            check_entries(source, [name])
+            shutil.copytree(path, destination / name, ignore=check_entries)
+
+
+def launch(side, folder, title, results, windows, console="series-x"):
     env = os.environ.copy()
     # Ignore a developer override that could silently substitute a different build.
     env.pop("VICTORY_EXE", None)
     env["VICTORY_TRACE_PIPELINES"] = "1"
-    def guest_path(path):
-        return str(path) if windows else "Z:" + str(path).replace("/", "\\")
-
-    env["VICTORY_CACHE_DIR"] = guest_path(folder / "cache")
-    if fresh_profile:
-        profile = Path(tempfile.mkdtemp(prefix="player-data-", dir=folder))
-        env["VICTORY_DATA_DIR"] = guest_path(profile)
+    for variable, directory in (("VICTORY_CACHE_DIR", "cache"), ("VICTORY_DATA_DIR", "data")):
+        path = str(folder / directory)
+        env[variable] = path if windows else "Z:" + path.replace("/", "\\")
     args = [str(title), "--console", console]
     if windows:
         command = [str(folder / "victory.exe"), "run", str(title), "--execute", "--console", console]
@@ -311,8 +334,7 @@ def run():
     parser.add_argument("request", nargs="?", help="PR number, test kit ZIP or request JSON")
     parser.add_argument("--list", action="store_true", help="list hardware test requests")
     parser.add_argument("--output-dir", type=Path, help="parent directory for the unique report")
-    parser.add_argument("--fresh-profile", action="store_true",
-                        help="start each build with its own empty temporary player data directory")
+    parser.add_argument("--save-dir", type=Path, help=f"use a local {TITLE_ID} folder outside the default saves/ directory")
     parser.add_argument("--plan", action="store_true", help="preview the selected test without launching")
     parser.add_argument("--title", type=Path, help="use this executable instead of the file chooser")
     options = parser.parse_args()
@@ -545,13 +567,12 @@ def side_metrics(results, side, windows, frame_log, submission_log, timeline):
     return rows
 
 
-def diagnostic_summary(request, results, windows, complete, destination, fresh_profile=False):
+def diagnostic_summary(request, results, windows, complete, destination):
     shader_ids = {}
     rows = [f"{console_name(request.get('console', 'series-x'))} hardware test | PR #{request['pr']} | " + ("Windows" if windows else "Linux/Proton"),
             "Comparison completed" if complete else "Partial comparison",
+            f"Starting save: {TITLE_ID} (separate copies)",
             "Timings cover all recorded phases, including menus."]
-    if fresh_profile:
-        rows.append("Each build started with empty player data.")
     for side in ("main", "candidate"):
         rows.extend(["", f"{side.capitalize()} | {request[side]['revision']}"])
         exit_path = results / (side + "-exit.txt")
@@ -865,9 +886,15 @@ def run_request(manifest, options):
     console = request.get("console", "series-x")
     print(f"VIctory PR #{request['pr']} | {console_name(console)} | two launches", flush=True)
     instruction_block(PRIVACY_HEADING, LOG_PRIVACY + " Your reports stay on this machine until you choose to share.")
-    fresh_profile = options.fresh_profile or request.get("fresh_profile", False)
-    if fresh_profile:
-        print("Each build will use its own empty, temporary player data directory.", flush=True)
+    source = (options.save_dir or default_save()).expanduser().resolve()
+    if source.name.upper() != TITLE_ID or not any(p.is_file() for p in (source / "saves").rglob("*")):
+        message = (f"Standard save {TITLE_ID} missing or empty at {source}. "
+                   f"Place your copy in saves/{TITLE_ID}/ or pass --save-dir pointing to your {TITLE_ID} folder.")
+        if not options.plan:
+            raise ValueError("Warning: " + message)
+        print("Warning: " + message, file=sys.stderr)
+    else:
+        print(f"Using standard save {TITLE_ID}. Each build gets a separate copy.", flush=True)
     if options.plan:
         if binding:
             owner = binding["requester"]["login"]
@@ -898,6 +925,9 @@ def run_request(manifest, options):
         for side in ("main", "candidate"):
             print(f"Checking {side}…", flush=True)
             stage_build(request, side, Path(work) / side, manifest.resolve().parent / "packages")
+        seed = Path(work) / "main" / "data" / TITLE_ID
+        copy_save(source, seed)
+        shutil.copytree(seed, Path(work) / "candidate" / "data" / TITLE_ID)
         results = Path(work) / "results"
         results.mkdir()
         shutil.copyfile(manifest, results / "request.json")
@@ -905,7 +935,7 @@ def run_request(manifest, options):
         try:
             for number, side in enumerate(("main", "candidate"), start=1):
                 instruction_block(f"RUN {number} OF 2  |  {side.upper()}  |  WHAT TO DO", request["scenario"])
-                launch(side, Path(work) / side, title, results, windows, console, fresh_profile)
+                launch(side, Path(work) / side, title, results, windows, console)
             complete = True
         finally:
             if any(results.glob("*.log")):
@@ -917,7 +947,7 @@ def run_request(manifest, options):
                         out.write(path, path.name)
                 heading = "REPORT READY" if complete else "TEST INTERRUPTED"
                 instruction_block(heading, "Keep this full troubleshooting archive on your machine.", f"Local logs: {bundle}")
-                report = diagnostic_summary(request, results, windows, complete, destination, fresh_profile)
+                report = diagnostic_summary(request, results, windows, complete, destination)
                 summary_path = destination / "summary.txt"
                 summary_path.write_text(report, encoding="utf-8")
                 share = destination / "share"

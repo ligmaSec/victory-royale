@@ -71,14 +71,18 @@ runtime on first use.
 | From the repository root, choose a test request | `python3 scripts/hardware-test/run-test.py` | `py scripts/hardware-test/run-test.py` |
 | With a kit ZIP, extract it and open a terminal in the folder containing `run-test.py` | `python3 run-test.py` | `py run-test.py` |
 
+Gameplay comparisons start from the standard `7952987A` save. Place your local
+copy in `saves/7952987A/` at the checkout root, or beside an extracted runner
+in the same layout. It contains `saves/` with your progress and may also contain
+`storage/` with settings. To keep the checkout empty, pass
+`--save-dir "/path/to/7952987A"`. Each build starts with its own temporary copy
+of the same progress and settings. The runner warns if the save is missing.
+You can still preview a request with `--plan`.
+
 The checkout menu uses a signed-in GitHub CLI (`gh auth login`). Type the PR number
 shown in the menu, or press Enter to cancel. If a request includes a number, you
 can append it directly to the checkout command. Add `--plan` to preview the scenario
-and build revisions. First-run requests can require empty player data automatically.
-To select this mode yourself, add `--fresh-profile` to give each
-build its own empty player data directory. These temporary directories are removed
-after the test. For comparisons using an existing save, use the normal command.
-An extracted kit includes both builds and needs no GitHub login.
+and build revisions. An extracted kit includes both builds and needs no GitHub login.
 
 1. Select your game's `.exe` when prompted. The runner checks both packages and starts
    **main** first. Follow **WHAT TO DO** above the launch and close the game at the point
@@ -198,8 +202,7 @@ request against the copy pinned in its bundled runner.
 Run the [hardware kit workflow](../.github/workflows/hardware-request.yml) on
 `main` with the PR number, console profile (Series X by default), and a short scenario.
 Both builds use that profile. Specify where to start,
-what to observe and when to close each run. Select **Start each build with empty player data**
-for first-run menus. The published request applies that setting when selected from the tester menu. If someone else asked for the test,
+what to observe and when to close each run. If someone else asked for the test,
 have them comment on this PR with `/victory hardware-test` on its own first line
 followed by their scenario. Put that comment URL in **requester_comment** when
 dispatching. For your own request leave the field blank. The workflow then uses

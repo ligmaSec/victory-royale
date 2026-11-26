@@ -6,6 +6,12 @@ Use the command for your system.
   Linux/Proton    python3 run-test.py
   Windows         py run-test.py
 
+Supply your local standard save in saves/7952987A/ beside this file in an
+extracted kit, or in saves/7952987A/ at the repository root. You can also pass
+--save-dir "/path/to/7952987A". Each build starts with a separate temporary
+copy of your progress and persistent settings. The save stays on your machine.
+A missing save produces a warning. Use --plan to preview without it.
+
 Select your game's .exe when prompted. Before each launch, read WHAT TO DO.
 Run the scenario on main, close the game as instructed, then repeat on the
 candidate with the same settings and window size. Each build gets a fresh

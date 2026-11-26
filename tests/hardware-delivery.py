@@ -160,7 +160,7 @@ class RequestDelivery(unittest.TestCase):
         out = self.root / "kit.zip"
         build = {"run": 9, "revision": "f" * 40, "sha256": "0" * 64}
         pull = {"user": author, "head": {"sha": "c" * 40}, "base": {"ref": "main", "repo": {"full_name": keys.REPO}}}
-        args = ["prepare", "7", "--console", "series-s", "--fresh-profile", "--scenario", "Observe.", "--output", str(out), "--published", "--requester-comment", comment]
+        args = ["prepare", "7", "--console", "series-s", "--scenario", "Observe.", "--output", str(out), "--published", "--requester-comment", comment]
         with mock.patch.dict(os.environ, GITHUB_RUN_ID="812", GITHUB_ACTOR="publisher", GITHUB_ACTOR_ID="22"), \
                 mock.patch.object(sys, "argv", args), mock.patch.object(prepare, "api", return_value=pull), \
                 mock.patch.object(prepare, "find_build", side_effect=[(build, "base", b"one"),
@@ -173,14 +173,15 @@ class RequestDelivery(unittest.TestCase):
                 self.assertIn(name, kit.namelist())
         trusted = hashlib.sha256(data).hexdigest()
         request = json.loads(data)
-        self.assertEqual((request["version"], request["console"], request["fresh_profile"]), (3, "series-s", True))
+        self.assertEqual((request["version"], request["console"]), (4, "series-s"))
+        self.assertEqual(request["save"], "7952987A")
         self.assertEqual(request["delivery"]["requester"], keys.account(requester))
         manifest = self.root / "request.json"
         for modified in (dict(request, delivery={"requester": keys.account(publisher), "registration": None}),
                          dict(request, candidate=dict(build, run=735)), dict(request, pr=9)):
             manifest.write_text(json.dumps(modified))
             with contextlib.redirect_stdout(io.StringIO()) as report:
-                runner.run_request(manifest, mock.Mock(plan=True, trusted_digest=trusted))
+                runner.run_request(manifest, mock.Mock(plan=True, trusted_digest=trusted, save_dir=None))
             self.assertIn("Private delivery unavailable for this request.", report.getvalue())
         run = dict(path=".github/workflows/hardware-request.yml", head_branch="main", event="workflow_dispatch",
                    conclusion="success", head_repository={"full_name": keys.REPO})
@@ -313,9 +314,12 @@ class RequestDelivery(unittest.TestCase):
         stamp = runner.digest(manifest)
         changed = dict(original, delivery={"requester": keys.account(publisher), "registration": published})
         manifest.write_text(json.dumps(changed), encoding="utf-8")
+        save = self.root / "saves" / "7952987A" / "saves"
+        save.mkdir(parents=True)
+        (save / "progress").write_text("test fixture")
         title = self.root / "fixture.exe"
         title.touch()
-        def launch(side, folder, game, results, windows, console, fresh_profile):
+        def launch(side, folder, game, results, windows, console):
             self.assertEqual(console, "series-s")
             (results / (side + ".log")).write_text("synthetic run")
         def menu(title, context, lines, actions, default, cancel):

@@ -34,6 +34,20 @@ REQUESTER = {"id": 83, "login": "test-requester"}
 BINDING = {"requester": REQUESTER, "registration": {"key": "fixture", "gist": "e" * 32}}
 
 
+class SaveLocations(unittest.TestCase):
+    def test_checkout_and_extracted_kit_resolve_their_own_saves(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "checkout"
+            scripts = checkout / "scripts" / "hardware-test"
+            scripts.mkdir(parents=True)
+            (checkout / ".victory-root").touch()
+            kit = Path(directory) / "kit"
+            with mock.patch.object(runner, "ROOT", scripts):
+                self.assertEqual(runner.default_save(), checkout / "saves" / "7952987A")
+            with mock.patch.object(runner, "ROOT", kit):
+                self.assertEqual(runner.default_save(), kit / "saves" / "7952987A")
+
+
 class HardwareRequest(unittest.TestCase):
     def setUp(self):
         # Launch tests capture their output and must never prompt the person running the suite.
@@ -63,6 +77,12 @@ class HardwareRequest(unittest.TestCase):
         self.title = self.root / "space & title.exe"
         self.title.touch()
         self.output = self.root / "out"
+        self.save = self.root / "saves" / runner.TITLE_ID
+        (self.save / "saves").mkdir(parents=True)
+        (self.save / "saves" / "progress").write_text("starting point")
+        default = mock.patch.object(runner, "default_save", return_value=self.save)
+        default.start()
+        self.addCleanup(default.stop)
 
     def fake_download(self, args, check):
         self.assertEqual(args[:6], ["gh", "run", "download", "12", "-R", "github.com/" + runner.REPO])
@@ -202,20 +222,30 @@ class HardwareRequest(unittest.TestCase):
         temp.mkdir()
         stdout = io.StringIO()
 
-        def launched(side, folder, title, results, windows, console, fresh_profile):
-            self.assertTrue(fresh_profile)
+        def launched(side, folder, title, results, windows, console):
+            profile = folder / "data" / runner.TITLE_ID
+            progress = profile / "saves" / "progress"
+            self.assertEqual(progress.read_text(), "starting point")
+            progress.write_text(side)
+            self.assertFalse((profile / "temp").exists())
+            self.assertEqual((profile / "storage" / "settings").read_text(), "fixture")
             number = 1 if side == "main" else 2
             lines = stdout.getvalue().rstrip().splitlines()
             self.assertEqual(lines[-3], f"RUN {number} OF 2  |  {side.upper()}  |  WHAT TO DO")
             self.assertEqual(lines[-1], self.request["scenario"])
             (results / (side + ".log")).write_text(side)
 
-        args = ["runner", str(self.manifest), "--title", str(self.title), "--fresh-profile"]
+        (self.save / "temp").mkdir()
+        (self.save / "temp" / "private-log").write_text("omit")
+        (self.save / "storage").mkdir()
+        (self.save / "storage" / "settings").write_text("fixture")
+        args = ["runner", str(self.manifest), "--title", str(self.title)]
         with mock.patch.object(sys, "argv", args), mock.patch.object(tempfile, "tempdir", str(temp)), \
                 mock.patch.dict(os.environ, {"COLUMNS": "52"}), \
                 mock.patch.object(shutil, "which", return_value="tool"), \
                 mock.patch.object(runner, "launch", side_effect=launched), contextlib.redirect_stdout(stdout):
             runner.run()
+        self.assertEqual((self.save / "saves" / "progress").read_text(), "starting point")
         report, = temp.rglob("report.zip")
         self.assertEqual(list(temp.iterdir()), [report.parent])
         self.assertIn("REPORT READY", stdout.getvalue())
@@ -241,24 +271,18 @@ class HardwareRequest(unittest.TestCase):
             with self.subTest(version=version, console=console), self.assertRaises(ValueError):
                 runner.parse_request(json.dumps(dict(self.request, version=version, console=console)))
 
-    def test_published_first_run_request_uses_empty_data_without_a_tester_flag(self):
-        shutil.copy(self.package, self.packages / (self.build["sha256"] + ".tar.gz"))
-        for console in ("series-s", "series-x"):
-            request = dict(self.request, version=3, fresh_profile=True, console=console)
-            self.manifest.write_text(json.dumps(request))
-            launches = []
-            self.run_pair(lambda side, folder, title, results, windows, selected, fresh:
-                          launches.append((side, selected, fresh)))
-            self.assertEqual(launches, [("main", console, True), ("candidate", console, True)])
-            for overrides in ({"version": 1}, {"version": 2}, {"fresh_profile": False}, {"fresh_profile": 1}):
+    def test_standard_requests_name_the_save_on_both_consoles(self):
+        for console in ("series-x", "series-s"):
+            request = dict(self.request, version=4, save=runner.TITLE_ID, console=console)
+            self.assertEqual(runner.parse_request(json.dumps(request)), request)
+            for change in ({"save": "../other"}, {"version": 1}, {"console": "unknown"}):
                 with self.assertRaises(ValueError):
-                    runner.parse_request(json.dumps(dict(request, **overrides)))
+                    runner.parse_request(json.dumps(dict(request, **change)))
 
     def test_fresh_pair_and_partial(self):
         self.request.update(version=2, console="series-s")
         self.manifest.write_text(json.dumps(self.request))
-        def launched(side, folder, title, results, windows, console, fresh_profile):
-            self.assertFalse(fresh_profile)
+        def launched(side, folder, title, results, windows, console):
             self.assertEqual(console, "series-s")
             self.assertEqual(title, self.title)
             (results / (side + ".log")).write_text(side)
@@ -647,6 +671,16 @@ class HardwareRequest(unittest.TestCase):
             for forbidden in (shader, "2026-", "0xabc", "private"):
                 self.assertNotIn(forbidden, text + body)
 
+    def test_missing_standard_save_warns_in_preview_and_stops_before_launch(self):
+        args = ["runner", str(self.manifest), "--save-dir", str(self.root / "missing" / runner.TITLE_ID)]
+        with mock.patch.object(sys, "argv", args + ["--plan"]), contextlib.redirect_stderr(io.StringIO()) as warning:
+            runner.run()
+        self.assertIn("Warning: Standard save 7952987A missing", warning.getvalue())
+        with mock.patch.object(sys, "argv", args), mock.patch.object(runner, "stage_build") as stage:
+            with self.assertRaisesRegex(ValueError, "saves/7952987A/"):
+                runner.run()
+            stage.assert_not_called()
+
     def test_platform_commands_and_cache_paths(self):
         for windows, console in ((False, "series-x"), (False, "series-s"),
                                  (True, "series-x"), (True, "series-s")):
@@ -660,7 +694,8 @@ class HardwareRequest(unittest.TestCase):
                 def start(args, **kwargs):
                     self.assertEqual(kwargs["cwd"], self.title.parent)
                     self.assertNotIn("VICTORY_EXE", kwargs["env"])
-                    self.assertEqual(kwargs["env"]["VICTORY_DATA_DIR"], "player-data-override")
+                    expected = str(self.root / "data")
+                    self.assertEqual(kwargs["env"]["VICTORY_DATA_DIR"], expected if windows else "Z:" + expected.replace("/", "\\"))
                     self.assertIn(str(self.title), args)
                     self.assertEqual(args[-2:], ["--console", console])
                     if windows:
@@ -672,45 +707,12 @@ class HardwareRequest(unittest.TestCase):
                         self.assertEqual(kwargs["env"]["VKD3D_SHADER_CACHE_PATH"], str(self.root / "vkd3d"))
                     return popen([sys.executable, "-c", "import sys; print(sys.argv[1]); sys.exit(42)",
                                   f"Report: {report} (launcher exit 42)"], **kwargs)
-                with mock.patch.dict(os.environ, {"VICTORY_EXE": "old.exe", "VICTORY_DATA_DIR": "player-data-override"}), \
+                with mock.patch.dict(os.environ, {"VICTORY_EXE": "old.exe", "VICTORY_DATA_DIR": "unrelated profile"}), \
                         mock.patch.object(subprocess, "Popen", side_effect=start):
                     runner.launch("main", self.root, self.title, results, windows, console)
                 self.assertEqual((results / "main-exit.txt").read_text().strip(), "42")
                 if not windows:
                     self.assertEqual((results / "main.tar.gz").read_bytes(), b"this launch")
-
-    def test_fresh_profile_keeps_each_launch_out_of_the_normal_save_directory(self):
-        normal = self.root / "player data"
-        normal.mkdir()
-        (normal / "existing save").write_text("original")
-        for windows in (True, False):
-            with self.subTest(windows=windows):
-                target = self.root / ("Windows runs" if windows else "Proton runs")
-                target.mkdir()
-                report = target / "report.tar.gz"
-                report.touch()
-                seen = []
-                popen = subprocess.Popen
-                def capture(args, **kwargs):
-                    value = kwargs["env"]["VICTORY_DATA_DIR"]
-                    if not windows:
-                        self.assertTrue(value.startswith("Z:"))
-                        value = value[2:].replace("\\", "/")
-                    profile = Path(value)
-                    self.assertNotEqual(profile, normal)
-                    self.assertEqual(list(profile.iterdir()), [])
-                    (profile / "first launch marker").touch()
-                    seen.append(profile)
-                    return popen([sys.executable, "-c", "import sys; print(sys.argv[1])",
-                                  f"Report: {report} (launcher exit 0)"], **kwargs)
-                with mock.patch.dict(os.environ, {"VICTORY_DATA_DIR": str(normal)}), \
-                        mock.patch.object(subprocess, "Popen", side_effect=capture):
-                    for side in ("main", "candidate"):
-                        folder = target / side
-                        folder.mkdir()
-                        runner.launch(side, folder, self.title, target, windows, "series-s", fresh_profile=True)
-                self.assertNotEqual(*seen)
-        self.assertEqual((normal / "existing save").read_text(), "original")
 
     def test_main_ci_refresh_after_a_docs_only_push(self):
         prefix = "victory-proton-x86_64-"
