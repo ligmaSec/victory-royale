@@ -69,6 +69,7 @@ class PathRecovery(unittest.TestCase):
                 title.unlink()
                 self.assertIsNone(runner.session.discover_title())
 
+    @unittest.skipUnless(os.name == "posix", "Proton reports contain Unix paths")
     def test_recover_only_a_live_title_from_a_victory_run(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
