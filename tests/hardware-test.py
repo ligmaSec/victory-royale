@@ -583,6 +583,29 @@ sys.exit(90)
             for value in ("private", "192.0.2.10", "secret=value"):
                 self.assertNotIn(value, body + timings + "".join(submissions))
 
+    def test_proton_build_comes_from_runtime_header_only(self):
+        header = b"======================\r\nProton: 1795031687 UMU-Proton-11.0-2e\r\n"
+        report = self.root / "run-unique"
+        report.mkdir()
+        steam = report / "steam-12345.log"
+        steam.write_bytes(header)
+        self.assertEqual(runner.session.reported_proton(report), "1795031687 UMU-Proton-11.0-2e")
+        self.assertIsNone(runner.session.proton_version(b"Command: other\n" + header))
+        self.assertIsNone(runner.session.proton_version(b"Proton: 123 /private/user/path\n"))
+        archive = self.root / "run-fast.tar.gz"
+        with tarfile.open(archive, "w:gz") as tar:
+            padding = tarfile.TarInfo("./launcher.log")
+            padding.size = 200000
+            tar.addfile(padding, io.BytesIO(bytes(padding.size)))
+            tar.add(steam, arcname="./steam-12345.log")
+        self.assertEqual(runner.session.reported_proton(archive), "1795031687 UMU-Proton-11.0-2e")
+        (self.root / "main-proton.txt").write_bytes(b"1795031687 UMU-Proton-11.0-2e\n")
+        (self.root / "candidate-proton.txt").write_bytes(b"1234 private custom name\n")
+        body = runner.diagnostic_summary(self.request, self.root, False, False, self.root)
+        self.assertIn("Proton version: 1795031687 UMU-Proton-11.0-2e", body)
+        self.assertIn("custom build (see local log)", body)
+        self.assertNotIn("private custom name", body)
+
     def test_proton_uses_recognized_output_with_a_nondefault_game_id(self):
         (self.root / "main.log").write_bytes(b"wrapper")
         header = b"Proton header only"

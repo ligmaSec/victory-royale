@@ -78,6 +78,31 @@ def report_headers(report):
                     return
 
 
+def proton_version(header):
+    """Use the build identity in Proton's own header, before the command line."""
+    match = re.match(rb"(?:=+\r?\n)?Proton: ([0-9]{1,12} [A-Za-z0-9][A-Za-z0-9.+_() -]{0,95})\r?\n", header)
+    return match.group(1).decode("ascii").rstrip() if match else None
+
+
+def reported_proton(report):
+    if report:
+        try:
+            if report.is_file() and report.name.endswith(".tar.gz"):
+                # An early exit can archive the report before the first live poll.
+                with tarfile.open(report, "r|gz") as archive:
+                    for member in archive:
+                        if member.isfile() and re.fullmatch(r"(?:\./)?steam-[^/]+\.log", member.name):
+                            if version := proton_version(archive.extractfile(member).read(1024)):
+                                return version
+                return None
+            for header in report_headers(report):
+                if version := proton_version(header):
+                    return version
+        except (OSError, EOFError, tarfile.TarError):
+            pass
+    return None
+
+
 def previous_title():
     """Recover a live title path from recent local Proton reports."""
     home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
@@ -302,13 +327,13 @@ def keep_window_sample(screenshot, seconds):
         samples[1].unlink()  # Keep the first image and the seven most recent.
 
 
-def monitor(process, log, windows, env, stop, close_file, screenshot=None):
+def monitor(process, log, windows, env, stop, close_file, screenshot=None, on_proton=None):
     tail = Tail()
     report_dir = None
     home = Path(env.get("XDG_DATA_HOME") or Path.home() / ".local/share")
     reports = (home if home.is_absolute() else Path.home() / ".local/share") / "victory/reports"
     start = time.monotonic()
-    deadline = start + stop["timeout_seconds"]
+    deadline = start + stop["timeout_seconds"] if stop else None
     next_capture = start + 5
     matched = None
     cooperative = False
@@ -333,13 +358,23 @@ def monitor(process, log, windows, env, stop, close_file, screenshot=None):
                 path = Path(os.fsdecode(line[len(b"Recording this run in "):]))
                 if path.parent.resolve() == reports.resolve() and path.name.startswith("run-"):
                     report_dir = path
-        if report_dir:
+        if report_dir and on_proton:
+            version = reported_proton(report_dir)
+            if version:
+                on_proton(version)
+                on_proton = None
+                if not stop:
+                    return "manual scenario", False, report_dir
+        if stop and report_dir:
             for path in [report_dir / "launcher.log", *report_dir.glob("steam-*.log")]:
                 for line in tail.lines(path):
                     observe(line)
         if report_dir and (report_dir / "launcher-exit.txt").is_file():
             # UMU has exited; the wrapper can still be creating its archive.
             return early, False, report_dir
+        if not stop:
+            time.sleep(0.25)
+            continue
         now = time.monotonic()
         if early == "exited before completion" and matched is not None and matched + stop["observe_seconds"] <= min(now, deadline):
             reason = "condition reached"

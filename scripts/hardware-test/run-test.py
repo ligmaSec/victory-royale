@@ -237,16 +237,26 @@ def launch(side, folder, title, results, windows, console="series-x", *, stop=No
         command = ["bash", str(folder / "victory-proton.sh"), "--report", "--runtime", "pinned", *args]
     log_path = results / (side + ".log")
     report = None
+    version_path = results / (side + "-proton.txt")
+
+    def show_version(version):
+        version_path.write_text(version + "\n", encoding="utf-8")
+        print(f"{side} | Proton version: {version}", flush=True)
+
     with log_path.open("wb") as log, subprocess.Popen(command, cwd=title.parent, env=env,
                                                        stdout=log, stderr=subprocess.STDOUT,
                                                        start_new_session=bool(stop and not windows)) as process:
         reason, forced, live_report = "manual scenario", False, None
-        if stop:
+        if stop or not windows:
             try:
                 reason, forced, live_report = session.monitor(
-                    process, log_path, windows, env, stop, close_file, results / (side + "-screenshot.png"))
+                    process, log_path, windows, env, stop, close_file, results / (side + "-screenshot.png"),
+                    None if windows else show_version)
+                if not stop:
+                    reason = "manual scenario"
             except BaseException:
-                session.terminate_run(process, windows, env)
+                if stop:
+                    session.terminate_run(process, windows, env)
                 raise
         status = process.wait()
     (results / (side + "-stop.txt")).write_text(reason + ("; forced" if forced else "") + "\n")
@@ -259,6 +269,11 @@ def launch(side, folder, title, results, windows, console="series-x", *, stop=No
                     report = Path(os.fsdecode(found[1]))
     (results / (side + "-exit.txt")).write_text(f"{status}\n")
     if not windows:
+        if not version_path.exists():
+            show_version(session.reported_proton(report) or session.reported_proton(live_report) or "unreported")
+        with log_path.open("ab") as stream:
+            version = version_path.read_text(encoding="utf-8").strip()
+            stream.write(f"Proton version: {version}\n".encode("ascii"))
         if report is None or not report.is_file():
             if stop:
                 # A startup timeout can precede the launcher's archive. Preserve any private logs.
@@ -666,6 +681,15 @@ def diagnostic_summary(request, results, windows, complete, destination, stop=No
                     f"(timeout {stop['timeout_seconds']} s per build)")
     for side in ("main", "candidate"):
         rows.extend(["", f"{side.capitalize()} | {request[side]['revision']}"])
+        if not windows:
+            info = results / (side + "-proton.txt")
+            version = session.proton_version(b"Proton: " + info.read_bytes()) if info.is_file() else None
+            # A custom build label can contain private text. Share recognized
+            # distribution identifiers only; the local log retains the actual label.
+            if version and not re.fullmatch(r"[0-9]+ (?:UMU-Proton|GE-Proton|Proton-GE|Proton|experimental|hotfix)[-._ ]?[0-9][A-Za-z0-9._+-]*",
+                                            version, re.IGNORECASE):
+                version = "custom build (see local log)"
+            rows.append("Proton version: " + (version or "unreported"))
         exit_path = results / (side + "-exit.txt")
         status = exit_path.read_bytes().strip() if exit_path.is_file() else b""
         code = str(int(status)) if re.fullmatch(rb"-?[0-9]{1,10}", status) else "unreported"

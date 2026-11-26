@@ -22,6 +22,9 @@ or ~/Games and, on Linux, launch commands from recent local Proton reports. Befo
 Automatic scenarios close each build once its milestone and observation period
 are complete. Follow the input instructions and leave the game open. A timeout
 or early exit is recorded separately. For manual scenarios, close as instructed.
+On Linux the terminal and each build's private log show the Proton version and
+build reported by the runtime. A failed launch that produced no version header
+is marked unreported.
 Repeat the same inputs and keep the same settings and window size. Each build gets a fresh
 translation cache. Add --plan to preview the instructions and build revisions.
 
