@@ -71,6 +71,14 @@ runtime on first use.
 | From the repository root, choose a test request | `python3 scripts/hardware-test/run-test.py` | `py scripts/hardware-test/run-test.py` |
 | With a kit ZIP, extract it and open a terminal in the folder containing `run-test.py` | `python3 run-test.py` | `py run-test.py` |
 
+Gameplay comparisons start from the standard `7952987A` save. Place your local
+copy in `saves/7952987A/` at the checkout root, or beside an extracted runner
+in the same layout. It contains `saves/` with your progress and may also contain
+`storage/` with settings. To keep the checkout empty, pass
+`--save-dir "/path/to/7952987A"`. Each build starts with its own temporary copy
+of the same progress and settings. The runner warns if the save is missing.
+You can still preview a request with `--plan`.
+
 The checkout menu uses a signed-in GitHub CLI (`gh auth login`). Type the PR number
 shown in the menu, or press Enter to cancel. If a request includes a number, you
 can append it directly to the checkout command. Add `--plan` to preview the scenario

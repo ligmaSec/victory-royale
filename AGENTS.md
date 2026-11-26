@@ -9,5 +9,8 @@ for crate responsibilities, terminology, and the import-resolution order.
 For title-specific compatibility work, check the affected behavior against the
 user-supplied game build and the relevant sections of its platform specification
 when available. Record the build, the observation, and what still needs a runtime
-or hardware check. Keep game material and derived files outside the checkout.
+or hardware check. Run gameplay and hardware comparisons from separate copies
+of the standard `7952987A` save. The ignored root `saves/` directory accepts a
+local copy. Treat saves as game files and keep them out of commits, artifacts
+and reports. Keep other game material and derived files outside the checkout.
 Use synthetic inputs for committed regression tests.

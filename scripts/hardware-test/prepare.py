@@ -98,10 +98,9 @@ def prepare():
     candidate, base, candidate_bytes = find_build("pull_request", pull["head"]["sha"],
                                  f"victory-proton-x86_64-pr-{args.pr}-")
     main, _, main_bytes = find_build("main", base, "victory-proton-x86_64-")
-    request = {"version": 1, "pr": args.pr, "scenario": args.scenario, "main": main, "candidate": candidate}
-    # Older runners hard-code Series X. They must decline a Series S kit.
-    if args.console == "series-s":
-        request.update(version=2, console=args.console)
+    # Earlier runners do not isolate the standard save and must decline this kit.
+    request = {"version": 4, "console": args.console, "save": "7952987A", "pr": args.pr,
+               "scenario": args.scenario, "main": main, "candidate": candidate}
     if binding:
         request["delivery"] = binding
         request["publication_run"] = int(os.environ["GITHUB_RUN_ID"])

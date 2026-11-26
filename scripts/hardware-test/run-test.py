@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -25,6 +26,7 @@ PACKAGE = "victory-proton-x86_64.tar.gz"
 # Stamped into the official extracted runner. A loose request cannot supply this value.
 PUBLISHED_SHA256 = None
 ROOT = Path(__file__).resolve().parent
+TITLE_ID = "7952987A"
 OUTGOING = ("summary.txt", "main-frames.csv", "candidate-frames.csv", "main-submissions.csv",
             "candidate-submissions.csv", "main-events.csv", "candidate-events.csv")
 REVIEWER = "victory-report-review" + (".exe" if sys.platform == "win32" else "")
@@ -77,7 +79,10 @@ def console_name(console):
 def parse_request(data):
     request = json.loads(data)
     console = request.get("console", "series-x")
-    if (type(request["version"]) is not int or (request["version"], console) not in ((1, "series-x"), (2, "series-s"))
+    version = request["version"]
+    legacy = (version, console) in ((1, "series-x"), (2, "series-s")) and "save" not in request
+    standard = version == 4 and request.get("save") == TITLE_ID and console in ("series-x", "series-s")
+    if (type(version) is not int or not (legacy or standard)
             or type(request["pr"]) is not int or request["pr"] < 1
             or not isinstance(request["scenario"], str) or not request["scenario"].strip()
             or not request["scenario"].isprintable()):
@@ -141,13 +146,47 @@ def choose_title():
     return Path(chosen).expanduser()
 
 
+def default_save():
+    checkout = ROOT.parent.parent
+    base = checkout if ROOT == checkout / "scripts" / "hardware-test" and (checkout / ".victory-root").is_file() else ROOT
+    return base / "saves" / TITLE_ID
+
+
+def copy_save(source, destination):
+    # Only persistent player data belongs in the test. In particular, a title's
+    # temp directory may contain unrelated files or logs from an earlier run.
+    def copy_entry(path, target):
+        info = path.lstat()
+        directory = stat.S_ISDIR(info.st_mode)
+        if (not (directory or stat.S_ISREG(info.st_mode))
+                or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+            raise ValueError(f"Use a self-contained save. Unsupported entry in {path}.")
+        if directory:
+            target.mkdir(parents=True)
+            for entry in path.iterdir():
+                copy_entry(entry, target / entry.name)
+            shutil.copystat(path, target)
+        else:
+            shutil.copy2(path, target)
+        # Keep the original timestamps, including for read-only source media.
+        # Each private slot must be readable and writable by its new owner.
+        mode = stat.S_IMODE(info.st_mode) | stat.S_IRUSR | stat.S_IWUSR
+        target.chmod(mode | stat.S_IXUSR if directory else mode)
+
+    for name in ("saves", "storage"):
+        path = source / name
+        if name == "saves" or path.exists():
+            copy_entry(path, destination / name)
+
+
 def launch(side, folder, title, results, windows, console="series-x"):
     env = os.environ.copy()
     # Ignore a developer override that could silently substitute a different build.
     env.pop("VICTORY_EXE", None)
     env["VICTORY_TRACE_PIPELINES"] = "1"
-    cache = folder / "cache"
-    env["VICTORY_CACHE_DIR"] = str(cache) if windows else "Z:" + str(cache).replace("/", "\\")
+    for variable, directory in (("VICTORY_CACHE_DIR", "cache"), ("VICTORY_DATA_DIR", "data")):
+        path = str(folder / directory)
+        env[variable] = path if windows else "Z:" + path.replace("/", "\\")
     args = [str(title), "--console", console]
     if windows:
         command = [str(folder / "victory.exe"), "run", str(title), "--execute", "--console", console]
@@ -303,11 +342,18 @@ def run():
     parser.add_argument("request", nargs="?", help="PR number, test kit ZIP or request JSON")
     parser.add_argument("--list", action="store_true", help="list hardware test requests")
     parser.add_argument("--output-dir", type=Path, help="parent directory for the unique report")
+    parser.add_argument("--save-dir", type=Path, help=f"use a local {TITLE_ID} folder outside the default saves/ directory")
     parser.add_argument("--plan", action="store_true", help="preview the selected test without launching")
     parser.add_argument("--title", type=Path, help="use this executable instead of the file chooser")
     options = parser.parse_args()
     if options.list and options.request:
         parser.error("--list takes no request")
+    options.save_dir = (options.save_dir or default_save()).expanduser().resolve()
+    temp = Path(tempfile.gettempdir()).resolve()
+    output = (options.output_dir or temp).expanduser().resolve()
+    for directory in (temp, output):
+        if directory.is_relative_to(options.save_dir):
+            raise ValueError("Choose temporary and report directories outside the source save.")
     with tempfile.TemporaryDirectory(prefix="victory-request-") as temporary:
         folder = Path(temporary)
         options.trusted_digest = PUBLISHED_SHA256
@@ -539,6 +585,7 @@ def diagnostic_summary(request, results, windows, complete, destination):
     shader_ids = {}
     rows = [f"{console_name(request.get('console', 'series-x'))} hardware test | PR #{request['pr']} | " + ("Windows" if windows else "Linux/Proton"),
             "Comparison completed" if complete else "Partial comparison",
+            f"Starting save: {TITLE_ID} (separate copies)",
             "Timings cover all recorded phases, including menus."]
     for side in ("main", "candidate"):
         rows.extend(["", f"{side.capitalize()} | {request[side]['revision']}"])
@@ -853,6 +900,15 @@ def run_request(manifest, options):
     console = request.get("console", "series-x")
     print(f"VIctory PR #{request['pr']} | {console_name(console)} | two launches", flush=True)
     instruction_block(PRIVACY_HEADING, LOG_PRIVACY + " Your reports stay on this machine until you choose to share.")
+    source = (options.save_dir or default_save()).expanduser().resolve()
+    if source.name.upper() != TITLE_ID or not any(p.is_file() for p in (source / "saves").rglob("*")):
+        message = (f"Standard save {TITLE_ID} missing or empty at {source}. "
+                   f"Place your copy in saves/{TITLE_ID}/ or pass --save-dir pointing to your {TITLE_ID} folder.")
+        if not options.plan:
+            raise ValueError("Warning: " + message)
+        print("Warning: " + message, file=sys.stderr)
+    else:
+        print(f"Using standard save {TITLE_ID}. Each build gets a separate copy.", flush=True)
     if options.plan:
         if binding:
             owner = binding["requester"]["login"]
@@ -872,6 +928,8 @@ def run_request(manifest, options):
         if not shutil.which(binary):
             raise ValueError(f"Missing {binary}. See the requirements in README.txt.")
     title = (options.title or choose_title()).expanduser().resolve()
+    if title.parent.is_relative_to(source):
+        raise ValueError("Select a game executable outside the source save folder.")
     if not title.is_file() or title.suffix.lower() != ".exe":
         raise ValueError("Select the game's .exe file.")
     temp = Path(tempfile.gettempdir()).resolve()
@@ -883,6 +941,9 @@ def run_request(manifest, options):
         for side in ("main", "candidate"):
             print(f"Checking {side}…", flush=True)
             stage_build(request, side, Path(work) / side, manifest.resolve().parent / "packages")
+        seed = Path(work) / "main" / "data" / TITLE_ID
+        copy_save(source, seed)
+        shutil.copytree(seed, Path(work) / "candidate" / "data" / TITLE_ID)
         results = Path(work) / "results"
         results.mkdir()
         shutil.copyfile(manifest, results / "request.json")

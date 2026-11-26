@@ -34,6 +34,20 @@ REQUESTER = {"id": 83, "login": "test-requester"}
 BINDING = {"requester": REQUESTER, "registration": {"key": "fixture", "gist": "e" * 32}}
 
 
+class SaveLocations(unittest.TestCase):
+    def test_checkout_and_extracted_kit_resolve_their_own_saves(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "checkout"
+            scripts = checkout / "scripts" / "hardware-test"
+            scripts.mkdir(parents=True)
+            (checkout / ".victory-root").touch()
+            kit = Path(directory) / "kit"
+            with mock.patch.object(runner, "ROOT", scripts):
+                self.assertEqual(runner.default_save(), checkout / "saves" / "7952987A")
+            with mock.patch.object(runner, "ROOT", kit):
+                self.assertEqual(runner.default_save(), kit / "saves" / "7952987A")
+
+
 class HardwareRequest(unittest.TestCase):
     def setUp(self):
         # Launch tests capture their output and must never prompt the person running the suite.
@@ -63,6 +77,12 @@ class HardwareRequest(unittest.TestCase):
         self.title = self.root / "space & title.exe"
         self.title.touch()
         self.output = self.root / "out"
+        self.save = self.root / "saves" / runner.TITLE_ID
+        (self.save / "saves").mkdir(parents=True)
+        (self.save / "saves" / "progress").write_text("starting point")
+        default = mock.patch.object(runner, "default_save", return_value=self.save)
+        default.start()
+        self.addCleanup(default.stop)
 
     def fake_download(self, args, check):
         self.assertEqual(args[:6], ["gh", "run", "download", "12", "-R", "github.com/" + runner.REPO])
@@ -203,18 +223,29 @@ class HardwareRequest(unittest.TestCase):
         stdout = io.StringIO()
 
         def launched(side, folder, title, results, windows, console):
+            profile = folder / "data" / runner.TITLE_ID
+            progress = profile / "saves" / "progress"
+            self.assertEqual(progress.read_text(), "starting point")
+            progress.write_text(side)
+            self.assertFalse((profile / "temp").exists())
+            self.assertEqual((profile / "storage" / "settings").read_text(), "fixture")
             number = 1 if side == "main" else 2
             lines = stdout.getvalue().rstrip().splitlines()
             self.assertEqual(lines[-3], f"RUN {number} OF 2  |  {side.upper()}  |  WHAT TO DO")
             self.assertEqual(lines[-1], self.request["scenario"])
             (results / (side + ".log")).write_text(side)
 
+        (self.save / "temp").mkdir()
+        (self.save / "temp" / "private-log").write_text("omit")
+        (self.save / "storage").mkdir()
+        (self.save / "storage" / "settings").write_text("fixture")
         args = ["runner", str(self.manifest), "--title", str(self.title)]
         with mock.patch.object(sys, "argv", args), mock.patch.object(tempfile, "tempdir", str(temp)), \
                 mock.patch.dict(os.environ, {"COLUMNS": "52"}), \
                 mock.patch.object(shutil, "which", return_value="tool"), \
                 mock.patch.object(runner, "launch", side_effect=launched), contextlib.redirect_stdout(stdout):
             runner.run()
+        self.assertEqual((self.save / "saves" / "progress").read_text(), "starting point")
         report, = temp.rglob("report.zip")
         self.assertEqual(list(temp.iterdir()), [report.parent])
         self.assertIn("REPORT READY", stdout.getvalue())
@@ -239,6 +270,14 @@ class HardwareRequest(unittest.TestCase):
         for version, console in ((1, "series-s"), (2, "series-x"), (2, "unknown"), (True, "series-x")):
             with self.subTest(version=version, console=console), self.assertRaises(ValueError):
                 runner.parse_request(json.dumps(dict(self.request, version=version, console=console)))
+
+    def test_standard_requests_name_the_save_on_both_consoles(self):
+        for console in ("series-x", "series-s"):
+            request = dict(self.request, version=4, save=runner.TITLE_ID, console=console)
+            self.assertEqual(runner.parse_request(json.dumps(request)), request)
+            for change in ({"save": "../other"}, {"version": 1}, {"console": "unknown"}):
+                with self.assertRaises(ValueError):
+                    runner.parse_request(json.dumps(dict(request, **change)))
 
     def test_fresh_pair_and_partial(self):
         self.request.update(version=2, console="series-s")
@@ -632,6 +671,50 @@ class HardwareRequest(unittest.TestCase):
             for forbidden in (shader, "2026-", "0xabc", "private"):
                 self.assertNotIn(forbidden, text + body)
 
+    def test_read_only_standard_save_gives_each_build_writable_progress(self):
+        progress = self.save / "saves" / "progress"
+        progress.chmod(0o444)
+        progress.parent.chmod(0o555)
+        self.addCleanup(progress.chmod, 0o644)
+        self.addCleanup(progress.parent.chmod, 0o755)
+
+        def write_progress(side, folder, title, results, windows, console):
+            slot = folder / "data" / runner.TITLE_ID / "saves" / "progress"
+            self.assertTrue(slot.stat().st_mode & 0o200)
+            self.assertTrue(slot.parent.stat().st_mode & 0o200)
+            self.assertEqual(slot.read_text(), "starting point")
+            slot.write_text(side)
+            (slot.parent / "next-slot").write_text(side)
+            (results / (side + ".log")).write_text(side)
+
+        self.run_pair(write_progress)
+        self.assertEqual(progress.read_text(), "starting point")
+        self.assertFalse(progress.stat().st_mode & 0o200)
+        self.assertFalse((progress.parent / "next-slot").exists())
+
+    def test_staging_and_reports_cannot_write_into_the_source_save(self):
+        inside = self.save / "saves" / "output"
+        args = ["runner", str(self.manifest), "--save-dir", str(self.save), "--title", str(self.title)]
+        with mock.patch.object(sys, "argv", args + ["--output-dir", str(inside)]), \
+                self.assertRaisesRegex(ValueError, "outside the source save"):
+            runner.run()
+        self.assertFalse(inside.exists())
+        with mock.patch.object(sys, "argv", args), mock.patch.object(tempfile, "tempdir", str(self.save / "saves")), \
+                mock.patch.object(tempfile, "TemporaryDirectory") as create, \
+                self.assertRaisesRegex(ValueError, "outside the source save"):
+            runner.run()
+        create.assert_not_called()
+
+    def test_missing_standard_save_warns_in_preview_and_stops_before_launch(self):
+        args = ["runner", str(self.manifest), "--save-dir", str(self.root / "missing" / runner.TITLE_ID)]
+        with mock.patch.object(sys, "argv", args + ["--plan"]), contextlib.redirect_stderr(io.StringIO()) as warning:
+            runner.run()
+        self.assertIn("Warning: Standard save 7952987A missing", warning.getvalue())
+        with mock.patch.object(sys, "argv", args), mock.patch.object(runner, "stage_build") as stage:
+            with self.assertRaisesRegex(ValueError, "saves/7952987A/"):
+                runner.run()
+            stage.assert_not_called()
+
     def test_platform_commands_and_cache_paths(self):
         for windows, console in ((False, "series-x"), (False, "series-s"),
                                  (True, "series-x"), (True, "series-s")):
@@ -645,6 +728,8 @@ class HardwareRequest(unittest.TestCase):
                 def start(args, **kwargs):
                     self.assertEqual(kwargs["cwd"], self.title.parent)
                     self.assertNotIn("VICTORY_EXE", kwargs["env"])
+                    expected = str(self.root / "data")
+                    self.assertEqual(kwargs["env"]["VICTORY_DATA_DIR"], expected if windows else "Z:" + expected.replace("/", "\\"))
                     self.assertIn(str(self.title), args)
                     self.assertEqual(args[-2:], ["--console", console])
                     if windows:
@@ -656,7 +741,7 @@ class HardwareRequest(unittest.TestCase):
                         self.assertEqual(kwargs["env"]["VKD3D_SHADER_CACHE_PATH"], str(self.root / "vkd3d"))
                     return popen([sys.executable, "-c", "import sys; print(sys.argv[1]); sys.exit(42)",
                                   f"Report: {report} (launcher exit 42)"], **kwargs)
-                with mock.patch.dict(os.environ, {"VICTORY_EXE": "old.exe"}), \
+                with mock.patch.dict(os.environ, {"VICTORY_EXE": "old.exe", "VICTORY_DATA_DIR": "unrelated profile"}), \
                         mock.patch.object(subprocess, "Popen", side_effect=start):
                     runner.launch("main", self.root, self.title, results, windows, console)
                 self.assertEqual((results / "main-exit.txt").read_text().strip(), "42")
