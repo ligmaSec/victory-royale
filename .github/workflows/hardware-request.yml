@@ -22,7 +22,7 @@ on:
         description: End each build after this runtime milestone and observation period
         type: choice
         default: device-ready
-        options: [device-ready, present-1024, first-mesh-bind, timing-window, manual]
+        options: [device-ready, present-1024, first-mesh-bind, dense-draws, timing-window, manual]
       observe_seconds:
         description: Seconds to observe after reaching the milestone
         default: "180"

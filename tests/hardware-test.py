@@ -140,6 +140,17 @@ class HardwareRequest(unittest.TestCase):
         self.assertEqual(args[:6], ["gh", "run", "download", "12", "-R", "github.com/" + runner.REPO])
         shutil.copy(self.package, Path(args[-1]) / runner.PACKAGE)
 
+    def test_dense_draws_uses_the_submitted_count_in_a_host_sample(self):
+        sample = (b"victory_gpu::host: 0.3 fps, 3000.0 ms/frame (12.0 preparing: copies "
+                  b"2.0 ms 1.0 MB, textures 1.0 ms 2.0 MB; 100.0 on the GPU; "
+                  b"2.0 copying back 1.0 MB), %d draws/frame, dropped 7000 without "
+                  b"a host pipeline (800 being made) and 900 indirect")
+        marker = runner.session.MARKERS["dense-draws"]
+        for count in (0, 499, 500, 999, 1000, 10216):
+            with self.subTest(count=count):
+                self.assertEqual(bool(marker.search(sample % count)), count >= 500)
+        self.assertIsNone(marker.search((sample % 500).replace(b"victory_gpu::host:", b"title:")))
+
     def test_bundled_build_offline(self):
         shutil.copy(self.package, self.packages / (self.build["sha256"] + ".tar.gz"))
         with mock.patch.object(subprocess, "run", side_effect=AssertionError), \

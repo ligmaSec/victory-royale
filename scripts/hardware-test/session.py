@@ -19,6 +19,9 @@ MARKERS = {
     "device-ready": re.compile(rb"victory_gpu::host:\s+host D3D12 device ready\b"),
     "present-1024": re.compile(rb"victory_gpu::queue:\s+(?:title requested a present|frame presented) [^\n]*\bframe=1024\b"),
     "timing-window": re.compile(rb"victory_gpu::host:\s+present intervals: [1-9][0-9]* frames, mean "),
+    "dense-draws": re.compile(
+        rb"victory_gpu::host:\s+[0-9.]+ fps, [0-9.]+ ms/frame \([^)]*\), "
+        rb"(?:[5-9][0-9]{2}|[1-9][0-9]{3,}) draws/frame, dropped "),
     "first-mesh-bind": re.compile(rb'victory_gpu::[\w:]+:\s+first bind [^\n]*\bstage="mesh"'),
 }
 ANSI = re.compile(rb"\x1b\[[0-9;]*m")

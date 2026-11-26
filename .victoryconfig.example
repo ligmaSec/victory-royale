@@ -16,7 +16,7 @@ game_dir = ~/games/GTA6.Xbox.v1.0.2.1
 
 # For older kits with no requested endpoint. Published endpoints take precedence.
 # Keep manual for an older kit with written instructions. To automate a known scene,
-# choose device-ready, present-1024, first-mesh-bind, or timing-window.
+# choose device-ready, present-1024, first-mesh-bind, dense-draws, or timing-window.
 stop_after = manual
 # observe_seconds = 180
 # timeout_seconds = 900
