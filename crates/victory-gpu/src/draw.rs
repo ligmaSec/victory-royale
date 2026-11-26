@@ -3546,6 +3546,21 @@ mod table_tests {
             [0.5, 0.5],
         );
         assert_eq!(sampled, [0.0, 1.0, 0.0, 1.0]);
+
+        // A direct index outside the four title slots can still reach the last
+        // host slot. Its fallback sampler clamps to the green edge texel.
+        let last = victory_shader::emit::SAMPLER_HEAP_LIMIT - 1;
+        // SAFETY: this is the live heap about to be bound.
+        assert!(last < unsafe { sampler_host.heap.GetDesc() }.NumDescriptors);
+        let padded = sample_via_host_heaps(
+            host,
+            &view_host.heap,
+            first,
+            &sampler_host.heap,
+            last,
+            [1.25, 0.5],
+        );
+        assert_eq!(padded, [0.0, 1.0, 0.0, 1.0]);
     }
 
     #[test]
