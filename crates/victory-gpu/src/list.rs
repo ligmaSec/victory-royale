@@ -865,24 +865,17 @@ extern "system" fn copy_texture_region(
             // Only the copied rectangle needs a host staging footprint.
             let packed = crate::resource::PACKED_16.contains(&host_format)
                 && crate::resource::widened_packed_format(src.resource) == Some(host_format);
-            let host_row_bytes = if packed {
-                u64::from(extent[0]) * 4
+            let physical_format = if packed {
+                crate::resource::RGBA8_UNORM
             } else {
-                region.row_bytes
+                host_format
             };
-            let Ok(row_bytes_u32) = u32::try_from(host_row_bytes) else {
-                return;
-            };
-            let Some(host_pitch) = row_bytes_u32.checked_next_multiple_of(256) else {
-                return;
-            };
-            let staging_lines = u64::from(extent[2]) * region.lines;
-            let Some(staging_bytes) = u64::from(host_pitch)
-                .checked_mul(staging_lines - 1)
-                .and_then(|n| n.checked_add(host_row_bytes))
+            let Some((footprint, staging_bytes)) =
+                crate::resource::PlacedFootprint::readback_staging(physical_format, extent)
             else {
                 return;
             };
+            let host_pitch = footprint.row_pitch;
             let Some((buffer, staging)) = list.readback(host, staging_bytes) else {
                 return;
             };
@@ -891,18 +884,7 @@ extern "system" fn copy_texture_region(
             list.mark_work();
             let mut to_location = dst;
             to_location.resource = buffer.as_raw().cast_const().cast();
-            to_location.footprint.offset = 0;
-            to_location.footprint.format = if packed {
-                crate::resource::RGBA8_UNORM
-            } else {
-                host_format
-            };
-            [
-                to_location.footprint.width,
-                to_location.footprint.height,
-                to_location.footprint.depth,
-            ] = extent;
-            to_location.footprint.row_pitch = host_pitch;
+            to_location.footprint = footprint;
             let mut from_location = src;
             from_location.resource = from_tex.as_raw().cast_const().cast();
             #[cfg(feature = "diagnostics")]
@@ -1569,14 +1551,33 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// Host group counts and whether any last group is incomplete. D3D12
+/// accepts at most 65,535 groups along each axis.
+#[cfg(any(windows, test))]
+pub(crate) fn thread_groups(threads: [u32; 3], size: [u32; 3]) -> Option<([u32; 3], bool)> {
+    if size.contains(&0) || threads.contains(&0) {
+        return None;
+    }
+    let groups: [u32; 3] = std::array::from_fn(|i| threads[i].div_ceil(size[i]));
+    let partial = (0..3).any(|i| !threads[i].is_multiple_of(size[i]));
+    groups
+        .iter()
+        .all(|&g| g <= 65_535)
+        .then_some((groups, partial))
+}
+
+/// Direct compute dispatch with console dispatch-initiator flags.
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+    // COMPUTE_DISPATCH_INITIATOR.USE_THREAD_DIMENSIONS
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    if flags & 0x20 != 0 {
+        state::dispatch_mode::<true>(this, x, y, z);
+    } else {
+        state::dispatch(this, x, y, z);
+    }
     #[cfg(not(windows))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, flags);
         count_dispatch();
     }
 }
@@ -1837,9 +1838,12 @@ mod state {
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
+        dispatch_mode::<false>(this, x, y, z);
+    }
+    pub(super) fn dispatch_mode<const THREADS: bool>(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
         super::mark_work(this);
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_state(this, |list, s| s.dispatch_mode::<THREADS>(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -3426,3 +3430,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod dispatch_tests;

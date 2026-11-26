@@ -35,7 +35,7 @@ jobs:
 
           release = Path("target/x86_64-pc-windows-gnullvm/release")
           binary = (release / "victory.exe").read_bytes()
-          for name in ("argument_clamp", "rect_expand", "rect_rewrite"):
+          for name in ("argument_clamp", "rect_expand", "rect_rewrite", "packed_copy"):
               shader, = release.glob(f"build/victory-gpu-*/out/{name}.dxil")
               data = shader.read_bytes()
               if not data.startswith(b"DXBC") or data not in binary:

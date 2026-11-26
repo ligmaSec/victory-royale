@@ -267,6 +267,7 @@ fn packed_write_flags(format: u32) -> u32 {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 
+    // The process owns one host device, so these format flags share its lifetime.
     static SUPPORT: [OnceLock<u32>; PACKED_16.len()] = [const { OnceLock::new() }; PACKED_16.len()];
     let i = PACKED_16
         .iter()
@@ -671,6 +672,28 @@ pub(crate) struct CopyRows {
 }
 
 impl PlacedFootprint {
+    /// A zero-offset host staging footprint for one cropped texture readback.
+    /// The supplied format describes physical storage, including widened targets.
+    #[cfg(any(windows, test))]
+    pub(crate) fn readback_staging(
+        format: u32,
+        [width, height, depth]: [u32; 3],
+    ) -> Option<(Self, u64)> {
+        let (element, block_width, _) = texture_element(format)?;
+        let row = u64::from(width)
+            .div_ceil(block_width)
+            .checked_mul(element)?;
+        let footprint = Self {
+            offset: 0,
+            format,
+            width,
+            height,
+            depth,
+            row_pitch: u32::try_from(row.checked_next_multiple_of(256)?).ok()?,
+        };
+        Some((footprint, footprint.bytes()?))
+    }
+
     /// `(lines, row_bytes, total_bytes)` spanned in a buffer: every row
     /// pitched but the last.
     pub(crate) fn layout(&self) -> Option<(u64, u64, u64)> {
@@ -2346,6 +2369,26 @@ mod tests {
     #[test]
     fn a_missing_resource_has_no_default_view_format() {
         assert_eq!(view_format(std::ptr::null()), None);
+    }
+
+    #[test]
+    fn readback_staging_uses_the_physical_texel_and_block_size() {
+        // The widened row crosses a 256-byte boundary. Keep padding between
+        // the four rows of the cropped volume and omit it after the last row.
+        for (format, extent, pitch, bytes) in [
+            (RGBA8_UNORM, [65, 2, 2], 512, 1796),
+            (115, [65, 2, 2], 256, 898),
+            (86, [65, 2, 2], 256, 898),
+            (71, [8, 8, 2], 256, 784),
+        ] {
+            let (fp, size) = PlacedFootprint::readback_staging(format, extent).unwrap();
+            assert_eq!(
+                (fp.format, [fp.width, fp.height, fp.depth]),
+                (format, extent)
+            );
+            assert_eq!((fp.offset, fp.row_pitch, size), (0, pitch, bytes));
+        }
+        assert!(PlacedFootprint::readback_staging(RGBA8_UNORM, [u32::MAX, 1, 1]).is_none());
     }
 
     #[test]

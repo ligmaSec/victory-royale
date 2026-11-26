@@ -649,6 +649,16 @@ impl State {
         let Some(p) = self.bound_pipeline(false) else {
             return false;
         };
+        self.prepare_graphics(list, indexed, mesh, &p)
+    }
+
+    fn prepare_graphics(
+        &mut self,
+        list: &HostList,
+        indexed: bool,
+        mesh: bool,
+        p: &HostPipeline,
+    ) -> bool {
         if p.compute || p.mesh != mesh {
             once!(
                 mesh,
@@ -660,7 +670,7 @@ impl State {
             once!("a rectangle pipeline drawn with another topology");
             return false;
         }
-        if !self.bind(list, &p, false) {
+        if !self.bind(list, p, false) {
             return false;
         }
         let l = &list.list;
@@ -745,6 +755,16 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        self.bind_dispatch::<false>(list, p, compute, [0; 3])
+    }
+
+    fn bind_dispatch<const THREADS: bool>(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        compute: bool,
+        dims: [u32; 3],
+    ) -> bool {
         list.mark_work();
         self.depth_sampled = false;
         let l = &list.list;
@@ -805,6 +825,10 @@ impl State {
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
+                    if THREADS && u.root == victory_shader::emit::DISPATCH_THREADS {
+                        values[u.index as usize] = dims[u.dword as usize];
+                        continue;
+                    }
                     if u.indexed_buffer {
                         let selected =
                             self.user_value(compute, u.slot, RootType::Constants, u.dword);
@@ -1002,7 +1026,7 @@ impl State {
         let host = heap.host()?;
         // The console forms this byte offset with a 32-bit shift by five.
         let Some(read) = heap.selected_buffer(selected & (u32::MAX >> 5)) else {
-            return Some([self.raw_slot(host, key, RawAccess::Read, None)?, 0, 0]);
+            return Some([self.raw_slot(host, key, RawAccess::Read, None)? << 4, 0, 0]);
         };
         let offset = read.shadow.offset(read.address);
         let bias = offset % 16;
@@ -1020,7 +1044,9 @@ impl State {
         };
         read.shadow
             .refresh_as(list, read.address, read.bytes, state);
-        Some([index, read.stride, bias as u32])
+        // VIEW_HEAP_LIMIT leaves room for the four-bit alignment bias.
+        const { assert!(victory_shader::emit::VIEW_HEAP_LIMIT <= 1 << 28) };
+        Some([(index << 4) | bias as u32, read.stride, read.bytes as u32])
     }
 
     /// Bind a raw view of the remaining host buffer. A writable view, its
@@ -1276,12 +1302,30 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    pub(crate) fn dispatch_mode<const THREADS: bool>(
+        &mut self,
+        list: &HostList,
+        x: u32,
+        y: u32,
+        z: u32,
+    ) {
+        let dims = [x, y, z];
+        #[cfg(feature = "diagnostics")]
+        let describe = || {
+            if THREADS {
+                format!("thread dispatch {x}x{y}x{z}")
+            } else {
+                format!("dispatch {x}x{y}x{z}")
+            }
+        };
+        if THREADS && dims.contains(&0) {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This, None);
-            self.frame_op(&format!("dispatch {x}x{y}x{z}"), true, false);
+            self.frame_op(&describe(), true, false);
             return;
         }
         let Some(p) = self.bound_pipeline(true) else {
@@ -1293,28 +1337,40 @@ impl State {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This, None);
             #[cfg(feature = "diagnostics")]
-            self.frame_op(&format!("dispatch {x}x{y}x{z}"), true, false);
+            self.frame_op(&describe(), true, false);
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
             #[cfg(feature = "diagnostics")]
-            self.frame_op_why(
-                &format!("dispatch {x}x{y}x{z}"),
-                true,
-                false,
-                Some("a graphics pipeline"),
-            );
+            self.frame_op_why(&describe(), true, false, Some("a graphics pipeline"));
             return;
         }
-        if !self.bind(list, &p, true) {
+        let (p, [x, y, z]) = if THREADS {
+            let Some(plan) = crate::pipeline::host::thread_dispatch(self.pipeline as This, p, dims)
+            else {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                self.frame_op_why(
+                    &describe(),
+                    true,
+                    false,
+                    Some("invalid size or partial compute pipeline unavailable"),
+                );
+                return;
+            };
+            plan
+        } else {
+            (p, dims)
+        };
+        if !self.bind_dispatch::<THREADS>(list, &p, true, dims) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        list.note_op(|| self.op_text(describe(), true));
         #[cfg(feature = "diagnostics")]
-        self.frame_op(&format!("dispatch {x}x{y}x{z}"), true, true);
+        self.frame_op(&describe(), true, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -2198,6 +2254,20 @@ impl State {
             );
             return false;
         };
+        // Clamping charges the list budget and can empty subsequent records.
+        // Only record it after the target pipeline is available.
+        let Some(p) = self.bound_pipeline(kind == DISPATCH) else {
+            *dropped = "no host pipeline";
+            #[cfg(feature = "diagnostics")]
+            {
+                self.frame_op("indirect", kind == DISPATCH, false);
+                crate::pipeline::note_why(format!(
+                    "indirect kind {kind}: {}",
+                    crate::pipeline::drop_reason(self.pipeline as This)
+                ));
+            }
+            return false;
+        };
         args.refresh_as(list, arguments, len, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
@@ -2217,38 +2287,23 @@ impl State {
         }
         self.invalidate_compute_binding();
         let ran = match kind {
-            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
-            DISPATCH => match self.bound_pipeline(true) {
-                Some(p) if p.compute => self.bind(list, &p, true),
-                _ => false,
-            },
+            DRAW | INDEXED | MESH => self.prepare_graphics(list, kind == INDEXED, kind == MESH, &p),
+            DISPATCH => p.compute && self.bind(list, &p, true),
             _ => false,
         };
         #[cfg(feature = "diagnostics")]
         self.frame_op("indirect", kind == DISPATCH, ran);
         if !ran {
-            let p = self.bound_pipeline(kind == DISPATCH);
-            *dropped = if p.is_none() {
-                "no host pipeline"
-            } else if kind == DISPATCH {
+            *dropped = if kind == DISPATCH {
                 "prepare/bind failed (compute)"
             } else {
                 "prepare/bind failed"
             };
             #[cfg(feature = "diagnostics")]
-            match &p {
-                // Named so the frame's table says which drops are indirect
-                // executions, and which shader keeps them from running.
-                None => crate::pipeline::note_why(format!(
-                    "indirect kind {kind}: {}",
-                    crate::pipeline::drop_reason(self.pipeline as This)
-                )),
-                Some(p) => why(&format!(
-                    "prepare failed (compute {}, mesh {})",
-                    p.compute, p.mesh
-                )),
-            }
+            why(&format!(
+                "prepare failed (compute {}, mesh {})",
+                p.compute, p.mesh
+            ));
             return false;
         }
         #[cfg(feature = "diagnostics")]
@@ -3538,6 +3593,21 @@ mod table_tests {
             [0.5, 0.5],
         );
         assert_eq!(sampled, [0.0, 1.0, 0.0, 1.0]);
+
+        // A direct index outside the four title slots can still reach the last
+        // host slot. Its fallback sampler clamps to the green edge texel.
+        let last = victory_shader::emit::SAMPLER_HEAP_LIMIT - 1;
+        // SAFETY: this is the live heap about to be bound.
+        assert!(last < unsafe { sampler_host.heap.GetDesc() }.NumDescriptors);
+        let padded = sample_via_host_heaps(
+            host,
+            &view_host.heap,
+            first,
+            &sampler_host.heap,
+            last,
+            [1.25, 0.5],
+        );
+        assert_eq!(padded, [0.0, 1.0, 0.0, 1.0]);
     }
 
     #[test]
@@ -4264,6 +4334,7 @@ mod bindless_tests {
         };
 
         let gfx_srv_uav = HostPipeline {
+            compute_threads: None,
             structured_strides: Vec::new(),
             compute: false,
             mesh: false,
@@ -4282,6 +4353,7 @@ mod bindless_tests {
             name: "gfx_srv_uav".into(),
         };
         let gfx_srv_only = HostPipeline {
+            compute_threads: None,
             structured_strides: Vec::new(),
             compute: false,
             mesh: false,
@@ -4300,6 +4372,7 @@ mod bindless_tests {
             name: "gfx_srv_only".into(),
         };
         let compute_srv = HostPipeline {
+            compute_threads: Some([1; 3]),
             structured_strides: Vec::new(),
             compute: true,
             mesh: false,
@@ -4924,7 +4997,7 @@ mod structured_alias_tests {
         let desc = HeapDesc {
             desc: D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 4,
+                NumDescriptors: 6,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             },
@@ -4949,8 +5022,9 @@ mod structured_alias_tests {
         resource[0] = 1;
         resource[4] = 256;
         // The first view starts at byte 12 and has stride 12. The second starts
-        // at byte 32 and has stride 32. The last contains only one record.
-        for (slot, stride, count) in [(1, 12, 2), (2, 32, 2), (3, 16, 1)] {
+        // at byte 32 and has stride 32. The last two test reads starting just
+        // past a view and reads straddling its final dword.
+        for (slot, stride, count) in [(1, 12, 2), (2, 32, 2), (3, 16, 1), (4, 20, 1), (5, 8, 2)] {
             let mut words = [0u32; 16];
             words[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
             words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -4966,7 +5040,7 @@ mod structured_alias_tests {
                 heap.start + slot * 32,
             );
         }
-        let (buffer, mapped) = host.readback_buffer(48).unwrap();
+        let (buffer, mapped) = host.readback_buffer(64).unwrap();
         let mut state = State::default();
         state.set_heaps(&[views]);
         let list = host.new_list().unwrap();
@@ -4975,6 +5049,8 @@ mod structured_alias_tests {
             (1, 1),
             (2, 1),
             (3, 1),
+            (4, 1),
+            (5, 1),
             (99, 1),
             (2, 0x0800_0001),
             (1, 0x1555_5555),
@@ -5002,14 +5078,16 @@ mod structured_alias_tests {
         }
         list.close();
         host.execute(&[&list]);
-        // SAFETY: the submission completed, and the mapped buffer holds six pairs of dwords.
-        let got = unsafe { mapped.cast::<[[u32; 2]; 6]>().read_unaligned() };
+        // SAFETY: the submission completed, and the mapped buffer holds eight pairs of dwords.
+        let got = unsafe { mapped.cast::<[[u32; 2]; 8]>().read_unaligned() };
         assert_eq!(
             got,
             [
                 [backing[7], backing[8]],
                 [backing[17], backing[18]],
                 [0; 2],
+                [0; 2],
+                [backing[5], 0],
                 [0; 2],
                 [0; 2],
                 [0; 2]

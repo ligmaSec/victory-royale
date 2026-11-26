@@ -39,6 +39,8 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg(any(windows, test))]
+mod frame_times;
 #[cfg(windows)]
 mod hlsl;
 #[cfg(windows)]

@@ -3118,6 +3118,7 @@ impl Presenter {
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 struct Meter {
+    frame_times: crate::frame_times::FrameTimes,
     since: std::time::Instant,
     frames: u32,
     #[cfg(feature = "diagnostics")]
@@ -3134,6 +3135,7 @@ impl Meter {
         crate::profile::start();
         let now = std::time::Instant::now();
         Meter {
+            frame_times: Default::default(),
             since: now,
             frames: 0,
             #[cfg(feature = "diagnostics")]
@@ -3153,7 +3155,22 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
-        let elapsed = self.since.elapsed();
+        let now = std::time::Instant::now();
+        if let Some(s) = self.frame_times.present(now) {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            tracing::info!(
+                "present intervals: {} frames, mean {:.2} ms, median {:.2} ms, p95 {:.2} ms, \
+                 longest {:.2} ms, {} over 100 ms, {} over 1 s",
+                s.intervals,
+                s.mean_ms,
+                ms(s.median),
+                ms(s.p95),
+                ms(s.longest),
+                s.over_100ms,
+                s.over_1s
+            );
+        }
+        let elapsed = now - self.since;
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
@@ -3385,6 +3402,7 @@ impl Host {
                 }
                 Ok(true) => {
                     if p.last_present_issue.take().is_some() {
+                        p.meter.frame_times.interrupted();
                         tracing::info!(frame, "DXGI resumed presenting frames");
                     }
                 }

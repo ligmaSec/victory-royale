@@ -381,6 +381,18 @@ pub(crate) fn record_region(
     )
 }
 
+// Each 64-thread group converts two texels per thread in one row.
+fn dispatch_shape(
+    src: D3D12_SUBRESOURCE_FOOTPRINT,
+    dst: D3D12_SUBRESOURCE_FOOTPRINT,
+    mode: u32,
+) -> ([u32; 4], [u32; 3]) {
+    (
+        [src.Width, src.RowPitch, dst.RowPitch, mode],
+        [src.Width.div_ceil(128), src.Height, 1],
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write(
     list: &HostList,
@@ -435,7 +447,7 @@ fn write(
         for (input, output) in source.layouts.iter().zip(&destination.layouts) {
             let src = input.Footprint;
             let dst = output.Footprint;
-            let constants = [src.Width, src.RowPitch, dst.RowPitch, mode];
+            let (constants, [groups_x, groups_y, groups_z]) = dispatch_shape(src, dst, mode);
             native.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
             // Bind one depth slice at a time so shader byte offsets fit in u32.
             let src_slice = u64::from(src.RowPitch) * u64::from(src.Height);
@@ -449,7 +461,7 @@ fn write(
                     2,
                     output_base + output.Offset + dst_slice * slice,
                 );
-                native.Dispatch(src.Width.div_ceil(128), src.Height, 1);
+                native.Dispatch(groups_x, groups_y, groups_z);
             }
         }
         native.ResourceBarrier(&[transition(
@@ -478,6 +490,31 @@ mod tests {
     use super::*;
     use crate::resource::{PACKED_16, RGBA8_UNORM, packed_test};
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+
+    #[test]
+    fn packed_copy_dispatch_uses_both_pitches_and_covers_odd_widths() {
+        for (width, groups_x) in [(1, 1), (128, 1), (129, 2)] {
+            for format in PACKED_16 {
+                for (mode, src_pitch, dst_pitch) in [(format, 768, 512), (format | 256, 512, 768)] {
+                    let src = D3D12_SUBRESOURCE_FOOTPRINT {
+                        Width: width,
+                        Height: 3,
+                        Depth: 2,
+                        RowPitch: src_pitch,
+                        ..Default::default()
+                    };
+                    let dst = D3D12_SUBRESOURCE_FOOTPRINT {
+                        RowPitch: dst_pitch,
+                        ..src
+                    };
+                    assert_eq!(
+                        dispatch_shape(src, dst, mode),
+                        ([width, src_pitch, dst_pitch, mode], [groups_x, 3, 1]),
+                    );
+                }
+            }
+        }
+    }
 
     fn make_texture(device: &ID3D12Device, format: u32, width: u32, height: u32) -> ID3D12Resource {
         let heap = D3D12_HEAP_PROPERTIES {
