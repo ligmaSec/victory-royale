@@ -445,6 +445,67 @@ impl Module {
         self.blocks[block].phis.push(i);
         V::Inst(i)
     }
+
+    /// Whether the join's branch skips every use of `phi` when entered from `from`.
+    /// The skipped arm must be reachable only from the join, so a later loop
+    /// iteration can reach it only after selecting a new incoming phi value.
+    pub(super) fn unused_on_phi_edge(&self, phi: V, join: usize, from: usize) -> bool {
+        let block = &self.blocks[join];
+        let Some(Term::CondBr(V::Inst(test), yes, no)) = block.term else {
+            return false;
+        };
+        let Op::Cmp(op @ (pred::EQ | pred::NE), a, b) = self.insts[test as usize].op else {
+            return false;
+        };
+        if !block.body.contains(&test) || self.types[self.type_of(a).0 as usize] != TypeDef::Int(32)
+        {
+            return false;
+        }
+        let on_edge = |v| match v {
+            V::Inst(i) if block.phis.contains(&i) => {
+                let Op::Phi(inputs) = &self.insts[i as usize].op else {
+                    return None;
+                };
+                self.int_value(inputs.iter().find(|(_, p)| *p == from)?.0)
+            }
+            _ => self.int_value(v),
+        };
+        let (Some(a), Some(b)) = (on_edge(a), on_edge(b)) else {
+            return false;
+        };
+        if yes == no {
+            return false;
+        }
+        let skipped = if ((a as u32) == (b as u32)) == (op == pred::EQ) {
+            no
+        } else {
+            yes
+        };
+        if skipped == 0 || skipped == join {
+            return false;
+        }
+        for (i, other) in self.blocks.iter().enumerate() {
+            if i != join && successors(other.term).contains(&skipped) {
+                return false;
+            }
+            if i != skipped && matches!(other.term, Some(Term::CondBr(v, _, _)) if v == phi) {
+                return false;
+            }
+            // A phi reads its operands on the incoming edge, before its own block runs.
+            let reads_phi = |&n: &u32| {
+                let mut used = false;
+                for_each_operand(&self.insts[n as usize].op, |v| used |= v == phi);
+                used
+            };
+            if other.phis.iter().any(reads_phi)
+                || (i != skipped && other.body.iter().any(reads_phi))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     /// The address of element `index` of the array `ptr` points to.
     pub fn element(&mut self, block: usize, ptr: V, index: V) -> V {
         let TypeDef::Ptr(arr, space) = self.types[self.type_of(ptr).0 as usize] else {
@@ -1270,6 +1331,57 @@ mod tests {
             .count();
         assert!(removed_phis >= 56);
         assert!(m.write(true).len() < m.write(false).len());
+    }
+
+    #[test]
+    fn missing_scalar_is_unread_only_on_the_edge_excluded_by_the_guard() {
+        for op in [pred::EQ, pred::NE] {
+            let mut m = Module::default();
+            let [entry, mask, scalar, join, read, exit] = std::array::from_fn(|_| m.new_block());
+            let ty = m.int(32);
+            let ptr = m.global("input", ty, 3);
+            let input = m.load(entry, ptr);
+            let zero = m.i32(0);
+            let one = m.i32(1);
+            let unknown = m.undef(ty);
+            let choose = m.cmp(entry, pred::EQ, input, zero);
+            m.terminate(entry, Term::CondBr(choose, mask, scalar));
+            m.terminate(mask, Term::Br(join));
+            m.terminate(scalar, Term::Br(join));
+            let payload = m.phi(join, ty);
+            m.set_phi(payload, vec![(unknown, mask), (input, scalar)]);
+            let guard = m.phi(join, ty);
+            m.set_phi(guard, vec![(zero, mask), (one, scalar)]);
+            let test = m.cmp(join, op, one, guard);
+            let (yes, no) = if op == pred::EQ {
+                (read, exit)
+            } else {
+                (exit, read)
+            };
+            m.terminate(join, Term::CondBr(test, yes, no));
+            m.store(read, ptr, payload);
+            m.terminate(read, Term::Br(exit));
+            m.terminate(exit, Term::Ret);
+            assert!(m.unused_on_phi_edge(payload, join, mask));
+            assert!(!m.unused_on_phi_edge(payload, join, scalar));
+
+            // A second route to the read bypasses the guard.
+            m.terminate(exit, Term::Br(read));
+            assert!(!m.unused_on_phi_edge(payload, join, mask));
+            m.terminate(exit, Term::Ret);
+
+            // An unknown guard on this edge cannot protect the read.
+            m.set_phi(guard, vec![(unknown, mask), (one, scalar)]);
+            assert!(!m.unused_on_phi_edge(payload, join, mask));
+            m.set_phi(guard, vec![(zero, mask), (one, scalar)]);
+            // A read after reconvergence, including on a phi edge, is live.
+            let again = m.phi(exit, ty);
+            m.set_phi(again, vec![(one, read), (payload, join)]);
+            assert!(!m.unused_on_phi_edge(payload, join, mask));
+            m.set_phi(again, vec![(one, read), (one, join)]);
+            m.store(exit, ptr, payload);
+            assert!(!m.unused_on_phi_edge(payload, join, mask));
+        }
     }
 
     #[test]

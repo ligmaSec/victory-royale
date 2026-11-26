@@ -145,4 +145,80 @@ mod tests {
         }
         assert!(super::clamp().is_some());
     }
+
+    #[test]
+    fn unfilled_mesh_records_leave_the_budget_for_later_work() {
+        use super::*;
+
+        let Some(host) = host() else {
+            return; // needs host D3D12 compute and buffer readback
+        };
+        const UNFILLED: usize = 16;
+        const MESH: u32 = 10;
+        const STRIDE: u32 = 12;
+        let mut input = [[u32::MAX; 3]; UNFILLED + 2];
+        // A non-sentinel oversized record still takes the ordinary bounds.
+        input[UNFILLED] = [u32::MAX, 2, 3];
+        input[UNFILLED + 1] = [17, 1, 1];
+        let mut expected = [[0; 3]; UNFILLED + 2];
+        expected[UNFILLED] = [65_535, 1, 1];
+        expected[UNFILLED + 1] = input[UNFILLED + 1];
+        let size = size_of_val(&input) as u64;
+
+        for records_per_clamp in [1, UNFILLED] {
+            let args = host.default_buffer(size).expect("argument buffer");
+            let list = host.new_list().expect("command list");
+            let (upload, mapped) = list.upload(host, size).expect("upload buffer");
+            list.use_shadow(&args, D3D12_RESOURCE_STATE_COPY_DEST);
+            // SAFETY: mapped upload of the correct size and live copy buffers on an open list.
+            let gpu = unsafe {
+                std::ptr::copy_nonoverlapping(
+                    input.as_ptr().cast::<u8>(),
+                    mapped,
+                    size_of_val(&input),
+                );
+                list.list.CopyBufferRegion(&args, 0, &upload, 0, size);
+                args.GetGPUVirtualAddress()
+            };
+
+            let clamp_and_read = |list: &HostList| {
+                let clamp_at = |offset: usize, records: usize| {
+                    list.use_shadow(&args, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    assert!(bound(
+                        list,
+                        &args,
+                        gpu + offset as u64 * u64::from(STRIDE),
+                        (MESH, STRIDE, records as u32),
+                    ));
+                };
+                for offset in (0..UNFILLED).step_by(records_per_clamp) {
+                    clamp_at(offset, records_per_clamp);
+                }
+                clamp_at(UNFILLED, 1);
+                clamp_at(UNFILLED + 1, 1);
+
+                let (readback, mapped) = list.readback(host, size).expect("readback buffer");
+                list.use_shadow(&args, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                // SAFETY: the buffers have compatible states and room for the copy.
+                unsafe { list.list.CopyBufferRegion(&readback, 0, &args, 0, size) };
+                list.close();
+                host.execute(&[list]);
+                let mut actual = [[0; 3]; UNFILLED + 2];
+                // SAFETY: execution finished and the mapped readback received the whole buffer.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        mapped,
+                        actual.as_mut_ptr().cast::<u8>(),
+                        size_of_val(&actual),
+                    );
+                }
+                actual
+            };
+            assert_eq!(clamp_and_read(&list), expected);
+
+            // No re-upload: the next list reads and bounds the same host shadow bytes.
+            let replay = host.new_list().expect("replay command list");
+            assert_eq!(clamp_and_read(&replay), expected);
+        }
+    }
 }

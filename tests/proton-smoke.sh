@@ -14,5 +14,8 @@ rustc --edition 2024 --target x86_64-pc-windows-gnullvm -C target-feature=+crt-s
     exit 1
 }
 "$root/scripts/victory-proton.sh" "$title" --execute 2>&1 | tee "$work/run.log"
+# These lines come from victory.exe during a normal Proton launch.
+grep -Eq '^Proton version: [[:alnum:]].*' "$work/run.log"
+if grep -Eq '^Proton version: unavailable[[:space:]]*$' "$work/run.log"; then exit 1; fi
 # pipefail checks the launcher. Also check the return value printed by VIctory.
 grep -Eq '^title exited with 42[[:space:]]*$' "$work/run.log"

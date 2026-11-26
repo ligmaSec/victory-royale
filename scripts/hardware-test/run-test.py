@@ -1,4 +1,4 @@
-"""Find and run a Series X hardware comparison for VIctory. Python 3.9+."""
+"""Find and run a hardware comparison for VIctory. Python 3.9+."""
 import argparse
 from collections import Counter
 import csv
@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -25,6 +26,7 @@ PACKAGE = "victory-proton-x86_64.tar.gz"
 # Stamped into the official extracted runner. A loose request cannot supply this value.
 PUBLISHED_SHA256 = None
 ROOT = Path(__file__).resolve().parent
+TITLE_ID = "7952987A"
 OUTGOING = ("summary.txt", "main-frames.csv", "candidate-frames.csv", "main-submissions.csv",
             "candidate-submissions.csv", "main-events.csv", "candidate-events.csv")
 REVIEWER = "victory-report-review" + (".exe" if sys.platform == "win32" else "")
@@ -70,9 +72,18 @@ def read_request(path):
     return parse_request(path.read_bytes())
 
 
+def console_name(console):
+    return {"series-x": "Series X", "series-s": "Series S"}[console]
+
+
 def parse_request(data):
     request = json.loads(data)
-    if (request["version"] != 1 or type(request["pr"]) is not int or request["pr"] < 1
+    console = request.get("console", "series-x")
+    version = request["version"]
+    legacy = (version, console) in ((1, "series-x"), (2, "series-s")) and "save" not in request
+    standard = version == 4 and request.get("save") == TITLE_ID and console in ("series-x", "series-s")
+    if (type(version) is not int or not (legacy or standard)
+            or type(request["pr"]) is not int or request["pr"] < 1
             or not isinstance(request["scenario"], str) or not request["scenario"].strip()
             or not request["scenario"].isprintable()):
         raise ValueError("Unrecognized test request.")
@@ -135,22 +146,56 @@ def choose_title():
     return Path(chosen).expanduser()
 
 
-def launch(side, folder, title, results, windows):
+def default_save():
+    checkout = ROOT.parent.parent
+    base = checkout if ROOT == checkout / "scripts" / "hardware-test" and (checkout / ".victory-root").is_file() else ROOT
+    return base / "saves" / TITLE_ID
+
+
+def copy_save(source, destination):
+    # Only persistent player data belongs in the test. In particular, a title's
+    # temp directory may contain unrelated files or logs from an earlier run.
+    def copy_entry(path, target):
+        info = path.lstat()
+        directory = stat.S_ISDIR(info.st_mode)
+        if (not (directory or stat.S_ISREG(info.st_mode))
+                or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+            raise ValueError(f"Use a self-contained save. Unsupported entry in {path}.")
+        if directory:
+            target.mkdir(parents=True)
+            for entry in path.iterdir():
+                copy_entry(entry, target / entry.name)
+            shutil.copystat(path, target)
+        else:
+            shutil.copy2(path, target)
+        # Keep the original timestamps, including for read-only source media.
+        # Each private slot must be readable and writable by its new owner.
+        mode = stat.S_IMODE(info.st_mode) | stat.S_IRUSR | stat.S_IWUSR
+        target.chmod(mode | stat.S_IXUSR if directory else mode)
+
+    for name in ("saves", "storage"):
+        path = source / name
+        if name == "saves" or path.exists():
+            copy_entry(path, destination / name)
+
+
+def launch(side, folder, title, results, windows, console="series-x"):
     env = os.environ.copy()
     # Ignore a developer override that could silently substitute a different build.
     env.pop("VICTORY_EXE", None)
     env["VICTORY_TRACE_PIPELINES"] = "1"
-    cache = folder / "cache"
-    env["VICTORY_CACHE_DIR"] = str(cache) if windows else "Z:" + str(cache).replace("/", "\\")
-    args = [str(title), "--console", "series-x"]
+    for variable, directory in (("VICTORY_CACHE_DIR", "cache"), ("VICTORY_DATA_DIR", "data")):
+        path = str(folder / directory)
+        env[variable] = path if windows else "Z:" + path.replace("/", "\\")
+    args = [str(title), "--console", console]
     if windows:
-        command = [str(folder / "victory.exe"), "run", str(title), "--execute", "--console", "series-x"]
+        command = [str(folder / "victory.exe"), "run", str(title), "--execute", "--console", console]
     else:
         env.update(VKD3D_SHADER_CACHE_PATH=str(folder / "vkd3d"), DXVK_STATE_CACHE_PATH=str(folder / "dxvk"))
         command = ["bash", str(folder / "victory-proton.sh"), "--report", "--runtime", "pinned", *args]
-    console = results / (side + ".log")
+    log_path = results / (side + ".log")
     report = None
-    with console.open("wb") as log, subprocess.Popen(command, cwd=title.parent, env=env,
+    with log_path.open("wb") as log, subprocess.Popen(command, cwd=title.parent, env=env,
                                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
         with process.stdout:
             for line in process.stdout:
@@ -199,7 +244,7 @@ def hardware_requests(number):
         artifacts = github_rows(f"actions/runs/{run_id}/artifacts?per_page=100",
                                 '.artifacts[] | select(.expired == false) | {name}')
         for artifact in artifacts:
-            match = re.fullmatch(r"victory-series-x-pr-([1-9][0-9]*)", artifact["name"])
+            match = re.fullmatch(r"victory-series-[xs]-pr-([1-9][0-9]*)", artifact["name"])
             if match:
                 pr = int(match[1])
                 if pr in open_prs and pr not in available:
@@ -216,9 +261,9 @@ def select_published(number, list_only, folder):
     available = hardware_requests(number)
     if number is None:
         if not available:
-            print("There are no open Series X hardware test requests.")
+            print("There are no open hardware test requests.")
             return None
-        print("Series X hardware test requests:")
+        print("Hardware test requests:")
         for pr, (pull, run_id, _) in sorted(available.items()):
             status = "kit available" if run_id else f"see request at https://github.com/{REPO}/pull/{pr}"
             print(f"  #{pr}  {pull['title']}  [{status}]")
@@ -238,7 +283,7 @@ def select_published(number, list_only, folder):
         print(f"PR #{number} is looking for testers. See https://github.com/{REPO}/pull/{number}")
         print("This request has no unexpired kit published from main.")
         return None
-    print(f"Downloading the Series X test for PR #{number}…", flush=True)
+    print(f"Downloading the hardware test for PR #{number}…", flush=True)
     subprocess.run(["gh", "run", "download", str(run_id), "-R", "github.com/" + REPO, "-n", artifact, "-D", str(folder)],
                    check=True)
     manifest = folder / "request.json"
@@ -247,6 +292,9 @@ def select_published(number, list_only, folder):
     request = read_request(manifest)
     if request["pr"] != number:
         raise ValueError("The published kit names a different PR.")
+    expected = f"victory-{request.get('console', 'series-x')}-pr-{number}"
+    if artifact != expected:
+        raise ValueError("The published kit names a different console profile.")
     parents = github_rows("git/commits/" + request["candidate"]["revision"], ".parents[] | {sha}")
     if [parent["sha"] for parent in parents] != [request["main"]["revision"], pull["head"]]:
         raise ValueError(f"PR #{number} changed after this kit was built. Ask the requester to publish a fresh kit.")
@@ -265,7 +313,7 @@ def official_archive(path, request):
                 or run["conclusion"] != "success"):
             return False
         expected = "sha256:" + digest(path)
-        name = f"victory-series-x-pr-{request['pr']}"
+        name = f"victory-{request.get('console', 'series-x')}-pr-{request['pr']}"
         artifacts = report_keys.github(prefix + f"runs/{run_id}/artifacts")["artifacts"]
         return any(a["name"] == name and a["digest"] == expected for a in artifacts)
     except (OSError, ValueError, KeyError, subprocess.SubprocessError):
@@ -292,13 +340,20 @@ def unpack_kit(path, folder, plan):
 def run():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("request", nargs="?", help="PR number, test kit ZIP or request JSON")
-    parser.add_argument("--list", action="store_true", help="list Series X hardware test requests")
+    parser.add_argument("--list", action="store_true", help="list hardware test requests")
     parser.add_argument("--output-dir", type=Path, help="parent directory for the unique report")
+    parser.add_argument("--save-dir", type=Path, help=f"use a local {TITLE_ID} folder outside the default saves/ directory")
     parser.add_argument("--plan", action="store_true", help="preview the selected test without launching")
     parser.add_argument("--title", type=Path, help="use this executable instead of the file chooser")
     options = parser.parse_args()
     if options.list and options.request:
         parser.error("--list takes no request")
+    options.save_dir = (options.save_dir or default_save()).expanduser().resolve()
+    temp = Path(tempfile.gettempdir()).resolve()
+    output = (options.output_dir or temp).expanduser().resolve()
+    for directory in (temp, output):
+        if directory.is_relative_to(options.save_dir):
+            raise ValueError("Choose temporary and report directories outside the source save.")
     with tempfile.TemporaryDirectory(prefix="victory-request-") as temporary:
         folder = Path(temporary)
         options.trusted_digest = PUBLISHED_SHA256
@@ -528,8 +583,9 @@ def side_metrics(results, side, windows, frame_log, submission_log, timeline):
 
 def diagnostic_summary(request, results, windows, complete, destination):
     shader_ids = {}
-    rows = [f"Series X hardware test | PR #{request['pr']} | " + ("Windows" if windows else "Linux/Proton"),
+    rows = [f"{console_name(request.get('console', 'series-x'))} hardware test | PR #{request['pr']} | " + ("Windows" if windows else "Linux/Proton"),
             "Comparison completed" if complete else "Partial comparison",
+            f"Starting save: {TITLE_ID} (separate copies)",
             "Timings cover all recorded phases, including menus."]
     for side in ("main", "candidate"):
         rows.extend(["", f"{side.capitalize()} | {request[side]['revision']}"])
@@ -710,8 +766,8 @@ def report_overview(summary):
     return rows
 
 
-def share_result(pr, filtered, kit, binding=None):
-    context = f"Series X  ·  PR #{pr}"
+def share_result(pr, filtered, kit, binding=None, console="series-x"):
+    context = f"{console_name(console)}  ·  PR #{pr}"
     with zipfile.ZipFile(filtered) as archive:
         initial = archive.read("summary.txt").decode("utf-8") if "summary.txt" in archive.namelist() else ""
     if not sys.stdin.isatty():
@@ -841,8 +897,18 @@ def run_request(manifest, options):
     data = manifest.read_bytes()
     request = parse_request(data)
     binding = request.get("delivery") if hashlib.sha256(data).hexdigest() == options.trusted_digest else None
-    print(f"VIctory PR #{request['pr']} | Series X | two launches", flush=True)
+    console = request.get("console", "series-x")
+    print(f"VIctory PR #{request['pr']} | {console_name(console)} | two launches", flush=True)
     instruction_block(PRIVACY_HEADING, LOG_PRIVACY + " Your reports stay on this machine until you choose to share.")
+    source = (options.save_dir or default_save()).expanduser().resolve()
+    if source.name.upper() != TITLE_ID or not any(p.is_file() for p in (source / "saves").rglob("*")):
+        message = (f"Standard save {TITLE_ID} missing or empty at {source}. "
+                   f"Place your copy in saves/{TITLE_ID}/ or pass --save-dir pointing to your {TITLE_ID} folder.")
+        if not options.plan:
+            raise ValueError("Warning: " + message)
+        print("Warning: " + message, file=sys.stderr)
+    else:
+        print(f"Using standard save {TITLE_ID}. Each build gets a separate copy.", flush=True)
     if options.plan:
         if binding:
             owner = binding["requester"]["login"]
@@ -862,6 +928,8 @@ def run_request(manifest, options):
         if not shutil.which(binary):
             raise ValueError(f"Missing {binary}. See the requirements in README.txt.")
     title = (options.title or choose_title()).expanduser().resolve()
+    if title.parent.is_relative_to(source):
+        raise ValueError("Select a game executable outside the source save folder.")
     if not title.is_file() or title.suffix.lower() != ".exe":
         raise ValueError("Select the game's .exe file.")
     temp = Path(tempfile.gettempdir()).resolve()
@@ -873,6 +941,9 @@ def run_request(manifest, options):
         for side in ("main", "candidate"):
             print(f"Checking {side}…", flush=True)
             stage_build(request, side, Path(work) / side, manifest.resolve().parent / "packages")
+        seed = Path(work) / "main" / "data" / TITLE_ID
+        copy_save(source, seed)
+        shutil.copytree(seed, Path(work) / "candidate" / "data" / TITLE_ID)
         results = Path(work) / "results"
         results.mkdir()
         shutil.copyfile(manifest, results / "request.json")
@@ -880,7 +951,7 @@ def run_request(manifest, options):
         try:
             for number, side in enumerate(("main", "candidate"), start=1):
                 instruction_block(f"RUN {number} OF 2  |  {side.upper()}  |  WHAT TO DO", request["scenario"])
-                launch(side, Path(work) / side, title, results, windows)
+                launch(side, Path(work) / side, title, results, windows, console)
             complete = True
         finally:
             if any(results.glob("*.log")):
@@ -903,7 +974,7 @@ def run_request(manifest, options):
                         # Fixed ZIP metadata avoids recording local times or file modes.
                         entry = zipfile.ZipInfo(name)
                         out.writestr(entry, (destination / name).read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
-                share_result(request["pr"], filtered, options.review_kit, binding)
+                share_result(request["pr"], filtered, options.review_kit, binding, console)
 
 
 if __name__ == "__main__":

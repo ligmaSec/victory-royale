@@ -1336,7 +1336,7 @@ impl State {
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// In frames listed for capture, at debug level: one line per draw or
+    /// In detailed capture frames, at debug level: one line per draw or
     /// dispatch with its render targets and depth (named as in
     /// `VICTORY_DUMP_TARGETS` files) and whether it ran, else why it was
     /// dropped (diagnostics builds).
@@ -1349,9 +1349,11 @@ impl State {
     /// was looked at (else the pipeline's).
     #[cfg(feature = "diagnostics")]
     fn frame_op_why(&self, kind: &str, compute: bool, ran: bool, why: Option<&str>) {
-        if !tracing::enabled!(tracing::Level::DEBUG)
-            || !crate::capture::listed(crate::queue::presented() + 1)
-        {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let frame = crate::queue::presented() + 1;
+        if !crate::capture::detailed(frame) {
             return;
         }
         let targets: Vec<String> = if compute {
@@ -1373,7 +1375,7 @@ impl State {
         let text = self.op_text(kind.to_owned(), compute);
         tracing::debug!(
             "frame {} op: pipeline {:#x} topology {} targets {targets:?} depth {:#x} -> {outcome} || {text}",
-            crate::queue::presented() + 1,
+            frame,
             self.pipeline,
             self.topology,
             self.depth.map_or(0, |d| d.resource)
@@ -1844,9 +1846,9 @@ impl State {
         if !tracing::enabled!(tracing::Level::DEBUG) {
             return;
         }
-        // Listed frames: `frame_op` logs every operation instead.
-        let listed = crate::capture::listed(crate::queue::presented() + 1);
-        let logged = !listed && TRACED.fetch_add(1, Ordering::Relaxed) < 64;
+        // Detailed frames have a separate trace of every operation.
+        let detailed = crate::capture::detailed(crate::queue::presented() + 1);
+        let logged = !detailed && TRACED.fetch_add(1, Ordering::Relaxed) < 64;
         let targets: Vec<String> = self
             .targets
             .iter()
@@ -3281,6 +3283,95 @@ mod table_tests {
             crate::object::S_OK
         );
         TitleObject(out)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn world_capture_dumps_targets_on_followups_and_listed_frames() {
+        // Frame numbers and capture settings belong to the process.
+        const CHILD: &str = "VICTORY_TEST_WORLD_TARGETS";
+        if std::env::var_os(CHILD).is_none() {
+            let folder = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "draw::table_tests::world_capture_dumps_targets_on_followups_and_listed_frames",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("VICTORY_CAPTURE", folder.path())
+                .env("VICTORY_DUMP_TARGETS", "1")
+                .env("VICTORY_CAPTURE_WORLD", "1")
+                .env("VICTORY_CAPTURE_FRAMES", "8,10")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+            return;
+        }
+        let Some(host) = crate::host::host() else {
+            assert!(
+                !crate::switch::on("VICTORY_D3D12_WARP"),
+                "the requested WARP device must initialize for the readback test"
+            );
+            return;
+        };
+        let target = create_title_texture(
+            4,
+            4,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+        );
+        let mut slot = [0u64; 16];
+        let handle = slot.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(std::ptr::null(), target.0, std::ptr::null(), handle);
+        let rtv = host.rtv(crate::resource::host_resource(target.0), None);
+        let (queue, signal) = crate::queue::test_queue();
+        let queue = TitleObject(queue);
+        type Present = extern "system" fn(
+            This,
+            u32,
+            *const crate::queue::Plane,
+            *const u8,
+        ) -> crate::object::HRESULT;
+        let present = crate::object::slot::<Present>(queue.0, signal + 0x80);
+        let mut state = State::default();
+        for frame in 1..=11 {
+            let list = host.new_list().unwrap();
+            state.set_targets(&list, &[handle], 0);
+            state.set_targets(&list, &[handle], 0);
+            // SAFETY: the open list has a live RTV in render-target state.
+            unsafe {
+                list.list
+                    .ClearRenderTargetView(rtv, &[frame as f32 / 16.0, 0.0, 1.0, 1.0], None)
+            };
+            list.close();
+            host.execute(&[&list]);
+            if frame == 3 {
+                super::DRAWN.fetch_add(500, Ordering::Relaxed);
+            }
+            assert_eq!(
+                present(queue.0, 0, std::ptr::null(), std::ptr::null()),
+                crate::object::S_OK
+            );
+        }
+        let folder = crate::capture::folder().unwrap();
+        assert_eq!(std::fs::read_dir(folder).unwrap().count(), 4);
+        for frame in [5, 8, 9, 10] {
+            let expected = [((frame * 255 + 8) / 16) as u8, 0, 255, 255].repeat(16);
+            crate::capture::save(frame, 4, 4, 16, false, &expected);
+            let dumped = folder.join(format!("frame-{frame}-00-{:?}-4x4-f28.png", target.0));
+            let reference = folder.join(format!("frame-{frame}.png"));
+            assert_eq!(
+                std::fs::read(dumped).unwrap(),
+                std::fs::read(reference).unwrap()
+            );
+        }
     }
 
     fn create_sampler_at(desc: &D3D12_SAMPLER_DESC, handle: u64) {

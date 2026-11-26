@@ -1,6 +1,6 @@
 # Asset policy (rule #1)
 
-**Nothing from the game is ever stored in this repository.** Everything is
+**Nothing from the game is ever committed to this repository.** Everything is
 built on the user's machine from files the user supplies. The same applies
 to other titles used for testing, and to any other proprietary material.
 
@@ -39,6 +39,12 @@ accepted.
 Outside the repository, configured in `victory.toml`: `game_dir` (the
 user's dump), `test_titles`, and `cache_dir` for everything derived
 (default `%LOCALAPPDATA%\victory\cache`).
+
+Hardware comparisons use the standard player-provided `7952987A` save.
+The ignored root directory `saves/7952987A/` is its local input location.
+Git leaves empty directories out of clones. Create `saves/` locally or pass
+an external `7952987A` folder with `--save-dir`. Keep save files out of
+fixtures, release packages and reports.
 
 Under Wine/Proton, vkd3d-proton and DXVK write shader caches
 (`vkd3d-proton.cache`, `*.dxvk-cache`) into the current directory. They are

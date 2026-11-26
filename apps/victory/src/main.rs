@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(any(windows, test))]
+mod proton;
 mod run;
 mod shader;
 mod translate;

@@ -1,4 +1,4 @@
-"""Local browser editor for optional Series X hardware test observations."""
+"""Local browser editor for optional hardware test observations."""
 import base64
 import binascii
 import json

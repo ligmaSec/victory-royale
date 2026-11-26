@@ -52,6 +52,9 @@ windows = { workspace = true, features = [
 # `#[implement]` names it.
 windows-core = { workspace = true, optional = true }
 
+[target.'cfg(windows)'.dev-dependencies]
+victory-gpu = { workspace = true, features = ["test-support"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 

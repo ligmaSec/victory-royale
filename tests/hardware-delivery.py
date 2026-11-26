@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -160,7 +161,7 @@ class RequestDelivery(unittest.TestCase):
         out = self.root / "kit.zip"
         build = {"run": 9, "revision": "f" * 40, "sha256": "0" * 64}
         pull = {"user": author, "head": {"sha": "c" * 40}, "base": {"ref": "main", "repo": {"full_name": keys.REPO}}}
-        args = ["prepare", "7", "--scenario", "Observe.", "--output", str(out), "--published", "--requester-comment", comment]
+        args = ["prepare", "7", "--console", "series-s", "--scenario", "Observe.", "--output", str(out), "--published", "--requester-comment", comment]
         with mock.patch.dict(os.environ, GITHUB_RUN_ID="812", GITHUB_ACTOR="publisher", GITHUB_ACTOR_ID="22"), \
                 mock.patch.object(sys, "argv", args), mock.patch.object(prepare, "api", return_value=pull), \
                 mock.patch.object(prepare, "find_build", side_effect=[(build, "base", b"one"),
@@ -173,22 +174,78 @@ class RequestDelivery(unittest.TestCase):
                 self.assertIn(name, kit.namelist())
         trusted = hashlib.sha256(data).hexdigest()
         request = json.loads(data)
+        self.assertEqual((request["version"], request["console"]), (4, "series-s"))
+        self.assertEqual(request["save"], "7952987A")
         self.assertEqual(request["delivery"]["requester"], keys.account(requester))
         manifest = self.root / "request.json"
         for modified in (dict(request, delivery={"requester": keys.account(publisher), "registration": None}),
                          dict(request, candidate=dict(build, run=735)), dict(request, pr=9)):
             manifest.write_text(json.dumps(modified))
             with contextlib.redirect_stdout(io.StringIO()) as report:
-                runner.run_request(manifest, mock.Mock(plan=True, trusted_digest=trusted))
+                runner.run_request(manifest, mock.Mock(plan=True, trusted_digest=trusted, save_dir=None))
             self.assertIn("Private delivery unavailable for this request.", report.getvalue())
         run = dict(path=".github/workflows/hardware-request.yml", head_branch="main", event="workflow_dispatch",
                    conclusion="success", head_repository={"full_name": keys.REPO})
-        artifact = {"name": "victory-series-x-pr-7", "digest": "sha256:" + runner.digest(out)}
+        artifact = {"name": "victory-series-s-pr-7", "digest": "sha256:" + runner.digest(out)}
         with mock.patch.object(keys, "github", side_effect=[run, {"artifacts": [artifact]}, run, {"artifacts": [artifact]}]):
             self.assertTrue(runner.official_archive(out, request))
             with zipfile.ZipFile(out, "a") as zip_out:
                 zip_out.writestr("modified", "new bytes")
             self.assertFalse(runner.official_archive(out, request))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "exercises the Bash distribution entry point")
+    def test_extracted_published_kit_launches_both_builds_from_its_local_save(self):
+        launcher = rb"""set -eu
+data=${VICTORY_DATA_DIR#Z:}
+slot="${data//\\//}/7952987A/saves/progress"
+test "$(cat "$slot")" = private-start
+printf changed > "$slot"
+report="$(dirname "$0")/fixture.tar.gz"
+tar -czf "$report" -T /dev/null
+echo "Report: $report (launcher exit 0)"
+"""
+        def package(revision):
+            payload = io.BytesIO()
+            with tarfile.open(fileobj=payload, mode="w:gz") as bundle:
+                for name, data in (("victory.exe", b"fixture"), ("victory-proton.sh", launcher),
+                                   ("REVISION", revision.encode()), ("LICENSE", b"fixture")):
+                    member = tarfile.TarInfo("victory/" + name)
+                    member.size = len(data)
+                    bundle.addfile(member, io.BytesIO(data))
+            data = payload.getvalue()
+            return {"revision": revision, "run": 9, "sha256": hashlib.sha256(data).hexdigest()}, "base", data
+
+        archive = self.root / "kit.zip"
+        pull = {"user": author, "head": {"sha": "c" * 40}, "base": {"ref": "main", "repo": {"full_name": keys.REPO}}}
+        args = ["prepare", "7", "--scenario", "Close the game.", "--output", str(archive),
+                "--published", "--requester-comment", comment]
+        with mock.patch.dict(os.environ, GITHUB_RUN_ID="812", GITHUB_ACTOR="publisher", GITHUB_ACTOR_ID="22"), \
+                mock.patch.object(sys, "argv", args), mock.patch.object(prepare, "api", return_value=pull), \
+                mock.patch.object(prepare, "find_build", side_effect=[package("c" * 40), package("b" * 40)]):
+            prepare.prepare()
+        kit = self.root / "extracted kit"
+        with zipfile.ZipFile(archive) as bundle:
+            bundle.extractall(kit)
+        slot = kit / "saves" / "7952987A" / "saves" / "progress"
+        slot.parent.mkdir(parents=True)
+        slot.write_text("private-start")
+        title = self.root / "fixture.exe"
+        title.touch()
+        # The fixture distribution exercises the child environment with Bash.
+        # Satisfy the runner's UMU preflight without downloading a runtime in CI.
+        (self.root / "umu-run").touch(mode=0o755)
+        env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ["PATH"])
+        out = self.root / "reports"
+        result = subprocess.run([sys.executable, str(kit / "run-test.py"), "--title", str(title),
+                                 "--output-dir", str(out)], env=env, cwd=self.root, stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Comparison completed", result.stdout)
+        self.assertEqual(slot.read_text(), "private-start")
+        with zipfile.ZipFile(next(out.rglob("report.zip"))) as report:
+            for side in ("main", "candidate"):
+                self.assertEqual(report.read(side + "-exit.txt").strip(), b"0")
+            self.assertFalse(any("7952987A" in name for name in report.namelist()))
 
     def test_collects_a_truncated_gist_using_its_pinned_raw_revision(self):
         body = b"synthetic armored report"
@@ -305,16 +362,20 @@ class RequestDelivery(unittest.TestCase):
         # Replacing both fields with a different legitimate account must fail too.
         # Exercise the extracted runner through its normal argument parsing and results menu.
         build = {"run": 712, "revision": "a" * 40, "sha256": "b" * 64}
-        original = {"version": 1, "pr": 7, "scenario": "Observe.", "delivery": binding,
+        original = {"version": 2, "console": "series-s", "pr": 7, "scenario": "Observe.", "delivery": binding,
                     "main": build, "candidate": build}
         manifest = self.root / "request.json"
         manifest.write_text(json.dumps(original), encoding="utf-8")
         stamp = runner.digest(manifest)
         changed = dict(original, delivery={"requester": keys.account(publisher), "registration": published})
         manifest.write_text(json.dumps(changed), encoding="utf-8")
+        save = self.root / "saves" / "7952987A" / "saves"
+        save.mkdir(parents=True)
+        (save / "progress").write_text("test fixture")
         title = self.root / "fixture.exe"
         title.touch()
-        def launch(side, folder, game, results, windows):
+        def launch(side, folder, game, results, windows, console):
+            self.assertEqual(console, "series-s")
             (results / (side + ".log")).write_text("synthetic run")
         def menu(title, context, lines, actions, default, cancel):
             self.assertEqual(title, "Hardware test results")

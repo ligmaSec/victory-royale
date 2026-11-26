@@ -89,6 +89,16 @@ jobs:
       - name: Tests
         run: cargo test --workspace --locked -- --test-threads=1
 
+      - name: Check shadow copy-back on WARP
+        env:
+          VICTORY_D3D12_WARP: "1"
+        run: cargo test -p victory-gpu --lib --features diagnostics --locked later_gpu_write_range_keeps_the_titles_newer_bytes -- --test-threads=1
+
+      - name: World capture readback on WARP
+        env:
+          VICTORY_D3D12_WARP: "1"
+        run: cargo test -p victory-gpu --lib --features diagnostics --locked world_capture -- --test-threads=1
+
   msrv:
     needs: fmt-policy
     if: needs.fmt-policy.outputs.route == 'code'

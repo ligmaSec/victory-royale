@@ -11,8 +11,15 @@ on:
         description: "Publishing for someone else? Link their /victory hardware-test comment on this PR"
         required: false
         type: string
+      console:
+        description: Console profile for both launches
+        type: choice
+        default: series-x
+        options:
+          - series-x
+          - series-s
       scenario:
-        description: What to do in each Series X run and when to close it
+        description: What to do in each run and when to close it
         required: true
         type: string
 
@@ -51,14 +58,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REQUESTER_COMMENT: ${{ inputs.requester_comment }}
           PR: ${{ inputs.pr }}
+          CONSOLE: ${{ inputs.console }}
           SCENARIO: ${{ inputs.scenario }}
         run: |
-          python3 scripts/hardware-test/prepare.py "$PR" --scenario "$SCENARIO" --published --requester-comment "$REQUESTER_COMMENT" --review-dir "$RUNNER_TEMP/review" --output "$RUNNER_TEMP/kit.zip"
+          python3 scripts/hardware-test/prepare.py "$PR" --console "$CONSOLE" --scenario "$SCENARIO" --published --requester-comment "$REQUESTER_COMMENT" --review-dir "$RUNNER_TEMP/review" --output "$RUNNER_TEMP/kit.zip"
           unzip -q "$RUNNER_TEMP/kit.zip" -d "$RUNNER_TEMP/kit"
       - name: Publish the test kit
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: victory-series-x-pr-${{ inputs.pr }}
+          name: victory-${{ inputs.console }}-pr-${{ inputs.pr }}
           path: ${{ runner.temp }}/kit/
           compression-level: 0
           retention-days: 7

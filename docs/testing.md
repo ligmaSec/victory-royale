@@ -39,7 +39,7 @@ the full UMU/Proton runtime still require a separate workstation test.
 Successful main builds deliver `victory-proton-x86_64-<commit>` for 14 days.
 Code PRs deliver `victory-proton-x86_64-pr-<number>-<merge-commit>` for three
 days. The latter contains the revision GitHub tested with the base branch.
-For a requested comparison, use the [interactive Series X test](#run-a-series-x-hardware-test)
+For a requested comparison, use the [interactive hardware test](#run-a-hardware-test)
 to get both matched builds. For a single run, Windows testers can launch the extracted
 `victory.exe` with the [usual Windows launch command](../README.md#getting-started).
 
@@ -53,7 +53,9 @@ tar -xf victory-proton-x86_64.tar.gz
 ./victory/victory-proton.sh --run "/path/to/game/title.exe"
 ```
 
-## Run a Series X hardware test
+<a id="run-a-series-x-hardware-test"></a>
+
+## Run a hardware test
 
 You'll need Python 3.9 or newer and your own title executable outside the VIctory checkout.
 > [!WARNING]
@@ -68,6 +70,14 @@ runtime on first use.
 | --- | --- | --- |
 | From the repository root, choose a test request | `python3 scripts/hardware-test/run-test.py` | `py scripts/hardware-test/run-test.py` |
 | With a kit ZIP, extract it and open a terminal in the folder containing `run-test.py` | `python3 run-test.py` | `py run-test.py` |
+
+Gameplay comparisons start from the standard `7952987A` save. Place your local
+copy in `saves/7952987A/` at the checkout root, or beside an extracted runner
+in the same layout. It contains `saves/` with your progress and may also contain
+`storage/` with settings. To keep the checkout empty, pass
+`--save-dir "/path/to/7952987A"`. Each build starts with its own temporary copy
+of the same progress and settings. The runner warns if the save is missing.
+You can still preview a request with `--plan`.
 
 The checkout menu uses a signed-in GitHub CLI (`gh auth login`). Type the PR number
 shown in the menu, or press Enter to cancel. If a request includes a number, you
@@ -190,7 +200,8 @@ request against the copy pinned in its bundled runner.
 ## Requesting a hardware comparison
 
 Run the [hardware kit workflow](../.github/workflows/hardware-request.yml) on
-`main` with the PR number and a short Series X scenario. Specify where to start,
+`main` with the PR number, console profile (Series X by default), and a short scenario.
+Both builds use that profile. Specify where to start,
 what to observe and when to close each run. If someone else asked for the test,
 have them comment on this PR with `/victory hardware-test` on its own first line
 followed by their scenario. Put that comment URL in **requester_comment** when
@@ -254,6 +265,37 @@ Run one crate or one test on its own:
 cargo test -p victory-shader --locked
 cargo test -p victory-shader --locked -- <test name> --nocapture
 ```
+
+### Running the title under Wine without a sound device
+
+On a headless Linux host, an X display can be working while Wine has no
+default playback endpoint. In that configuration the Series X 1.0.2.1
+opening repeatedly stopped at guest frame 82. Check the title's local
+crash report for its frame number. The host can present hundreds of
+frames before the title stops.
+
+For Wine using ALSA, a silent playback device lets a graphics test run
+past this point. In a shell with your test Wine prefix and graphics
+runtime already configured, give just the launch its own ALSA config:
+
+```sh
+audio_config=$(mktemp)
+cat > "$audio_config" <<'EOF'
+</usr/share/alsa/alsa.conf>
+pcm.!default {
+    type null
+    hint { show on description "VIctory software playback" }
+}
+EOF
+ALSA_CONFIG_PATH="$audio_config" wine ./victory.exe run "$TITLE_EXE" --execute --console series-x
+rm -f "$audio_config"
+```
+
+Set `TITLE_EXE` to the Windows path to your executable. Use a fresh Wine
+session for each side so its audio driver picks up the setting. Record
+`ALSA null` with the GPU, runtime and scene cue for both builds. This
+setup exercises silent playback. Audible output needs a separate test
+with a working sound device.
 
 ## Comparing frame pacing
 

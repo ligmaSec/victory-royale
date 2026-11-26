@@ -79,6 +79,7 @@ def review_notices(out):
 def prepare():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pr", type=int)
+    parser.add_argument("--console", choices=("series-x", "series-s"), default="series-x")
     parser.add_argument("--scenario", required=True, help="what to do in each run and when to close it")
     parser.add_argument("--output", required=True, type=Path, help="new request ZIP")
     parser.add_argument("--review-dir", type=Path, help="directory containing both native review executables")
@@ -97,7 +98,9 @@ def prepare():
     candidate, base, candidate_bytes = find_build("pull_request", pull["head"]["sha"],
                                  f"victory-proton-x86_64-pr-{args.pr}-")
     main, _, main_bytes = find_build("main", base, "victory-proton-x86_64-")
-    request = {"version": 1, "pr": args.pr, "scenario": args.scenario, "main": main, "candidate": candidate}
+    # Earlier runners do not isolate the standard save and must decline this kit.
+    request = {"version": 4, "console": args.console, "save": "7952987A", "pr": args.pr,
+               "scenario": args.scenario, "main": main, "candidate": candidate}
     if binding:
         request["delivery"] = binding
         request["publication_run"] = int(os.environ["GITHUB_RUN_ID"])

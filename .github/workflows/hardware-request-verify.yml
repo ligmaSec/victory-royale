@@ -30,8 +30,8 @@ jobs:
           KIT_RUN: ${{ github.event.workflow_run.id }}
         run: |
           artifact=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$KIT_RUN/artifacts" --jq '.artifacts[] | select(.expired == false) | .name')
-          if [[ ! "$artifact" =~ ^victory-series-x-pr-([1-9][0-9]*)$ ]]; then
-            echo "::error::Expected one unexpired Series X kit in the publication run."
+          if [[ ! "$artifact" =~ ^victory-series-[xs]-pr-([1-9][0-9]*)$ ]]; then
+            echo "::error::Expected one unexpired hardware kit in the publication run."
             exit 1
           fi
           pr=${BASH_REMATCH[1]}
