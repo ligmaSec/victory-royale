@@ -141,6 +141,13 @@ const MAX_MEMO: usize = 1 << 18;
 /// Case splits [`Bools::meet`] makes before it gives up.
 const MAX_MEET: usize = 1 << 16;
 
+/// A single lane-condition query. Only proven contradictions enter the cache.
+struct MeetSearch {
+    splits_left: usize,
+    cache_words_left: usize,
+    impossible: Set<Box<[(Bool, bool)]>>,
+}
+
 impl Bools {
     fn new() -> Self {
         Bools {
@@ -282,23 +289,32 @@ impl Bools {
     /// `b` where `holds`, its negation where not. Yes when the search grows
     /// too large to finish.
     pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
-        let mut budget = MAX_MEET;
-        self.meet_in(all.to_vec(), &mut budget)
+        let mut search = MeetSearch {
+            splits_left: MAX_MEET,
+            cache_words_left: MAX_MEET,
+            impossible: Set::default(),
+        };
+        self.meet_in(all.to_vec(), &mut search)
     }
 
-    fn meet_in(&self, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {
+    fn meet_in(&self, mut all: Vec<(Bool, bool)>, search: &mut MeetSearch) -> bool {
         let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
         if all.iter().any(fails) {
             return false;
         }
         all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
-        if all.is_empty() || *budget == 0 {
+        // Reduced diagrams can reach the same remaining conditions through
+        // different assignments. Count that search against the budget once.
+        if search.impossible.contains(all.as_slice()) {
+            return false;
+        }
+        if all.is_empty() || search.splits_left == 0 {
             return true;
         }
-        *budget -= 1;
+        search.splits_left -= 1;
         let top = |b: Bool| self.nodes[b.0 as usize].0;
         let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
-        [false, true].into_iter().any(|value| {
+        let possible = [false, true].into_iter().any(|value| {
             let next = all
                 .iter()
                 .map(|&(b, holds)| {
@@ -306,8 +322,15 @@ impl Bools {
                     (if value { hi } else { lo }, holds)
                 })
                 .collect();
-            self.meet_in(next, budget)
-        })
+            self.meet_in(next, search)
+        });
+        // Include the boxed slice's two-word key in the per-query allowance.
+        let cost = all.len() + 2;
+        if !possible && cost <= search.cache_words_left {
+            search.cache_words_left -= cost;
+            search.impossible.insert(all.into_boxed_slice());
+        }
+        possible
     }
 
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
@@ -1805,6 +1828,20 @@ mod tests {
         f
     }
 
+    #[test]
+    fn complementary_lane_masks_exclude_an_edge_after_a_complex_join() {
+        let (mut bools, masks) = atoms(20);
+        let reach = masks[..19]
+            .iter()
+            .fold(Bool::FALSE, |old, &mask| bools.xor(old, mask));
+        let arm = masks[19];
+        let other = bools.not(arm);
+        assert!(bools.meet(&[(reach, true), (arm, true)]));
+        assert!(bools.meet(&[(reach, true), (arm, false), (other, true)]));
+        assert!(!bools.meet(&[(reach, true), (arm, true), (other, true)]));
+        assert!(!bools.meet(&[(reach, true), (arm, false), (other, false)]));
+    }
+
     /// A deterministic mix of ands, ors and xors over `xs`.
     fn mixed(b: &mut Bools, xs: &[Bool], seed: u64, steps: usize) -> Bool {
         let mut s = seed;
@@ -1837,6 +1874,37 @@ mod tests {
                     let (v, lo, hi) = b.nodes[f.0 as usize];
                     f = if bits >> v & 1 == 1 { hi } else { lo };
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn lane_condition_queries_preserve_reachable_assignments_when_bounded() {
+        let (mut bools, xs) = atoms(6);
+        for seed in 0..32 {
+            let a = mixed(&mut bools, &xs, seed, 12);
+            let b = mixed(&mut bools, &xs, seed + 32, 12);
+            let c = bools.xor(a, b);
+            for signs in 0..8 {
+                let query = [
+                    (a, signs & 1 != 0),
+                    (b, signs & 2 != 0),
+                    (c, signs & 4 != 0),
+                ];
+                let reachable = (0..64).any(|bits| {
+                    query
+                        .iter()
+                        .all(|&(node, want)| value_at(&bools, node, bits) == want)
+                });
+                assert_eq!(bools.meet(&query), reachable);
+                // Exhausting either allowance may decline to prove a contradiction.
+                // A reachable assignment must still be allowed.
+                let mut search = MeetSearch {
+                    splits_left: 3,
+                    cache_words_left: 3,
+                    impossible: Set::default(),
+                };
+                assert!(bools.meet_in(query.to_vec(), &mut search) || !reachable);
             }
         }
     }
