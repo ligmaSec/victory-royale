@@ -291,7 +291,11 @@ if [[ $proton_selection != umu && -f $proton_path/version && -r $proton_path/ver
     proton_selected_version=$(head -c 256 -- "$proton_path/version" 2>/dev/null | head -n 1 |
         LC_ALL=C grep -axE "$proton_version_pattern") || proton_selected_version=unknown
 fi
-printf 'Proton selection (%s): %s\n' "$proton_selection" "$proton_selected_version" >&2
+# The report captures both selection and observation. During ordinary runs an
+# unresolved UMU selection contributes no version information.
+if [[ $mode == --report || $proton_selected_version != unknown ]]; then
+    printf 'Proton selection (%s): %s\n' "$proton_selection" "$proton_selected_version" >&2
+fi
 
 if [[ $mode != --report ]]; then
     if [[ -z $stage ]]; then exec "${command[@]}"; fi

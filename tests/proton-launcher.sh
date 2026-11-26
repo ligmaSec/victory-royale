@@ -347,6 +347,9 @@ HOME="$work/empty home" PROTON_HEADER_FIXTURE="$work/umu-header" proton_report d
 grep -qx 'proton_selection=umu' "$work/delegated.build"
 grep -qx 'proton_selected_version=unknown' "$work/delegated.build"
 grep -qx 'proton_observed_version=1795031687 UMU-Proton-11.0-2e' "$work/delegated.build"
+PROTONPATH=GE-Proton bash "$launcher" --run --runtime proton "$work/game with spaces/title.exe" \
+    > "$work/ordinary.stdout" 2> "$work/ordinary.stderr"
+if grep -q 'Proton selection.*unknown' "$work/ordinary.stderr"; then exit 1; fi
 PROTONPATH=GE-Proton PROTON_HEADER_FIXTURE="$work/umu-header" proton_report alias
 grep -qx 'proton_selection=umu' "$work/alias.build"
 grep -qx 'proton_selected_version=unknown' "$work/alias.build"
