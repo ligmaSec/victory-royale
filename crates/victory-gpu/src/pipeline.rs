@@ -106,8 +106,27 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
+    /// Console group dimensions, including when host quads use a flattened group.
+    pub(crate) compute_threads: Option<[u32; 3]>,
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+}
+
+#[cfg(windows)]
+impl Translated {
+    fn from_native(
+        host: victory_shader::emit::HostShader,
+        native: victory_shader::NativeProgram,
+    ) -> Self {
+        Self {
+            compute_threads: match native.io {
+                victory_shader::native::StageIo::Cs(cs) => Some(cs.threads),
+                _ => None,
+            },
+            host,
+            used: native.used,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -120,6 +139,7 @@ impl Shader {
     ) -> Arc<Self> {
         let translated = OnceLock::new();
         let _ = translated.set(Some(Translated {
+            compute_threads: None,
             host: victory_shader::emit::HostShader {
                 stage: hw_stage,
                 dxil: Vec::new(),
@@ -159,12 +179,9 @@ impl Shader {
             stage: "compute",
             hash: blake3::hash(&host.dxil).to_hex()[..16].to_string(),
             container: Vec::new(),
-            translated: OnceLock::from(Some(Translated {
-                host,
-                used: native.used,
-            })),
             #[cfg(feature = "diagnostics")]
             wave64: OnceLock::from(native.wave64),
+            translated: OnceLock::from(Some(Translated::from_native(host, native))),
         })
     }
 
@@ -211,21 +228,18 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     let host = crate::shader_cache::host_shader(container)?;
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL) {
-        Some(part) => victory_shader::native_programs(part.data)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|p| {
-                matches!(
-                    p.stage,
-                    HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-                )
-            })
-            .map(|p| p.used)
-            .unwrap_or_default(),
-        None => Vec::new(),
-    };
-    Ok(Translated { host, used })
+    let dxil = c.part(FourCC::DXIL).ok_or("no DXIL part")?;
+    let native = victory_shader::native_programs(dxil.data)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|p| {
+            matches!(
+                p.stage,
+                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+            )
+        })
+        .ok_or("no translated shader stage")?;
+    Ok(Translated::from_native(host, native))
 }
 
 #[repr(C)]
@@ -840,6 +854,48 @@ mod tests {
 
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn flattened_compute_pipeline_schedules_console_groups() {
+        use victory_shader::{
+            HwStage, NativeProgram,
+            native::{ComputeIo, StageIo},
+        };
+
+        // Pair a real flattened host shader with the shape from the console
+        // container, as happens when loading an 8x8 translation from cache.
+        let io = |threads| StageIo::Cs(ComputeIo { rsrc2: 0, threads });
+        let mut native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 1,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: io([64, 1, 1]),
+            code: 0xbf81_0000u32.to_le_bytes().to_vec(), // s_endpgm
+        };
+        let mut shader = Arc::try_unwrap(Shader::test_compute(native.clone())).unwrap();
+        let flat = shader.translated.take().unwrap().unwrap().host;
+        assert_eq!(flat.compute_threads(), Some([64, 1, 1]));
+        native.io = io([8, 8, 1]);
+        let translated = Translated::from_native(flat, native);
+        assert_eq!(translated.compute_threads, Some([8, 8, 1]));
+        shader.translated = OnceLock::from(Some(translated));
+
+        if crate::host::host().is_some() {
+            let pipeline = host::HostPipeline::new(&[Arc::new(shader)], None, &[]).unwrap();
+            let size = pipeline.compute_threads.unwrap();
+            assert_eq!(
+                crate::list::thread_groups([8, 8, 1], size),
+                Some(([1, 1, 1], false))
+            );
+            assert_eq!(
+                crate::list::thread_groups([12, 8, 1], size),
+                Some(([2, 1, 1], true))
+            );
+        }
+    }
 
     #[test]
     fn slot67_result_names_parse() {
