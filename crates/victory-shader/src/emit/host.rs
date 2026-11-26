@@ -778,6 +778,7 @@ pub struct Draw<'a> {
 pub(super) enum TriangleDraw {
     Direct,
     TwoTriangles,
+    Strip,
     Indexed,
     IndirectIndexed,
 }
@@ -1026,7 +1027,11 @@ impl Host {
                 bottom: h as i32,
                 ..Default::default()
             }]);
-            list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            let topology = match command {
+                TriangleDraw::Strip => D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+                _ => D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+            };
+            list.IASetPrimitiveTopology(topology);
             if let Some(vb) = &vb {
                 list.IASetVertexBuffers(
                     0,
@@ -1086,10 +1091,10 @@ impl Host {
                 let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
                 list6.DispatchMesh(d.mesh_groups, 1, 1);
             } else {
-                let count = if matches!(command, TriangleDraw::TwoTriangles) {
-                    6
-                } else {
-                    3
+                let count = match command {
+                    TriangleDraw::TwoTriangles => 6,
+                    TriangleDraw::Strip => 4,
+                    _ => 3,
                 };
                 list.DrawInstanced(count, 1, 0, 0);
             }

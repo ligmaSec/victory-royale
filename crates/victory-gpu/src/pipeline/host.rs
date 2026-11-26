@@ -499,7 +499,11 @@ impl HostPipeline {
         let mut heaps = false;
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
-            heaps |= t.indexes_heaps();
+            let required = t.requirements();
+            if required.barycentrics && !host.barycentrics() {
+                return refuse("the host GPU has no pixel shader barycentrics", shaders);
+            }
+            heaps |= required.indexes_heaps;
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,

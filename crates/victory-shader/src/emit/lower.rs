@@ -93,6 +93,17 @@ enum Stop {
     Fail(ShaderError),
 }
 
+const DIRECT_BARYCENTRICS: Why = "barycentrics read directly";
+
+/// Require an optional host capability only if the normal lowering refuses
+/// a live use. Dead arithmetic stays usable with the original requirements.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LowerMode {
+    Normal,
+    NumericSelects,
+    Barycentrics,
+}
+
 const UNTRACKED_SELECT: Why = "a select on an untracked mask";
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -106,20 +117,23 @@ pub(crate) fn lower_with_waves<const PARTIAL: bool>(
     pixel_inputs: Option<&[SigElement]>,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<Lowered, ShaderError> {
-    match lower_program::<PARTIAL>(parts, false, waves, pixel_inputs, view_stride) {
+    let attempt = |mode| lower_program::<PARTIAL>(parts, mode, waves, pixel_inputs, view_stride);
+    match attempt(LowerMode::Normal) {
         Err(ShaderError::Unsupported {
             what: UNTRACKED_SELECT,
             ..
-        }) if parts.native.stage == HwStage::Cs => {
-            lower_program::<PARTIAL>(parts, true, waves, pixel_inputs, view_stride)
-        }
+        }) if parts.native.stage == HwStage::Cs => attempt(LowerMode::NumericSelects),
+        Err(ShaderError::Unsupported {
+            what: DIRECT_BARYCENTRICS,
+            ..
+        }) if parts.native.stage == HwStage::Ps => attempt(LowerMode::Barycentrics),
         result => result,
     }
 }
 
 fn lower_program<const PARTIAL: bool>(
     parts: &Parts,
-    numeric_selects: bool,
+    mode: LowerMode,
     waves: super::ComputeWaves,
     pixel_inputs: Option<&[SigElement]>,
     view_stride: Option<ViewStride<'_>>,
@@ -127,9 +141,7 @@ fn lower_program<const PARTIAL: bool>(
     let mut bad = HashMap::new();
     let mut waves = waves;
     loop {
-        match Lower::new(parts, &bad, numeric_selects, waves, view_stride)
-            .run::<PARTIAL>(pixel_inputs)
-        {
+        match Lower::new(parts, &bad, mode, waves, view_stride).run::<PARTIAL>(pixel_inputs) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -270,9 +282,7 @@ struct Lower<'a> {
     flat_quads: Option<[u32; 3]>,
     /// The entry block needs a group rendezvous after initialization and after its atomic max.
     sync_lds_max: bool,
-    /// Retry a compute shader with numeric selects only when the normal
-    /// translation needs one. Unused selects need no fixed wave size.
-    numeric_selects: bool,
+    mode: LowerMode,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -602,7 +612,7 @@ impl<'a> Lower<'a> {
     fn new(
         x: &'a Parts<'a>,
         bad: &'a HashMap<Value, Why>,
-        numeric_selects: bool,
+        mode: LowerMode,
         waves: super::ComputeWaves,
         view_stride: Option<ViewStride<'a>>,
     ) -> Self {
@@ -640,7 +650,7 @@ impl<'a> Lower<'a> {
                     || implicit_derivatives(n)
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
-                    || numeric_selects && numeric_select(x.st, i)
+                    || mode == LowerMode::NumericSelects && numeric_select(x.st, i)
             };
             // Masks held as numbers or constant lane sets: the lane
             // tests its own bit by its console lane.
@@ -690,7 +700,7 @@ impl<'a> Lower<'a> {
                 && threads == 64
                 && s.lds_dwords == 0
                 && !masks_held
-                && !numeric_selects
+                && mode != LowerMode::NumericSelects
                 && insts().any(|i| implicit_derivatives(i.name()))
                 && insts().all(|i| {
                     (!is_console_lane_op(i) || implicit_derivatives(i.name()))
@@ -703,7 +713,7 @@ impl<'a> Lower<'a> {
                 && threads == 64
                 && s.lds_dwords > 0
                 && !console_lanes
-                && !numeric_selects
+                && mode != LowerMode::NumericSelects
                 && entry_lds_max(x)
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
             if quad_samples_only {
@@ -804,7 +814,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             flat_quads,
             sync_lds_max,
-            numeric_selects,
+            mode,
             flat: None,
             no_barrier,
             fence_only_barrier,
@@ -1479,6 +1489,14 @@ impl<'a> Lower<'a> {
         for &(reg, v) in &self.x.p.inputs {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
+                // Most programs only interpolate with them: loaded on first
+                // use as a value (`get`).
+                Reg::V(_)
+                    if self.mode == LowerMode::Barycentrics
+                        && matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) =>
+                {
+                    continue;
+                }
                 Reg::S(n) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
                     // Above the SGPRs the hardware initializes, a register
@@ -1527,7 +1545,7 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
-            Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
+            Input::Barycentric { .. } => return Val::Missing(DIRECT_BARYCENTRICS),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -1713,7 +1731,99 @@ impl<'a> Lower<'a> {
             self.vals.insert(v, val);
             return Ok(val);
         }
+        if let Some(loaded) = self.lazy_barycentric(v) {
+            loaded?;
+            return Ok(self.vals[&v]);
+        }
         Err("a value defined after its use")
+    }
+
+    /// Loads `v` if it is a barycentric input VGPR not loaded yet (see
+    /// `inputs`): `None` if it is not one.
+    fn lazy_barycentric(&mut self, v: Value) -> Option<Result<(), Why>> {
+        if self.mode != LowerMode::Barycentrics {
+            return None;
+        }
+        let (kind, index) = self.x.io.inputs.iter().find_map(|&(w, i)| match i {
+            Input::Barycentric { kind, index } if w == v => Some((kind, index)),
+            _ => None,
+        })?;
+        let val = self.barycentric(kind, index);
+        self.vals.insert(v, val);
+        Some(match val {
+            Val::Missing(w) => Err(w),
+            _ => Ok(()),
+        })
+    }
+
+    /// Barycentric `index` (0 i, 1 j) of `kind` as a value: a channel of
+    /// `SV_Barycentrics` declared with the same interpolation mode.
+    ///
+    /// For a triangle with P0, P1 and P2 in primitive order, GFX10
+    /// interpolates P0 + i (P1 - P0) + j (P2 - P0). D3D numbers those
+    /// weights x, y and z, so I and J map to y and z.
+    fn barycentric(&mut self, kind: Barycentric, index: u8) -> Val {
+        let Some(mode) = interp_mode(kind) else {
+            return Val::Missing("pull-model barycentrics");
+        };
+        if index > 1 {
+            return Val::Missing("pull-model barycentrics");
+        }
+        // One element per interpolation mode (the console's own, if its
+        // signature declares one). DXIL allows two, one perspective and
+        // one linear: a second perspective (or linear) mode is refused,
+        // since its weights differ from the first's where the modes'
+        // sample points do (centroid weights stay inside the triangle,
+        // center ones need not), so reusing the declared element would
+        // be a silent wrong value.
+        let bary = |e: &SigElement| e.kind == 28;
+        let clash = self.s.inputs.iter().any(|e| {
+            bary(e) && e.usage != 0 && e.interp != mode && linear(e.interp) == linear(mode)
+        });
+        if clash {
+            return Val::Missing(if linear(mode) {
+                "barycentrics of two linear modes (SV_Barycentrics allows one)"
+            } else {
+                "barycentrics of two perspective modes (SV_Barycentrics allows one)"
+            });
+        }
+        let id = match self
+            .s
+            .inputs
+            .iter()
+            .position(|e| bary(e) && (e.interp == mode || e.usage == 0))
+        {
+            Some(id) => id,
+            None => {
+                let index = self.s.inputs.iter().filter(|e| bary(e)).count() as u32;
+                if index >= 2 {
+                    return Val::Missing("barycentrics of a third interpolation mode");
+                }
+                // A system value the validator wants unpacked (packing
+                // location -1), like other non-packed system values.
+                self.s.inputs.push(SigElement {
+                    name: "SV_Barycentrics".into(),
+                    index,
+                    kind: 28,
+                    comp: 9,
+                    interp: mode,
+                    row: None,
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        let e = &mut self.s.inputs[id];
+        if e.col != 0 || e.cols < 3 {
+            return Val::Missing("a console barycentrics element without i and j");
+        }
+        e.row = None;
+        e.interp = mode;
+        self.s.flags |= flags::BARYCENTRICS;
+        self.load_input(id, index + 1)
     }
 
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
@@ -2421,7 +2531,7 @@ impl<'a> Lower<'a> {
         if code == NULL {
             return Ok(self.s.m.bool(false));
         }
-        if !self.numeric_selects || !self.console_lanes {
+        if self.mode != LowerMode::NumericSelects || !self.console_lanes {
             return Err(UNTRACKED_SELECT);
         }
         // A scalar operation can define either dword independently. The SSA
@@ -7147,15 +7257,7 @@ impl<'a> Lower<'a> {
                 ..
             } => (
                 attribute,
-                match barycentric {
-                    Barycentric::PerspectiveCenter => 2,
-                    Barycentric::PerspectiveCentroid => 3,
-                    Barycentric::PerspectiveSample => 6,
-                    Barycentric::LinearCenter => 4,
-                    Barycentric::LinearCentroid => 5,
-                    Barycentric::LinearSample => 7,
-                    Barycentric::PerspectivePullModel => return Err("pull-model interpolation"),
-                },
+                interp_mode(*barycentric).ok_or("pull-model interpolation")?,
             ),
             // P0, the provoking vertex: a flat (nointerpolation) input.
             Interp::Vertex {
@@ -9183,6 +9285,9 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
+                if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
+                    let _ = self.lazy_barycentric(arg);
+                }
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
@@ -9412,6 +9517,25 @@ fn wave_lane(m: &mut Module, block: usize, lane: V, wave64: bool) -> V {
             m.bin(block, Bin::And, lane, mask)
         }
     }
+}
+
+/// Whether DXIL interpolation mode `mode` is a linear (noperspective) one.
+fn linear(mode: u8) -> bool {
+    matches!(mode, 4 | 5 | 7)
+}
+
+/// The DXIL interpolation mode of a kind of barycentrics (none for the
+/// pull model).
+fn interp_mode(kind: Barycentric) -> Option<u8> {
+    Some(match kind {
+        Barycentric::PerspectiveCenter => 2,
+        Barycentric::PerspectiveCentroid => 3,
+        Barycentric::PerspectiveSample => 6,
+        Barycentric::LinearCenter => 4,
+        Barycentric::LinearCentroid => 5,
+        Barycentric::LinearSample => 7,
+        Barycentric::PerspectivePullModel => return None,
+    })
 }
 
 #[cfg(test)]
