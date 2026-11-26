@@ -416,9 +416,9 @@ impl Module {
         }
         for inst in &mut self.insts {
             if let Op::Call(function, args) = &mut inst.op
-                && self.funcs[*function as usize]
-                    .name
-                    .starts_with("dx.op.loadInput.")
+                && let name = &self.funcs[*function as usize].name
+                && (name.starts_with("dx.op.loadInput.")
+                    || name.starts_with("dx.op.attributeAtVertex."))
                 && let Some(&id) = ids.get(&args[1])
             {
                 args[1] = id;

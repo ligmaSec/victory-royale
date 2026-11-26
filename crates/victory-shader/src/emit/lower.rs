@@ -102,6 +102,7 @@ enum LowerMode {
     Normal,
     NumericSelects,
     Barycentrics,
+    LiveInterpolation,
 }
 
 const UNTRACKED_SELECT: Why = "a select on an untracked mask";
@@ -118,7 +119,7 @@ pub(crate) fn lower_with_waves<const PARTIAL: bool>(
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<Lowered, ShaderError> {
     let attempt = |mode| lower_program::<PARTIAL>(parts, mode, waves, pixel_inputs, view_stride);
-    match attempt(LowerMode::Normal) {
+    let result = match attempt(LowerMode::Normal) {
         Err(ShaderError::Unsupported {
             what: UNTRACKED_SELECT,
             ..
@@ -127,6 +128,13 @@ pub(crate) fn lower_with_waves<const PARTIAL: bool>(
             what: DIRECT_BARYCENTRICS,
             ..
         }) if parts.native.stage == HwStage::Ps => attempt(LowerMode::Barycentrics),
+        result => result,
+    };
+    match result {
+        Err(ShaderError::Unsupported {
+            what: "the first half of an interpolation",
+            ..
+        }) if parts.native.stage == HwStage::Ps => attempt(LowerMode::LiveInterpolation),
         result => result,
     }
 }
@@ -1492,8 +1500,10 @@ impl<'a> Lower<'a> {
                 // Most programs only interpolate with them: loaded on first
                 // use as a value (`get`).
                 Reg::V(_)
-                    if self.mode == LowerMode::Barycentrics
-                        && matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) =>
+                    if matches!(
+                        self.mode,
+                        LowerMode::Barycentrics | LowerMode::LiveInterpolation
+                    ) && matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) =>
                 {
                     continue;
                 }
@@ -1741,7 +1751,10 @@ impl<'a> Lower<'a> {
     /// Loads `v` if it is a barycentric input VGPR not loaded yet (see
     /// `inputs`): `None` if it is not one.
     fn lazy_barycentric(&mut self, v: Value) -> Option<Result<(), Why>> {
-        if self.mode != LowerMode::Barycentrics {
+        if !matches!(
+            self.mode,
+            LowerMode::Barycentrics | LowerMode::LiveInterpolation
+        ) {
             return None;
         }
         let (kind, index) = self.x.io.inputs.iter().find_map(|&(w, i)| match i {
@@ -7226,7 +7239,161 @@ impl<'a> Lower<'a> {
         }
     }
 
+    fn write_interp_half(&mut self, inst: &Inst, mut f: V) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!("v_interp_*_f16 is VOP3")
+        };
+        let (omod, clamp) = (v.omod, v.clamp);
+        match omod {
+            0 => {}
+            k => {
+                let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(k)];
+                let c = self.s.m.f32(factor.to_bits());
+                f = self.s.m.bin(self.cur, Bin::Mul, f, c);
+            }
+        }
+        if clamp {
+            f = self.unary(7, f);
+        }
+        let h16 = self.f16_nearest(f);
+        self.write_half(inst, h16, None)
+    }
+
+    /// A partial interpolation can be observed before the second half.
+    /// Read the vertices and use the instruction's actual weight and accumulator.
+    fn live_interp(&mut self, inst: &Inst) -> Result<(), Why> {
+        let first = inst.name().starts_with("v_interp_p1");
+        let half = inst.name().ends_with("_f16");
+        let (dst, attr, weight, acc) = match &inst.fields {
+            Fields::Vintrp { dst, src, attr } => (*dst, *attr, *src, Some(*dst)),
+            Fields::Valu(v)
+                if v.abs == 0 && v.neg == 0 && (!first || (v.omod == 0 && !v.clamp)) =>
+            {
+                (
+                    v.dst.ok_or("an interpolation destination")?,
+                    v.src[0],
+                    v.src[1],
+                    v.src.get(2).copied(),
+                )
+            }
+            _ => return Err("interpolation operand modifiers"),
+        };
+        let Operand::Vector { reg, .. } = dst else {
+            return Err("an interpolation destination");
+        };
+        let StageIo::Ps { inputs, .. } = &self.x.native.io else {
+            return Err("a non-pixel interpolation");
+        };
+        let Operand::Attr { index, chan, high } = attr else {
+            return Err("an interpolation attribute");
+        };
+        let input = inputs
+            .iter()
+            .find(|input| input.attr == index)
+            .ok_or("an interpolation attribute")?;
+        if input.fp16 != half {
+            return Err("an interpolation of a different input precision");
+        }
+        let ch = if half {
+            let h = chan * 2 + u8::from(high);
+            if input.pack2 {
+                packed_half(
+                    &self.s.inputs,
+                    input.row,
+                    (input.row2 != input.row).then_some(input.row2),
+                    h,
+                )
+            } else {
+                h.is_multiple_of(2).then_some((input.row, h / 2))
+            }
+        } else {
+            Some((input.row, chan))
+        };
+        let weight = self.operand(inst, &weight)?;
+        let weight = self.as_float(weight);
+        let (base, delta) =
+            if let Some((id, col)) = ch.and_then(|(row, ch)| self.find_input(row, ch)) {
+                let el = &mut self.s.inputs[id];
+                if el.comp != 9 || (el.usage != 0 && el.interp != 1) {
+                    return Err("a per-vertex interpolation input");
+                }
+                el.interp = 1;
+                let v0 = self.vertex_input(id, col, 0);
+                let vk = self.vertex_input(id, col, if first { 1 } else { 2 });
+                let delta = self.s.m.bin(self.cur, Bin::Sub, vk, v0);
+                // The f16 opcodes multiply by a half-precision P10 or P20
+                // from parameter memory. P1LL still returns a full f32.
+                let coefficient = |l: &mut Self, f| {
+                    let bits = l.f16_nearest(f);
+                    l.s.op(
+                        l.cur,
+                        "legacyF16ToF32",
+                        Attr::ReadNone,
+                        l.s.t.f32,
+                        131,
+                        &[bits],
+                    )
+                };
+                if half {
+                    let base = if first { coefficient(self, v0) } else { v0 };
+                    (base, coefficient(self, delta))
+                } else {
+                    (v0, delta)
+                }
+            } else if half
+                && self
+                    .s
+                    .inputs
+                    .iter()
+                    .any(|e| e.row == Some(u32::from(input.row)))
+            {
+                // The packed input can leave a half unwritten.
+                let z = self.s.m.f32(0);
+                (z, z)
+            } else {
+                return Err("an input the signature lacks");
+            };
+        let base = if first {
+            base
+        } else {
+            let acc = self.operand(inst, &acc.ok_or("an interpolation accumulator")?)?;
+            self.as_float(acc)
+        };
+        let x = self.fmad(weight, delta, base);
+        if half && !first {
+            return self.write_interp_half(inst, x);
+        }
+        let x = self.as_int(x);
+        self.write(inst, Reg::V(reg), x, None);
+        Ok(())
+    }
+
+    /// One float channel of a triangle vertex in primitive order.
+    fn vertex_input(&mut self, id: usize, col: u8, k: u8) -> V {
+        self.s.inputs[id].usage |= 1 << col;
+        self.s.flags |= flags::BARYCENTRICS;
+        let args = [
+            self.s.m.i32(id as u32),
+            self.s.m.i32(0),
+            self.s.m.i8(col),
+            self.s.m.i8(k),
+        ];
+        self.s.op(
+            self.s.entry,
+            "attributeAtVertex.f32",
+            Attr::ReadNone,
+            self.s.t.f32,
+            137,
+            &args,
+        )
+    }
+
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
+        if self.mode == LowerMode::LiveInterpolation
+            && (inst.name().starts_with("v_interp_p1") || inst.name().starts_with("v_interp_p2"))
+        {
+            return self.live_interp(inst);
+        }
         let Some(&interp) = self.interps.get(&site) else {
             if inst.name().starts_with("v_interp_p1") {
                 let dst = match &inst.fields {
@@ -7338,30 +7505,14 @@ impl<'a> Lower<'a> {
                             .is_multiple_of(2)
                             .then_some((attribute.row, half_idx / 2))
                     };
-                    let mut f = match src.and_then(|(row, ch)| self.find_input(row, ch)) {
+                    let f = match src.and_then(|(row, ch)| self.find_input(row, ch)) {
                         Some((id, col)) => {
                             let x = channel(self, id, col)?;
                             self.as_float(x)
                         }
                         None => self.s.m.f32(0),
                     };
-                    let Fields::Valu(v) = &inst.fields else {
-                        unreachable!("v_interp_*_f16 is VOP3")
-                    };
-                    let (omod, clamp) = (v.omod, v.clamp);
-                    match omod {
-                        0 => {}
-                        k => {
-                            let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(k)];
-                            let c = self.s.m.f32(factor.to_bits());
-                            f = self.s.m.bin(self.cur, Bin::Mul, f, c);
-                        }
-                    }
-                    if clamp {
-                        f = self.unary(7, f);
-                    }
-                    let h16 = self.f16_nearest(f);
-                    return self.write_half(inst, h16, None);
+                    return self.write_interp_half(inst, f);
                 } else if mode == 1 {
                     // The whole dword of a flat input: both halves.
                     let lo = half(self, h)?;
