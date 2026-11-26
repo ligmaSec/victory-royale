@@ -16,7 +16,9 @@ Copy .victoryconfig.example to .victoryconfig beside the runner or at the checko
 root. Set game_dir or title once. A copy in your home folder applies across kits.
 The example also covers Proton, Wine prefix, save, report folder and timing.
 Use --config FILE to select a specific setup. Without game_dir or title, select
-your game's .exe when prompted. Before each launch, read WHAT TO DO.
+your game's .exe once if discovery cannot locate it. The runner checks
+VICTORY_GAME_DIR, earlier file selections, the standard install in ~/games
+or ~/Games and, on Linux, launch commands from recent local Proton reports. Before each launch, read WHAT TO DO.
 Automatic scenarios close each build once its milestone and observation period
 are complete. Follow the input instructions and leave the game open. A timeout
 or early exit is recorded separately. For manual scenarios, close as instructed.

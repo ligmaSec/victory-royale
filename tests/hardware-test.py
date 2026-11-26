@@ -55,6 +55,20 @@ class SaveLocations(unittest.TestCase):
 
 
 class PathRecovery(unittest.TestCase):
+    def test_remember_selection_across_kits(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            title = root / "select once.exe"
+            title.touch()
+            record = root / "private" / "title.json"
+            with mock.patch.object(runner.session, "title_record", return_value=record), \
+                    mock.patch.object(Path, "home", return_value=root), \
+                    mock.patch.dict(os.environ, {"VICTORY_GAME_DIR": "", "XDG_DATA_HOME": str(root)}):
+                runner.session.remember_title(title)
+                self.assertEqual(runner.session.discover_title(), title)
+                title.unlink()
+                self.assertIsNone(runner.session.discover_title())
+
     def test_recover_only_a_live_title_from_a_victory_run(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -3,6 +3,7 @@ import ast
 import configparser
 import gzip
 import io
+import json
 from pathlib import Path
 import os
 import re
@@ -10,6 +11,7 @@ import shutil
 import signal
 import subprocess
 import tarfile
+import tempfile
 import time
 
 MARKERS = {
@@ -105,11 +107,41 @@ def previous_title():
     return None
 
 
+def title_record():
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local")
+    else:
+        base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+        if not base.is_absolute():
+            base = Path.home() / ".local/state"
+    return base / "victory" / "hardware-test-title.json"
+
+
+def remember_title(title):
+    record = title_record()
+    record.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=record.parent, delete=False) as stream:
+        temp = Path(stream.name)
+        try:
+            json.dump(str(title), stream)
+            stream.close()
+            os.replace(temp, record)
+        finally:
+            temp.unlink(missing_ok=True)
+
+
 def discover_title():
     name = "game_scarlett_master.exe"
     configured = os.environ.get("VICTORY_GAME_DIR")
     if configured:
         return Path(configured).expanduser() / name
+    try:
+        with title_record().open(encoding="utf-8") as stream:
+            previous = Path(json.loads(stream.read(32768)))
+        if previous.is_absolute() and previous.suffix.lower() == ".exe" and previous.is_file():
+            return previous
+    except (OSError, TypeError, ValueError):
+        pass
     for games in ("games", "Games"):
         candidate = Path.home() / games / "GTA6.Xbox.v1.0.2.1" / name
         if candidate.is_file():

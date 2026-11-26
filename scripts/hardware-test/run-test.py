@@ -1015,11 +1015,18 @@ def run_request(manifest, options):
     for binary in ([] if windows else ["bash", "umu-run"]):
         if not shutil.which(binary, path=session.launch_path(options.settings)):
             raise ValueError(f"Missing {binary}. See the requirements in README.txt.")
-    title = (options.title or session.discover_title() or choose_title()).expanduser().resolve()
+    title = options.title or session.discover_title()
+    selected = title is None
+    title = (choose_title() if selected else title).expanduser().resolve()
     if title.parent.is_relative_to(source):
         raise ValueError("Select a game executable outside the source save folder.")
     if not title.is_file() or title.suffix.lower() != ".exe":
         raise ValueError("Select the game's .exe file.")
+    if selected:
+        try:
+            session.remember_title(title)
+        except OSError:
+            print("Could not remember the selected title for future runs.", file=sys.stderr)
     prefix = os.environ.get("WINEPREFIX") or options.settings.get("wine_prefix")
     if not windows and prefix:
         prefix = Path(prefix).expanduser().resolve()

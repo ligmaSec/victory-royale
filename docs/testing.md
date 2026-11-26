@@ -75,7 +75,7 @@ To remember your paths, copy `.victoryconfig.example` to `.victoryconfig` in the
 or beside the extracted runner. For one setup across kits, put the copy in your home directory.
 Set `game_dir` to your dump directory, or `title` to a specific executable. You can also set
 `save_dir`, `output_dir`, and on Linux `proton_dir`, `wine_prefix`, and `umu_dir` (the folder containing `umu-run`). Relative paths start at the
-config file. The runner checks the checkout or kit before your home. `--config FILE` selects a
+config file. The runner checks the kit, current checkout and home directory in order. `--config FILE` selects a
 specific file. Explicit CLI paths override the file. Existing `PROTONPATH` and `WINEPREFIX`
 environment variables override their config entries. Keep the local config on your machine.
 
@@ -92,7 +92,7 @@ in your config. A published automatic scenario takes precedence over local timin
 
 Gameplay comparisons start from the standard `7952987A` save. Place your local
 copy in `saves/7952987A/` at the checkout root, or beside an extracted runner
-in the same layout. It contains `saves/` with your progress and may also contain
+in the same layout. The runner also checks `~/games/saves/7952987A`. It contains `saves/` with your progress and may also contain
 `storage/` with settings. To keep the checkout empty, pass
 `--save-dir "/path/to/7952987A"`. Each build starts with its own temporary copy
 of the same progress and settings. The runner warns if the save is missing.
@@ -103,7 +103,9 @@ shown in the menu, or press Enter to cancel. If a request includes a number, you
 can append it directly to the checkout command. Add `--plan` to preview the scenario
 and build revisions. An extracted kit includes both builds and needs no GitHub login.
 
-1. Select your game's `.exe` when prompted. The runner checks both packages and starts
+1. Without a configured path the runner checks `VICTORY_GAME_DIR`, your last file selection,
+   and the standard install under `~/games` or `~/Games`. On Linux it also checks the launch
+   command in recent local Proton reports. Select the executable once if discovery finds no match. The runner checks both packages and starts
    **main** first. Follow **WHAT TO DO** above the launch. For a manual scenario, close the game at the specified point.
 2. The **candidate** opens next. Repeat the same steps with the same settings and window
    size. The runner gives each build its own fresh translation cache.
