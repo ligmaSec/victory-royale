@@ -82,6 +82,8 @@ def import_lib(name, exports):
 
 import_lib("kernel32", [
     "GetCurrentProcessId",
+    "GetCurrentProcess",
+    "K32GetProcessMemoryInfo",
     "GetCurrentThreadId",
     "CreateThread",
     "WaitForSingleObject",
@@ -116,6 +118,16 @@ typedef void *HANDLE;
 #define IMPORT __declspec(dllimport)
 
 IMPORT DWORD GetCurrentProcessId(void);
+#ifdef CASE_WORKING_SET
+// PROCESS_MEMORY_COUNTERS, Windows x64.
+typedef struct {
+    DWORD cb, page_faults;
+    U64 peak_working_set, working_set;
+    U64 peak_paged, paged, peak_nonpaged, nonpaged, pagefile, peak_pagefile;
+} MemoryCounters;
+IMPORT HANDLE GetCurrentProcess(void);
+IMPORT int K32GetProcessMemoryInfo(HANDLE, MemoryCounters *, DWORD);
+#endif
 IMPORT DWORD GetCurrentThreadId(void);
 
 IMPORT HANDLE CreateThread(
@@ -415,6 +427,14 @@ U32 probe_entry(void *unused) {
     return test_thread();
 #endif
 
+#ifdef CASE_WORKING_SET
+    MemoryCounters counters;
+    counters.cb = sizeof(counters);
+    if (!K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters)))
+        return 0;
+    return (U32)(counters.working_set / 1024);
+#endif
+
 #ifdef CASE_MEMORY
     return test_memory();
 #endif
@@ -537,6 +557,7 @@ cases = {
     "tls": ["CASE_TLS"],
     "static-tls": ["CASE_TLS", "STATIC_TLS"],
     "memory": ["CASE_MEMORY"],
+    "working-set": ["CASE_WORKING_SET"],
     "files": ["CASE_FILES"],
     "dll": ["CASE_DLL"],
     "late-dll": ["CASE_LATE"],
@@ -837,6 +858,35 @@ loader(
     "missing",
     extra=("--unimplemented", "zero")
 )
+
+# Overlay bytes after the PE's last section do not enlarge its mapped image.
+# The same guest should use similar memory at entry with either input length.
+def check_image_lifetime():
+    case = "working-set"
+    if case not in built:
+        record("loader-image-lifetime", "BLOCKED", "fixture not built")
+        return
+    exe = title / "working-set.exe"
+    sizes = []
+    for label in ("small", "padded"):
+        if label == "padded":
+            with exe.open("ab") as f:
+                f.truncate(exe.stat().st_size + 64 * 1024 * 1024)
+        name = "loader-working-set-" + label
+        run = invoke(name, [winpath(victory), "run", winpath(exe), "--execute"])
+        if run is None:
+            return
+        process, output = run
+        measured = re.search(r"^title exited with (\d+)\s*$", output, re.MULTILINE)
+        if process.returncode or not measured or int(measured[1]) < 1024:
+            record(name, "FAIL", "guest did not report a working set in KiB")
+            return
+        sizes.append(int(measured[1]))
+    # One retained input costs 64 MiB, two cost 128 MiB. Allow 32 MiB of host noise.
+    record("loader-image-lifetime", "PASS" if sizes[1] - sizes[0] < 32 * 1024 else "FAIL",
+           f"guest entry with small/padded PE: {sizes[0]}/{sizes[1]} KiB")
+
+check_image_lifetime()
 
 print("\n=== NEGATIVE CONTROL ===")
 

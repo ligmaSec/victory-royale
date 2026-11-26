@@ -1,8 +1,6 @@
 //! Turns a title's image into something the Windows loader maps but does
 //! not run. Pure byte manipulation, so it is testable on any host.
 
-use std::borrow::Cow;
-
 use victory_pe::layout::{self, dir, dll_flags, file_flags};
 use victory_pe::{ImageInfo, PeError};
 
@@ -45,19 +43,8 @@ impl PreparedImage {
 ///   survives a rebase;
 /// * `FORCE_INTEGRITY` cleared, checksum zeroed: the copy is unsigned.
 pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
-    prepare_image(Cow::Borrowed(original))
-}
-
-/// Prepares a file we own in its existing allocation. The identity and
-/// metadata still describe the original file, before its headers change.
-pub fn prepare_owned(original: Vec<u8>) -> Result<PreparedImage, PrepareError> {
-    prepare_image(Cow::Owned(original))
-}
-
-fn prepare_image(original: Cow<'_, [u8]>) -> Result<PreparedImage, PrepareError> {
-    let info = ImageInfo::parse(&original)?;
-    let original_hash = blake3::hash(&original);
-    let mut bytes = original.into_owned();
+    let info = ImageInfo::parse(original)?;
+    let mut bytes = original.to_vec();
 
     let fh = layout::file_header_offset(&bytes).ok_or(PrepareError::Patch("no file header"))?;
     let opt =
@@ -144,7 +131,7 @@ fn prepare_image(original: Cow<'_, [u8]>) -> Result<PreparedImage, PrepareError>
     Ok(PreparedImage {
         info,
         bytes,
-        original_hash,
+        original_hash: blake3::hash(original),
     })
 }
 

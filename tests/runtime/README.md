@@ -36,6 +36,7 @@ are never intended for inclusion in the repository.
 - Thread creation, events, waits and thread exit codes.
 - TLS process/thread callbacks and static thread-local storage.
 - Virtual memory allocation and release.
+- Process working set at guest entry with and without 64 MiB of unmapped PE padding.
 - Reads through the virtual G: title drive.
 - Imported and dynamically loaded title DLLs.
 - Missing import reporting and zero-return stub behavior.
