@@ -17,6 +17,10 @@
 //! parallel. Stores also hold `SERIALISING` shared and a save holds it
 //! exclusively, so the size cannot change between `GetSerializedSize` and
 //! `Serialize`; loads never touch it, so a save never blocks them.
+//! Across processes, each cache file has a sibling `.lock` file. A writer
+//! holds its exclusive handle only while replacing the destination. Periodic
+//! saves wait up to 250 ms per file. The final save can wait two seconds per
+//! file because shutdown has no later opportunity to publish the compiled work.
 
 use std::collections::HashSet;
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
@@ -73,6 +77,8 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
+const PERIODIC_LOCK_WAIT: Duration = Duration::from_millis(250);
+const FINAL_LOCK_WAIT: Duration = Duration::from_secs(2);
 
 fn device_adapter(device: &ID3D12Device) -> Option<DXGI_ADAPTER_DESC1> {
     // SAFETY: these calls query the live device and DXGI adapter metadata.
@@ -115,10 +121,21 @@ fn read_cache(root: &Path, adapter: &Path) -> Vec<u8> {
     }
 }
 
-fn write_cache(root: &Path, adapter: &Path, blob: &[u8], early: &[u8]) -> std::io::Result<()> {
+fn write_cache(
+    root: &Path,
+    adapter: &Path,
+    blob: &[u8],
+    early: &[u8],
+    final_save: bool,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(adapter)?;
-    write_atomically(&adapter.join(LIBRARY_FILE), blob)?;
-    write_atomically(&root.join(EARLY_FILE), early)
+    let wait = if final_save {
+        FINAL_LOCK_WAIT
+    } else {
+        PERIODIC_LOCK_WAIT
+    };
+    write_atomically(&adapter.join(LIBRARY_FILE), blob, wait)?;
+    write_atomically(&root.join(EARLY_FILE), early, wait)
 }
 
 fn library() -> Option<&'static Library> {
@@ -368,7 +385,7 @@ pub(crate) fn save(now: bool) {
         .flatten()
         .cloned()
         .collect();
-    let written = write_cache(dir, &cache_dir(dir), &blob, used.join("\n").as_bytes());
+    let written = write_cache(dir, &cache_dir(dir), &blob, used.join("\n").as_bytes(), now);
     match written {
         Ok(()) => {
             // Keep pipelines stored while the files were being written; only
@@ -398,7 +415,7 @@ pub(crate) fn save(now: bool) {
 
 /// Take turns replacing the cache entry across processes. Proton can deny a
 /// concurrent rename even when every writer has its own staging file.
-fn publish_cache_file(tmp: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+fn publish_cache_file(tmp: &Path, path: &Path, wait: Duration) -> std::io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows::Win32::Foundation::ERROR_SHARING_VIOLATION;
 
@@ -415,7 +432,7 @@ fn publish_cache_file(tmp: &std::path::Path, path: &std::path::Path) -> std::io:
             Ok(_exclusive_handle) => return std::fs::rename(tmp, path),
             Err(e)
                 if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION.0 as i32)
-                    && started.elapsed() < Duration::from_millis(250) =>
+                    && started.elapsed() < wait =>
             {
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -427,7 +444,7 @@ fn publish_cache_file(tmp: &std::path::Path, path: &std::path::Path) -> std::io:
 /// Writes `bytes` to a unique temporary file beside `path`, then renames it
 /// over `path`: a reader never sees a part, and overlapping saves do not
 /// share a temporary file.
-fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_atomically(path: &Path, bytes: &[u8], wait: Duration) -> std::io::Result<()> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let extension = format!(
         "tmp-{}-{}",
@@ -435,7 +452,7 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
         NEXT.fetch_add(1, Ordering::Relaxed)
     );
     let tmp = path.with_extension(extension);
-    let written = std::fs::write(&tmp, bytes).and_then(|()| publish_cache_file(&tmp, path));
+    let written = std::fs::write(&tmp, bytes).and_then(|()| publish_cache_file(&tmp, path, wait));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -519,7 +536,7 @@ mod tests {
             (&intel, b"gpu B"),
             (&warp, b"software"),
         ] {
-            write_cache(root, dir, blob, b"shared draw keys").unwrap();
+            write_cache(root, dir, blob, b"shared draw keys", false).unwrap();
         }
         assert_eq!(read_cache(root, &nvidia), b"gpu A");
         assert_eq!(read_cache(root, &intel), b"gpu B");
@@ -675,7 +692,7 @@ mod tests {
                 start.wait();
                 let byte = thread as u8 + 1;
                 for _ in 0..32 {
-                    write_atomically(&path, &[byte; 64 * 1024]).unwrap();
+                    write_atomically(&path, &[byte; 64 * 1024], PERIODIC_LOCK_WAIT).unwrap();
                 }
             }));
         }
@@ -696,24 +713,59 @@ mod tests {
     }
 
     #[test]
+    fn a_writer_publishes_after_a_competing_cache_save_finishes() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        for (final_save, hold) in [(false, 20), (true, 500)] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let adapter = root.join("adapter");
+            std::fs::create_dir(&adapter).unwrap();
+            let lock = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .share_mode(0)
+                .open(adapter.join(LIBRARY_FILE).with_extension("lock"))
+                .unwrap();
+
+            std::thread::scope(|scope| {
+                let writer =
+                    scope.spawn(|| write_cache(root, &adapter, b"compiled", b"draws", final_save));
+                // The sibling staging file appears before the first lock attempt.
+                while !writer.is_finished() && std::fs::read_dir(&adapter).unwrap().count() == 1 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(Duration::from_millis(hold));
+                drop(lock);
+                writer.join().unwrap().unwrap();
+            });
+            assert_eq!(
+                std::fs::read(adapter.join(LIBRARY_FILE)).unwrap(),
+                b"compiled"
+            );
+            assert_eq!(std::fs::read(root.join(EARLY_FILE)).unwrap(), b"draws");
+        }
+    }
+
+    #[test]
     fn a_busy_publisher_leaves_the_previous_cache_for_the_next_save() {
         use std::os::windows::fs::OpenOptionsExt;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LIBRARY_FILE);
-        write_atomically(&path, b"previous").unwrap();
+        write_atomically(&path, b"previous", PERIODIC_LOCK_WAIT).unwrap();
         let other = std::fs::OpenOptions::new()
             .write(true)
             .share_mode(0)
             .open(path.with_extension("lock"))
             .unwrap();
 
-        assert!(write_atomically(&path, b"busy").is_err());
+        assert!(write_atomically(&path, b"busy", PERIODIC_LOCK_WAIT).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"previous");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
         drop(other);
 
-        write_atomically(&path, b"next").unwrap();
+        write_atomically(&path, b"next", PERIODIC_LOCK_WAIT).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"next");
     }
 
@@ -723,7 +775,7 @@ mod tests {
         let path = dir.path().join(LIBRARY_FILE);
         std::fs::create_dir(&path).unwrap();
 
-        assert!(write_atomically(&path, b"not published").is_err());
+        assert!(write_atomically(&path, b"not published", PERIODIC_LOCK_WAIT).is_err());
         assert!(
             !std::fs::read_dir(dir.path())
                 .unwrap()
