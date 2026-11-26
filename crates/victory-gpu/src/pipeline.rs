@@ -312,6 +312,28 @@ pub(crate) fn builder_quarantined(this: This) -> bool {
         })
 }
 
+/// The largest title buffer a builder stage's root-UAV writes are copied
+/// back from: room for sizes and counters, less than any structure (each
+/// is more than 64 KiB, `memory.rs`).
+#[cfg(any(windows, test))]
+const BUILDER_RESULT_BYTES: u64 = 64 << 10;
+
+/// Of `len` bytes a builder stage may write through a root UAV into a host
+/// copy, how many go back to title memory once its list has run. All of
+/// them in a small title buffer: the sizes and counters the title reads.
+/// None in a window of plain memory (`window`), where the structures lie
+/// between the title's own objects, and none in a title buffer bigger than
+/// [`BUILDER_RESULT_BYTES`]: structure bytes stay in the host copies, which
+/// the programs that walk them read. Copying them back ended in a null
+/// read in the title's image DLL.
+#[cfg(any(windows, test))]
+pub(crate) fn builder_copy_back(window: bool, buffer_len: u64, len: u64) -> u64 {
+    if window || buffer_len > BUILDER_RESULT_BYTES {
+        return 0;
+    }
+    len.min(buffer_len)
+}
+
 /// Whether the structure builder may run at all (`VICTORY_BVH_BUILDER=1`).
 #[cfg(windows)]
 fn builder_allowed() -> bool {
@@ -812,6 +834,50 @@ mod tests {
         assert!(super::quarantine_writes(Some(OsStr::new("1"))));
         assert!(super::quarantine_writes(Some(OsStr::new(""))));
         assert!(!super::quarantine_writes(Some(OsStr::new("0"))));
+    }
+
+    /// Title memory with a structure in plain memory, a big buffer and a
+    /// small counter buffer: the builder writes all three in its host
+    /// copies, and only the counters reach title memory.
+    #[test]
+    fn builder_copies_back_counters_but_never_structure_bytes() {
+        use super::builder_copy_back;
+        // (start, length, window) of each copy, in one title address space.
+        let copies = [
+            (0x0000, 4 << 20, true),
+            (0x40_0000, 1 << 20, false),
+            (0x50_0000, 0x100, false),
+        ];
+        let size = 0x50_0100;
+        let mut title = vec![0u8; size];
+        let mut host = vec![0u8; size];
+        // The stage's root UAVs and the bytes it stores there.
+        let roots = [
+            (0x1000u64, 0x8000u64),
+            (0x40_0040, 0x1000),
+            (0x50_0008, 0x10),
+        ];
+        for &(at, len) in &roots {
+            host[at as usize..(at + len) as usize].fill(0xab);
+        }
+        for &(at, len) in &roots {
+            let &(start, buffer, window) = copies
+                .iter()
+                .find(|c| (c.0..c.0 + c.1).contains(&at))
+                .expect("a root in a copy");
+            let left = start + buffer - at;
+            let back = builder_copy_back(window, buffer, len.min(left));
+            let (from, to) = (at as usize, (at + back) as usize);
+            title[from..to].copy_from_slice(&host[from..to]);
+        }
+        assert!(
+            title[..0x50_0000].iter().all(|&b| b == 0),
+            "structure bytes copied"
+        );
+        assert!(title[0x50_0008..0x50_0018].iter().all(|&b| b == 0xab));
+        assert_eq!(title.iter().filter(|&&b| b != 0).count(), 0x10);
+        assert_eq!(builder_copy_back(false, 64 << 10, 1 << 20), 64 << 10);
+        assert_eq!(builder_copy_back(false, (64 << 10) + 1, 4), 0);
     }
 
     #[cfg(all(windows, feature = "diagnostics"))]

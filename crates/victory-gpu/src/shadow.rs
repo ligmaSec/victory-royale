@@ -1977,6 +1977,12 @@ impl Shadow {
         (self.start + self.len).saturating_sub(address)
     }
 
+    /// Whether the copy is of a window of title memory outside buffers
+    /// rather than of a title buffer.
+    pub(crate) fn is_window(&self) -> bool {
+        self.window
+    }
+
     /// Whether the memory behind the copy turned out not to be write-watched:
     /// every refresh then copies its whole range.
     pub(crate) fn unwatched(&self) -> bool {

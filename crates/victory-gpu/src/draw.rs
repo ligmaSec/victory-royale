@@ -1114,16 +1114,16 @@ impl State {
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
             let pipeline = self.pipeline as This;
+            let builder = crate::pipeline::is_builder(pipeline);
             let publish = !crate::pipeline::builder_quarantined(pipeline);
             let writes = publish && (t.stores || !write_skip());
             // The builder's structure bytes stay in the host copies: the
             // programs that walk them read those copies. Only its small
-            // root-UAV results (sizes, counters) go back to title memory.
-            // Copying the raw guest ranges back lands structure data on the
-            // title's neighbours and ends in a null read in its image DLL.
-            let raw_writes = publish
-                && !crate::pipeline::is_builder(pipeline)
-                && (t.host.writes_guest_memory || !write_skip());
+            // root-UAV results (sizes, counters) go back to title memory
+            // (`crate::pipeline::builder_copy_back`). Copying the raw guest
+            // ranges back lands structure data on the title's neighbours
+            // and ends in a null read in its image DLL.
+            let raw_writes = publish && !builder && (t.host.writes_guest_memory || !write_skip());
             // Title memory by address: what the shader finds it by.
             let memory = if t
                 .host
@@ -1277,7 +1277,7 @@ impl State {
                 // in the same list.
                 let writes_slot =
                     writes && (!write_skip() || t.host.written_root_uavs.contains(&slot));
-                if !self.root_uav(list, address, param, compute, writes_slot) {
+                if !self.root_uav(list, address, param, compute, writes_slot, builder) {
                     return false;
                 }
             }
@@ -1294,8 +1294,9 @@ impl State {
     /// address not on 16 bytes), or as a root descriptor with
     /// `VICTORY_ROOT_SRV_DIRECT=1` (the dispatch is dropped then if there
     /// is nothing to bind). With `writes`, what the shader stored is copied
-    /// back into title memory when the list has run. False if the draw
-    /// must be dropped.
+    /// back into title memory when the list has run; for a `builder`
+    /// stage only what [`crate::pipeline::builder_copy_back`] allows.
+    /// False if the draw must be dropped.
     /// shortcut: a root view has no size: the view, the refresh and the
     /// copy back cover all that is left of the title's buffer
     /// (`VICTORY_ROOT_UAV_MB` sets a limit for all three).
@@ -1306,6 +1307,7 @@ impl State {
         param: u32,
         compute: bool,
         writes: bool,
+        builder: bool,
     ) -> bool {
         const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
         static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1328,8 +1330,13 @@ impl State {
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
-            if writes {
-                s.gpu_writes(list, a, len);
+            let back = if builder {
+                crate::pipeline::builder_copy_back(s.is_window(), s.span().1, len)
+            } else {
+                len
+            };
+            if writes && (!builder || back != 0) {
+                s.gpu_writes(list, a, back);
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
