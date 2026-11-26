@@ -294,7 +294,13 @@ export WINEDEBUG=${WINEDEBUG:--all,+timestamp,+pid,+tid,+seh}
         sha256sum -- d3d12.dll d3d12core.dll
     fi
 ) > "$report/build.txt"
-echo "Logs may contain your username, local file paths, or other sensitive information. Review them before sharing privately."
+warning="WARNING: LOGS MAY CONTAIN SENSITIVE INFORMATION"
+if [[ -t 1 && -z ${NO_COLOR+x} && ${TERM:-} != dumb ]]; then
+    printf '\n\033[1;91m%s\033[0m\n' "$warning"
+else
+    printf '\n%s\n' "$warning"
+fi
+echo "Raw logs can include usernames, local paths, credentials, or game output. Review them before sharing. Keep the full archive local."
 echo "Recording this run in $report"
 status=0
 trap ':' INT

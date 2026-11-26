@@ -1,0 +1,52 @@
+name: Verify the published hardware request
+
+on:
+  workflow_run:
+    workflows: ["Prepare a hardware test kit"]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  preview:
+    if: github.repository == 'ligmaSec/victory-royale' && github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      pr: ${{ steps.preview.outputs.pr }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Preview the published request as a tester
+        id: preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIT_RUN: ${{ github.event.workflow_run.id }}
+        run: |
+          artifact=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$KIT_RUN/artifacts" --jq '.artifacts[] | select(.expired == false) | .name')
+          if [[ ! "$artifact" =~ ^victory-series-x-pr-([1-9][0-9]*)$ ]]; then
+            echo "::error::Expected one unexpired Series X kit in the publication run."
+            exit 1
+          fi
+          pr=${BASH_REMATCH[1]}
+          python3 scripts/hardware-test/run-test.py "$pr" --plan
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+
+  label:
+    needs: preview
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Mark the verified request for testers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.preview.outputs.pr }}
+        run: gh api --silent --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/labels" -f 'labels[]=tester wanted'

@@ -249,20 +249,14 @@ fn barycentrics_supported(host: &super::host::Host) -> bool {
     ok.is_ok() && o.BarycentricsSupported.as_bool()
 }
 
-/// A triangle whose vertices have w 1, 2 and 4, drawn with the weights
-/// program: every pixel well inside holds the weights D3D gives vertices
-/// 0, 1 and 2 there, perspective-correct for the perspective pair and
-/// screen-linear for the linear one (they differ by up to about 0.3).
-#[test]
 #[cfg(windows)]
-fn drawn_weights_are_the_hosts_vertex_weights() {
-    use super::host::{Draw, Host, Root};
-    let ndc = [[-0.8f32, -0.7], [0.9, -0.6], [-0.5, 0.85]];
-    let w = [1.0f32, 2.0, 4.0];
-    let vertices: Vec<f32> = (0..3)
-        .flat_map(|k| [ndc[k][0] * w[k], ndc[k][1] * w[k], 0.5 * w[k], w[k]])
-        .collect();
-    let (width, height) = (32u32, 32u32);
+fn check_weights(
+    texels: &[[f32; 4]],
+    (width, height): (u32, u32),
+    ndc: [[f32; 2]; 3],
+    w: [f32; 3],
+    linear: bool,
+) -> usize {
     // Screen-linear and perspective-correct weights at a pixel's centre.
     let weights = |px: u32, py: u32| {
         let p = [
@@ -278,6 +272,40 @@ fn drawn_weights_are_the_hosts_vertex_weights() {
         let s = q[0] + q[1] + q[2];
         (linear, [q[0] / s, q[1] / s, q[2] / s])
     };
+    let (mut inside, mut spread) = (0, 0.0f32);
+    for py in 0..height {
+        for px in 0..width {
+            let (lin, persp) = weights(px, py);
+            // Near or past an edge: coverage is the rasteriser's.
+            if lin.iter().any(|&l| l < 0.02) {
+                continue;
+            }
+            inside += 1;
+            spread = (0..3).fold(spread, |m, c| m.max((lin[c] - persp[c]).abs()));
+            let want = if linear { lin } else { persp };
+            let t = texels[(py * width + px) as usize];
+            let ok = (0..3).all(|c| (t[c] - want[c]).abs() < 2e-3) && t[3] == 1.0;
+            assert!(ok, "pixel ({px}, {py}): {t:?}, want {want:?}");
+        }
+    }
+    assert!(inside > 100 && spread > 0.2, "{inside} pixels, {spread}");
+    inside
+}
+
+/// A triangle whose vertices have w 1, 2 and 4, drawn with the weights
+/// program: every pixel well inside holds the weights D3D gives vertices
+/// 0, 1 and 2 there, perspective-correct for the perspective pair and
+/// screen-linear for the linear one (they differ by up to about 0.3).
+#[test]
+#[cfg(windows)]
+fn drawn_weights_are_the_hosts_vertex_weights() {
+    use super::host::{Draw, Host, Root, TriangleDraw};
+    let ndc = [[-0.8f32, -0.7], [0.9, -0.6], [-0.5, 0.85], [0.8, 0.75]];
+    let w = [1.0f32, 2.0, 4.0, 1.0];
+    let vertices: Vec<f32> = (0..4)
+        .flat_map(|k| [ndc[k][0] * w[k], ndc[k][1] * w[k], 0.5 * w[k], w[k]])
+        .collect();
+    let (width, height) = (32u32, 32u32);
     let vs = super::host::position_vs();
     validate(&vs);
     let mut ran = 0;
@@ -304,27 +332,26 @@ fn drawn_weights_are_the_hosts_vertex_weights() {
                 size: (width, height),
                 mesh_groups: 0,
             };
-            let texels = host
-                .draw(&root, &pso, &draw)
-                .unwrap_or_else(|e| panic!("{label}: {e}"));
-            let (mut inside, mut spread) = (0, 0.0f32);
-            for py in 0..height {
-                for px in 0..width {
-                    let (lin, persp) = weights(px, py);
-                    // Near or past an edge: coverage is the rasteriser's.
-                    if lin.iter().any(|&l| l < 0.02) {
-                        continue;
-                    }
-                    inside += 1;
-                    spread = (0..3).fold(spread, |m, c| m.max((lin[c] - persp[c]).abs()));
-                    let want = if linear { lin } else { persp };
-                    let t = texels[(py * width + px) as usize];
-                    let ok = (0..3).all(|c| (t[c] - want[c]).abs() < 2e-3) && t[3] == 1.0;
-                    assert!(ok, "{label} {addr:#x} ({px}, {py}): {t:?}, want {want:?}");
+            // D3D keeps vertex 1 as the provoking vertex in the second
+            // strip primitive and swaps the other two barycentric weights.
+            for (command, triangles) in [
+                (TriangleDraw::Direct, &[[0, 1, 2]][..]),
+                (TriangleDraw::Strip, &[[0, 1, 2], [1, 3, 2]][..]),
+            ] {
+                let texels = host
+                    .draw_triangle(&root, &pso, &draw, command)
+                    .unwrap_or_else(|e| panic!("{label}: {e}"));
+                for &triangle in triangles {
+                    let inside = check_weights(
+                        &texels,
+                        (width, height),
+                        triangle.map(|k| ndc[k]),
+                        triangle.map(|k| w[k]),
+                        linear,
+                    );
+                    eprintln!("{label} {addr:#x} {triangle:?}: {inside} pixels match");
                 }
             }
-            assert!(inside > 100 && spread > 0.2, "{inside} pixels, {spread}");
-            eprintln!("{label} {addr:#x}: {inside} pixels match");
         }
         ran += 1;
     }
