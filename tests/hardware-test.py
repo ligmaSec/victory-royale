@@ -222,7 +222,7 @@ class HardwareRequest(unittest.TestCase):
         temp.mkdir()
         stdout = io.StringIO()
 
-        def launched(side, folder, title, results, windows, console):
+        def launched(side, folder, title, results, windows, console, **kwargs):
             profile = folder / "data" / runner.TITLE_ID
             progress = profile / "saves" / "progress"
             self.assertEqual(progress.read_text(), "starting point")
@@ -234,6 +234,7 @@ class HardwareRequest(unittest.TestCase):
             self.assertEqual(lines[-3], f"RUN {number} OF 2  |  {side.upper()}  |  WHAT TO DO")
             self.assertEqual(lines[-1], self.request["scenario"])
             (results / (side + ".log")).write_text(side)
+            return True
 
         (self.save / "temp").mkdir()
         (self.save / "temp" / "private-log").write_text("omit")
@@ -265,6 +266,93 @@ class HardwareRequest(unittest.TestCase):
         with zipfile.ZipFile(report) as archive:
             self.assertEqual(set(archive.namelist()), {"request.json", "main.log", "candidate.log"})
 
+    def test_session_config_precedence_and_request_contract(self):
+        cfg = self.root / "setup" / ".victoryconfig"
+        cfg.parent.mkdir()
+        cfg.write_text("[hardware]\ngame_dir=../my game\nsave_dir=../saves/7952987A\n"
+                       "proton_dir=../Proton Engine\nwine_prefix=../prefix\n"
+                       "stop_after=device-ready\nobserve_seconds=3\ntimeout_seconds=8\n")
+        profile = runner.session.preferences(cfg)
+        self.assertEqual(profile["title"], self.root / "my game" / "game_scarlett_master.exe")
+        self.assertEqual(profile["save_dir"], self.save)
+        self.assertEqual(profile["proton_dir"], self.root / "Proton Engine")
+        stop = runner.session.stopping("first-mesh-bind", 7, 55)
+        request = dict(self.request, version=5, save=runner.TITLE_ID, stop=stop)
+        self.manifest.write_text(json.dumps(request))
+        for args, message in [([], "7 s after first-mesh-bind"), (["--manual"], None)]:
+            output = io.StringIO()
+            with mock.patch.object(sys, "argv", ["runner", str(self.manifest), "--config", str(cfg),
+                                                  "--plan", *args]), contextlib.redirect_stdout(output):
+                runner.run()
+            if message:
+                self.assertIn(message, output.getvalue())
+            else:
+                self.assertNotIn("Automatic close", output.getvalue())
+        with self.assertRaises(ValueError):
+            runner.parse_request(json.dumps(dict(request, version=4)))
+        for invalid in [dict(stop, marker="unknown"), dict(stop, observe_seconds=True),
+                        dict(stop, observe_seconds=55), dict(stop, timeout_seconds=100000)]:
+            with self.assertRaises(ValueError):
+                runner.parse_request(json.dumps(dict(request, stop=invalid)))
+
+    def test_monitor_both_launch_paths_and_early_exit(self):
+        # A real child produces split output then waits for its own close signal.
+        # The Proton shape writes the game output only in the announced report.
+        for windows in (True, False):
+            for outcome in ("match", "early", "timeout"):
+                with self.subTest(windows=windows, outcome=outcome):
+                    folder = self.root / (str(windows) + outcome)
+                    folder.mkdir()
+                    console = folder / "console"
+                    close = folder / "close.request"
+                    report = folder / "victory/reports/run-fixture"
+                    report.mkdir(parents=True)
+                    code = """
+import os,pathlib,sys,time
+report,close,platform,outcome = sys.argv[1:]
+if platform == 'proton':
+    print('Recording this run in ' + report, flush=True)
+    log = open(pathlib.Path(report)/'steam-victory.log','w')
+else:
+    log = sys.stdout
+print('victory_hle::modules::lifecycle: hardware test close available', file=log, flush=True)
+if outcome == 'early':
+    sys.exit(5)
+print('victory_gpu::host: host D3D12 device ', end='', file=log, flush=True)
+time.sleep(.12)
+print('ready' if outcome == 'match' else 'unavailable', file=log, flush=True)
+for _ in range(100):
+    if os.path.isfile(close): sys.exit(0)
+    time.sleep(.05)
+sys.exit(90)
+"""
+                    with console.open("wb") as log, subprocess.Popen(
+                            [sys.executable, "-c", code, str(report), str(close),
+                             "windows" if windows else "proton", outcome], stdout=log) as child:
+                        reason, forced, _ = runner.session.monitor(
+                            child, console, windows, {"XDG_DATA_HOME": str(folder), "VICTORY_DATA_DIR": str(folder)},
+                            runner.session.stopping("device-ready", 0, 1 if outcome == "timeout" else 5), close)
+                    expected = {"match": "condition reached", "early": "exited before completion",
+                                "timeout": "timeout before completion"}
+                    self.assertEqual((reason, forced), (expected[outcome], False))
+                    self.assertEqual(child.returncode, 5 if outcome == "early" else 0)
+                    self.assertEqual(close.exists(), outcome != "early")
+
+    @unittest.skipUnless(sys.platform == "win32", "uses a native Windows Forms window")
+    def test_close_legacy_windows_build_by_process(self):
+        log_path = self.root / "native-window.log"
+        window = ("Add-Type -AssemblyName System.Windows.Forms; "
+                  "$f = New-Object Windows.Forms.Form; "
+                  "$f.Add_Shown({[Console]::WriteLine('victory_gpu::host: host D3D12 device ready')}); "
+                  "[Windows.Forms.Application]::Run($f)")
+        with log_path.open("wb") as log, subprocess.Popen(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", window],
+                stdout=log, stderr=subprocess.STDOUT) as child:
+            reason, forced, _ = runner.session.monitor(
+                child, log_path, True, {"VICTORY_DATA_DIR": str(self.root)},
+                runner.session.stopping("device-ready", 0, 30), self.root / "close.request")
+        self.assertEqual((reason, forced), ("condition reached", False))
+
     def test_console_profile_requires_a_compatible_runner(self):
         self.assertEqual(runner.parse_request(json.dumps(self.request)), self.request)
         for version, console in ((1, "series-s"), (2, "series-x"), (2, "unknown"), (True, "series-x")):
@@ -282,10 +370,11 @@ class HardwareRequest(unittest.TestCase):
     def test_fresh_pair_and_partial(self):
         self.request.update(version=2, console="series-s")
         self.manifest.write_text(json.dumps(self.request))
-        def launched(side, folder, title, results, windows, console):
+        def launched(side, folder, title, results, windows, console, **kwargs):
             self.assertEqual(console, "series-s")
             self.assertEqual(title, self.title)
             (results / (side + ".log")).write_text(side)
+            return True
 
         self.run_pair(launched)
         self.run_pair(launched)
@@ -294,7 +383,7 @@ class HardwareRequest(unittest.TestCase):
         with zipfile.ZipFile(bundles[0]) as archive:
             self.assertEqual(set(archive.namelist()), {"request.json", "main.log", "candidate.log"})
 
-        def fail(side, *args):
+        def fail(side, *args, **kwargs):
             if side == "candidate":
                 raise ValueError("test interruption")
             launched(side, *args)
@@ -678,7 +767,7 @@ class HardwareRequest(unittest.TestCase):
         self.addCleanup(progress.chmod, 0o644)
         self.addCleanup(progress.parent.chmod, 0o755)
 
-        def write_progress(side, folder, title, results, windows, console):
+        def write_progress(side, folder, title, results, windows, console, **kwargs):
             slot = folder / "data" / runner.TITLE_ID / "saves" / "progress"
             self.assertTrue(slot.stat().st_mode & 0o200)
             self.assertTrue(slot.parent.stat().st_mode & 0o200)
@@ -686,6 +775,7 @@ class HardwareRequest(unittest.TestCase):
             slot.write_text(side)
             (slot.parent / "next-slot").write_text(side)
             (results / (side + ".log")).write_text(side)
+            return True
 
         self.run_pair(write_progress)
         self.assertEqual(progress.read_text(), "starting point")

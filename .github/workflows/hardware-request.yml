@@ -18,6 +18,19 @@ on:
         options:
           - series-x
           - series-s
+      stop_after:
+        description: End each build after this runtime milestone and observation period
+        type: choice
+        default: device-ready
+        options: [device-ready, present-1024, first-mesh-bind, manual]
+      observe_seconds:
+        description: Seconds to observe after reaching the milestone
+        default: "180"
+        type: string
+      timeout_seconds:
+        description: Maximum seconds per build including startup
+        default: "900"
+        type: string
       scenario:
         description: What to do in each run and when to close it
         required: true
@@ -59,9 +72,12 @@ jobs:
           REQUESTER_COMMENT: ${{ inputs.requester_comment }}
           PR: ${{ inputs.pr }}
           CONSOLE: ${{ inputs.console }}
+          STOP_AFTER: ${{ inputs.stop_after }}
+          OBSERVE: ${{ inputs.observe_seconds }}
+          TIMEOUT: ${{ inputs.timeout_seconds }}
           SCENARIO: ${{ inputs.scenario }}
         run: |
-          python3 scripts/hardware-test/prepare.py "$PR" --console "$CONSOLE" --scenario "$SCENARIO" --published --requester-comment "$REQUESTER_COMMENT" --review-dir "$RUNNER_TEMP/review" --output "$RUNNER_TEMP/kit.zip"
+          python3 scripts/hardware-test/prepare.py "$PR" --console "$CONSOLE" --scenario "$SCENARIO" --stop-after "$STOP_AFTER" --observe-seconds "$OBSERVE" --timeout-seconds "$TIMEOUT" --published --requester-comment "$REQUESTER_COMMENT" --review-dir "$RUNNER_TEMP/review" --output "$RUNNER_TEMP/kit.zip"
           unzip -q "$RUNNER_TEMP/kit.zip" -d "$RUNNER_TEMP/kit"
       - name: Publish the test kit
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

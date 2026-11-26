@@ -545,6 +545,23 @@ pub(crate) fn relaunch(args: Vec<std::ffi::OsString>) {
     }
 }
 
+/// Hardware tests request the same suspend and shutdown as the window close button.
+pub fn watch_test_close() -> std::io::Result<()> {
+    if let Some(path) = std::env::var_os("VICTORY_TEST_CLOSE_FILE").filter(|s| !s.is_empty()) {
+        let path = std::path::PathBuf::from(path);
+        std::thread::Builder::new()
+            .name("victory-test-close".into())
+            .spawn(move || {
+                while !path.is_file() {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                end_title("hardware test finished", Box::new(|| {}));
+            })?;
+        tracing::info!("hardware test close available");
+    }
+    Ok(())
+}
+
 /// In a relaunched `victory`: waits (30 s at most) for the process it
 /// replaces to be gone, so the two never share the title's files.
 pub fn wait_for_previous() {

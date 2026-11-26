@@ -20,6 +20,7 @@ import zipfile
 import observations
 import report_keys
 import report_ui
+import session
 
 REPO = report_keys.REPO
 PACKAGE = "victory-proton-x86_64.tar.gz"
@@ -57,7 +58,9 @@ VENDORS = {b"0x1002": "AMD", b"0x10de": "NVIDIA", b"0x8086": "Intel", b"0x1414":
 EVENTS = {b"shader does not translate": "shader refusal",
           b"host compute pipeline refused": "compute pipeline refusal",
           b"no free dynamic descriptor slots": "descriptor exhaustion",
-          b"device removed": "device removal"}
+          b"device removed": "device removal",
+          b"VIctory: unhandled exception 0x": "unhandled exception",
+          b"window closed: suspending the title": "window close observed"}
 
 
 def digest(path):
@@ -81,12 +84,20 @@ def parse_request(data):
     console = request.get("console", "series-x")
     version = request["version"]
     legacy = (version, console) in ((1, "series-x"), (2, "series-s")) and "save" not in request
-    standard = version == 4 and request.get("save") == TITLE_ID and console in ("series-x", "series-s")
+    standard = version in (4, 5) and request.get("save") == TITLE_ID and console in ("series-x", "series-s")
     if (type(version) is not int or not (legacy or standard)
             or type(request["pr"]) is not int or request["pr"] < 1
             or not isinstance(request["scenario"], str) or not request["scenario"].strip()
             or not request["scenario"].isprintable()):
         raise ValueError("Unrecognized test request.")
+    if version == 5:
+        stop = request.get("stop")
+        if stop != "manual":
+            if not isinstance(stop, dict) or set(stop) != {"marker", "observe_seconds", "timeout_seconds"}:
+                raise ValueError("Missing hardware-test stopping condition.")
+            session.stopping(stop["marker"], stop["observe_seconds"], stop["timeout_seconds"])
+    elif "stop" in request:
+        raise ValueError("Unexpected stopping condition on a legacy request.")
     for side in ("main", "candidate"):
         build = request[side]
         if not (type(build["run"]) is int and build["run"] > 0
@@ -146,10 +157,14 @@ def choose_title():
     return Path(chosen).expanduser()
 
 
-def default_save():
+def settings_root():
     checkout = ROOT.parent.parent
     base = checkout if ROOT == checkout / "scripts" / "hardware-test" and (checkout / ".victory-root").is_file() else ROOT
-    return base / "saves" / TITLE_ID
+    return base
+
+
+def default_save():
+    return settings_root() / "saves" / TITLE_ID
 
 
 def copy_save(source, destination):
@@ -179,7 +194,7 @@ def copy_save(source, destination):
             copy_entry(path, destination / name)
 
 
-def launch(side, folder, title, results, windows, console="series-x"):
+def launch(side, folder, title, results, windows, console="series-x", *, stop=None, settings=None):
     env = os.environ.copy()
     # Ignore a developer override that could silently substitute a different build.
     env.pop("VICTORY_EXE", None)
@@ -187,30 +202,56 @@ def launch(side, folder, title, results, windows, console="series-x"):
     for variable, directory in (("VICTORY_CACHE_DIR", "cache"), ("VICTORY_DATA_DIR", "data")):
         path = str(folder / directory)
         env[variable] = path if windows else "Z:" + path.replace("/", "\\")
+    close_file = folder / "close.request"
+    env.pop("VICTORY_TEST_CLOSE_FILE", None)
+    if stop:
+        env["VICTORY_TEST_CLOSE_FILE"] = str(close_file) if windows else "Z:" + str(close_file).replace("/", "\\")
     args = [str(title), "--console", console]
     if windows:
         command = [str(folder / "victory.exe"), "run", str(title), "--execute", "--console", console]
     else:
+        for key, variable in (("proton_dir", "PROTONPATH"), ("wine_prefix", "WINEPREFIX")):
+            if (settings or {}).get(key) and not env.get(variable):
+                env[variable] = str(settings[key])
         env.update(VKD3D_SHADER_CACHE_PATH=str(folder / "vkd3d"), DXVK_STATE_CACHE_PATH=str(folder / "dxvk"))
         command = ["bash", str(folder / "victory-proton.sh"), "--report", "--runtime", "pinned", *args]
     log_path = results / (side + ".log")
     report = None
     with log_path.open("wb") as log, subprocess.Popen(command, cwd=title.parent, env=env,
-                                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
-        with process.stdout:
-            for line in process.stdout:
-                log.write(line)
-                if not windows:
-                    found = re.fullmatch(rb"Report: (.+) \(launcher exit [0-9]+\)", line.rstrip(b"\r\n"))
-                    if found:
-                        report = Path(os.fsdecode(found[1]))
+                                                       stdout=log, stderr=subprocess.STDOUT,
+                                                       start_new_session=bool(stop and not windows)) as process:
+        reason, forced, live_report = "manual scenario", False, None
+        if stop:
+            try:
+                reason, forced, live_report = session.monitor(process, log_path, windows, env, stop, close_file)
+            except BaseException:
+                session.terminate_run(process, windows, env)
+                raise
         status = process.wait()
+    (results / (side + "-stop.txt")).write_text(reason + ("; forced" if forced else "") + "\n")
+    if not windows:
+        # Launcher stdout is small; driver output goes into the separate Proton report.
+        with log_path.open("rb") as stream:
+            for line in stream:
+                found = re.fullmatch(rb"Report: (.+) \(launcher exit [0-9]+\)", line.rstrip(b"\r\n"))
+                if found:
+                    report = Path(os.fsdecode(found[1]))
     (results / (side + "-exit.txt")).write_text(f"{status}\n")
     if not windows:
         if report is None or not report.is_file():
+            if stop:
+                # A startup timeout can precede the launcher's archive. Preserve any private logs.
+                if live_report and live_report.is_dir():
+                    with tarfile.open(results / (side + ".tar.gz"), "w:gz") as archive:
+                        for path in [live_report / "launcher.log", *live_report.glob("steam-*.log")]:
+                            if path.is_file() and not path.is_symlink():
+                                archive.add(path, arcname=path.name, recursive=False)
+                print(f"{side} exited ({status}) without a complete Proton archive.", flush=True)
+                return False
             raise ValueError(f"The {side} launcher did not produce a report. See the console log in the partial report.")
         shutil.copyfile(report, results / (side + ".tar.gz"))
     print(f"{side} exited ({status}).", flush=True)
+    return not stop or (reason == "condition reached" and (forced or status == 0))
 
 
 def github_rows(endpoint, query):
@@ -345,7 +386,15 @@ def run():
     parser.add_argument("--save-dir", type=Path, help=f"use a local {TITLE_ID} folder outside the default saves/ directory")
     parser.add_argument("--plan", action="store_true", help="preview the selected test without launching")
     parser.add_argument("--title", type=Path, help="use this executable instead of the file chooser")
+    parser.add_argument("--config", type=Path, help="read hardware-test settings from this file")
+    parser.add_argument("--manual", action="store_true", help="close both builds yourself")
     options = parser.parse_args()
+    local = settings_root() / ".victoryconfig"
+    config = options.config or (local if local.is_file() else Path.home() / ".victoryconfig")
+    options.settings = session.preferences(config.expanduser().resolve()) if options.config or config.is_file() else {}
+    options.title = options.title or options.settings.get("title")
+    options.save_dir = options.save_dir or options.settings.get("save_dir")
+    options.output_dir = options.output_dir or options.settings.get("output_dir")
     if options.list and options.request:
         parser.error("--list takes no request")
     options.save_dir = (options.save_dir or default_save()).expanduser().resolve()
@@ -581,12 +630,15 @@ def side_metrics(results, side, windows, frame_log, submission_log, timeline):
     return rows
 
 
-def diagnostic_summary(request, results, windows, complete, destination):
+def diagnostic_summary(request, results, windows, complete, destination, stop=None):
     shader_ids = {}
     rows = [f"{console_name(request.get('console', 'series-x'))} hardware test | PR #{request['pr']} | " + ("Windows" if windows else "Linux/Proton"),
             "Comparison completed" if complete else "Partial comparison",
             f"Starting save: {TITLE_ID} (separate copies)",
             "Timings cover all recorded phases, including menus."]
+    if stop:
+        rows.append(f"Requested endpoint: {stop['marker']} plus {stop['observe_seconds']} s "
+                    f"(timeout {stop['timeout_seconds']} s per build)")
     for side in ("main", "candidate"):
         rows.extend(["", f"{side.capitalize()} | {request[side]['revision']}"])
         exit_path = results / (side + "-exit.txt")
@@ -604,6 +656,13 @@ def diagnostic_summary(request, results, windows, complete, destination):
             frame_log.writerow(["window", "intervals", "mean_ms", "median_ms", "p95_ms", "longest_ms",
                                 "over_100_ms", "over_1_s"])
             rows.append(f"Launcher exit: {code}")
+            stop_file = results / (side + "-stop.txt")
+            if stop_file.is_file():
+                reason = stop_file.read_text().strip()
+                if reason.removesuffix("; forced") in session.REASONS:
+                    rows.append(f"Run ending: {reason}")
+                    if reason.startswith("exited before") and code not in ("0", "unreported"):
+                        rows.append("Nonzero exit before the requested endpoint")
             rows.extend(side_metrics(results, side, windows, frame_log, submission_log, Timeline(events, shader_ids)))
     return "\n".join(rows) + "\n"
 
@@ -909,6 +968,12 @@ def run_request(manifest, options):
         print("Warning: " + message, file=sys.stderr)
     else:
         print(f"Using standard save {TITLE_ID}. Each build gets a separate copy.", flush=True)
+    stop = None if options.manual else request.get("stop", options.settings.get("stop"))
+    if stop == "manual":
+        stop = None
+    if stop:
+        print(f"Automatic close: {stop['observe_seconds']} s after {stop['marker']}; "
+              f"timeout {stop['timeout_seconds']} s from launch.", flush=True)
     if options.plan:
         if binding:
             owner = binding["requester"]["login"]
@@ -932,6 +997,12 @@ def run_request(manifest, options):
         raise ValueError("Select a game executable outside the source save folder.")
     if not title.is_file() or title.suffix.lower() != ".exe":
         raise ValueError("Select the game's .exe file.")
+    prefix = os.environ.get("WINEPREFIX") or options.settings.get("wine_prefix")
+    if not windows and prefix:
+        prefix = Path(prefix).expanduser().resolve()
+        if (prefix.is_relative_to(source)
+                or any((d / ".victory-root").is_file() for d in (prefix, *prefix.parents))):
+            raise ValueError("Choose a Wine prefix outside the source save and checkout.")
     temp = Path(tempfile.gettempdir()).resolve()
     output = (options.output_dir or temp).expanduser().resolve()
     for directory in (output, temp, title.parent):
@@ -949,10 +1020,12 @@ def run_request(manifest, options):
         shutil.copyfile(manifest, results / "request.json")
         complete = False
         try:
+            outcomes = []
             for number, side in enumerate(("main", "candidate"), start=1):
                 instruction_block(f"RUN {number} OF 2  |  {side.upper()}  |  WHAT TO DO", request["scenario"])
-                launch(side, Path(work) / side, title, results, windows, console)
-            complete = True
+                outcomes.append(launch(side, Path(work) / side, title, results, windows, console,
+                                       stop=stop, settings=options.settings))
+            complete = all(outcomes)
         finally:
             if any(results.glob("*.log")):
                 output.mkdir(parents=True, exist_ok=True)
@@ -963,7 +1036,7 @@ def run_request(manifest, options):
                         out.write(path, path.name)
                 heading = "REPORT READY" if complete else "TEST INTERRUPTED"
                 instruction_block(heading, "Keep this full troubleshooting archive on your machine.", f"Local logs: {bundle}")
-                report = diagnostic_summary(request, results, windows, complete, destination)
+                report = diagnostic_summary(request, results, windows, complete, destination, stop)
                 summary_path = destination / "summary.txt"
                 summary_path.write_text(report, encoding="utf-8")
                 share = destination / "share"

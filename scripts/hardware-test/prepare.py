@@ -10,6 +10,7 @@ import sys
 import tempfile
 import zipfile
 
+import session
 import report_keys
 
 REPO = report_keys.REPO
@@ -85,7 +86,12 @@ def prepare():
     parser.add_argument("--review-dir", type=Path, help="directory containing both native review executables")
     parser.add_argument("--published", action="store_true", help="bind the request in the official main workflow")
     parser.add_argument("--requester-comment", default="", help="delegated request comment on this PR")
+    parser.add_argument("--stop-after", choices=["manual", *session.MARKERS])
+    parser.add_argument("--observe-seconds", type=int, default=180)
+    parser.add_argument("--timeout-seconds", type=int, default=900)
     args = parser.parse_args()
+    stop = args.stop_after if args.stop_after in (None, "manual") else session.stopping(
+        args.stop_after, args.observe_seconds, args.timeout_seconds)
     if args.pr < 1 or not args.scenario.strip() or not args.scenario.isprintable():
         parser.error("Use a positive PR number and a single plain-text scenario.")
     pull = api(f"pulls/{args.pr}")
@@ -101,6 +107,8 @@ def prepare():
     # Earlier runners do not isolate the standard save and must decline this kit.
     request = {"version": 4, "console": args.console, "save": "7952987A", "pr": args.pr,
                "scenario": args.scenario, "main": main, "candidate": candidate}
+    if stop:
+        request.update(version=5, stop=stop)
     if binding:
         request["delivery"] = binding
         request["publication_run"] = int(os.environ["GITHUB_RUN_ID"])
@@ -120,8 +128,9 @@ def prepare():
             runner = runner.replace(b"PUBLISHED_SHA256 = None", f'PUBLISHED_SHA256 = "{stamp}"'.encode(), 1)
         out.writestr("run-test.py", runner)
         out.write(ROOT / "report_keys.py", "report_keys.py")
-        for name in ("report_ui.py", "observations.py", "observations.html"):
+        for name in ("report_ui.py", "observations.py", "observations.html", "session.py"):
             out.write(ROOT / name, name)
+        out.write(ROOT.parents[1] / ".victoryconfig.example", ".victoryconfig.example")
         out.write(ROOT.parents[1] / "LICENSE", "LICENSE")
         out.write(ROOT / "README.txt", "README.txt")
         out.writestr("request.json", manifest)

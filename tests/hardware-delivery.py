@@ -170,7 +170,7 @@ class RequestDelivery(unittest.TestCase):
         with zipfile.ZipFile(out) as kit:
             data = kit.read("request.json")
             self.assertIn(hashlib.sha256(data).hexdigest(), kit.read("run-test.py").decode())
-            for name in ("report_keys.py", "observations.py", "observations.html"):
+            for name in ("report_keys.py", "observations.py", "observations.html", "session.py", ".victoryconfig.example"):
                 self.assertIn(name, kit.namelist())
         trusted = hashlib.sha256(data).hexdigest()
         request = json.loads(data)
@@ -200,6 +200,16 @@ data=${VICTORY_DATA_DIR#Z:}
 slot="${data//\\//}/7952987A/saves/progress"
 test "$(cat "$slot")" = private-start
 printf changed > "$slot"
+test "$PROTONPATH" = "$EXPECTED_PROTON"
+test "$WINEPREFIX" = "$EXPECTED_PREFIX"
+live="$XDG_DATA_HOME/victory/reports/run-$(basename "$(dirname "$0")")"
+mkdir -p "$live"
+echo "Recording this run in $live"
+printf '%s\n' 'victory_hle::modules::lifecycle: hardware test close available' \
+    'victory_gpu::queue: title requested a present (draws and dispatches since the last report) frame=1024 draws=8' > "$live/steam-victory.log"
+signal=${VICTORY_TEST_CLOSE_FILE#Z:}
+for _ in {1..100}; do [[ -f "${signal//\\//}" ]] && break; sleep .05; done
+test -f "${signal//\\//}"
 report="$(dirname "$0")/fixture.tar.gz"
 tar -czf "$report" -T /dev/null
 echo "Report: $report (launcher exit 0)"
@@ -217,7 +227,8 @@ echo "Report: $report (launcher exit 0)"
 
         archive = self.root / "kit.zip"
         pull = {"user": author, "head": {"sha": "c" * 40}, "base": {"ref": "main", "repo": {"full_name": keys.REPO}}}
-        args = ["prepare", "7", "--scenario", "Close the game.", "--output", str(archive),
+        args = ["prepare", "7", "--scenario", "Watch the scene.", "--stop-after", "present-1024",
+                "--observe-seconds", "0", "--timeout-seconds", "8", "--output", str(archive),
                 "--published", "--requester-comment", comment]
         with mock.patch.dict(os.environ, GITHUB_RUN_ID="812", GITHUB_ACTOR="publisher", GITHUB_ACTOR_ID="22"), \
                 mock.patch.object(sys, "argv", args), mock.patch.object(prepare, "api", return_value=pull), \
@@ -234,10 +245,16 @@ echo "Report: $report (launcher exit 0)"
         # The fixture distribution exercises the child environment with Bash.
         # Satisfy the runner's UMU preflight without downloading a runtime in CI.
         (self.root / "umu-run").touch(mode=0o755)
-        env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ["PATH"])
+        env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ["PATH"],
+                   XDG_DATA_HOME=str(self.root / "xdg"), EXPECTED_PROTON=str(self.root / "Proton Build"),
+                   EXPECTED_PREFIX=str(self.root / "test prefix"))
+        env.pop("PROTONPATH", None)
+        env.pop("WINEPREFIX", None)
         out = self.root / "reports"
-        result = subprocess.run([sys.executable, str(kit / "run-test.py"), "--title", str(title),
-                                 "--output-dir", str(out)], env=env, cwd=self.root, stdin=subprocess.DEVNULL,
+        (kit / ".victoryconfig").write_text(
+            "[hardware]\ntitle = ../fixture.exe\noutput_dir = ../reports\n"
+            "proton_dir = ../Proton Build\nwine_prefix = ../test prefix\n")
+        result = subprocess.run([sys.executable, str(kit / "run-test.py")], env=env, cwd=self.root, stdin=subprocess.DEVNULL,
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Comparison completed", result.stdout)
@@ -245,6 +262,8 @@ echo "Report: $report (launcher exit 0)"
         with zipfile.ZipFile(next(out.rglob("report.zip"))) as report:
             for side in ("main", "candidate"):
                 self.assertEqual(report.read(side + "-exit.txt").strip(), b"0")
+                self.assertEqual(report.read(side + "-stop.txt").strip(), b"condition reached")
+            self.assertNotIn(".victoryconfig", report.namelist())
             self.assertFalse(any("7952987A" in name for name in report.namelist()))
 
     def test_collects_a_truncated_gist_using_its_pinned_raw_revision(self):
@@ -374,9 +393,10 @@ echo "Report: $report (launcher exit 0)"
         (save / "progress").write_text("test fixture")
         title = self.root / "fixture.exe"
         title.touch()
-        def launch(side, folder, game, results, windows, console):
+        def launch(side, folder, game, results, windows, console, **kwargs):
             self.assertEqual(console, "series-s")
             (results / (side + ".log")).write_text("synthetic run")
+            return True
         def menu(title, context, lines, actions, default, cancel):
             self.assertEqual(title, "Hardware test results")
             self.assertIn("Private delivery unavailable", " ".join(lines))

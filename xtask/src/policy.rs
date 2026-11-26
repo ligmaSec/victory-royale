@@ -159,6 +159,8 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
             | "tests/metal/run.py"
             | "tests/metal/probe.swift"
             | "scripts/hardware-test/run-test.py"
+            | "scripts/hardware-test/session.py"
+            | ".victoryconfig.example"
             | "scripts/hardware-test/prepare.py"
             | "scripts/hardware-test/report_ui.py"
             | "scripts/hardware-test/observations.py"

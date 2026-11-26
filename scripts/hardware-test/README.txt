@@ -12,9 +12,15 @@ extracted kit, or in saves/7952987A/ at the repository root. You can also pass
 copy of your progress and persistent settings. The save stays on your machine.
 A missing save produces a warning. Use --plan to preview without it.
 
-Select your game's .exe when prompted. Before each launch, read WHAT TO DO.
-Run the scenario on main, close the game as instructed, then repeat on the
-candidate with the same settings and window size. Each build gets a fresh
+Copy .victoryconfig.example to .victoryconfig beside the runner or at the checkout
+root. Set game_dir or title once. A copy in your home folder applies across kits.
+The example also covers Proton, Wine prefix, save, report folder and timing.
+Use --config FILE to select a specific setup. Without game_dir or title, select
+your game's .exe when prompted. Before each launch, read WHAT TO DO.
+Automatic scenarios close each build once its milestone and observation period
+are complete. Follow the input instructions and leave the game open. A timeout
+or early exit is recorded separately. For manual scenarios, close as instructed.
+Repeat the same inputs and keep the same settings and window size. Each build gets a fresh
 translation cache. Add --plan to preview the instructions and build revisions.
 
 ====================================================================

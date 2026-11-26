@@ -71,6 +71,25 @@ runtime on first use.
 | From the repository root, choose a test request | `python3 scripts/hardware-test/run-test.py` | `py scripts/hardware-test/run-test.py` |
 | With a kit ZIP, extract it and open a terminal in the folder containing `run-test.py` | `python3 run-test.py` | `py run-test.py` |
 
+To remember your paths, copy `.victoryconfig.example` to `.victoryconfig` in the checkout root
+or beside the extracted runner. For one setup across kits, put the copy in your home directory.
+Set `game_dir` to your dump directory, or `title` to a specific executable. You can also set
+`save_dir`, `output_dir`, and on Linux `proton_dir` and `wine_prefix`. Relative paths start at the
+config file. The runner checks the checkout or kit before your home. `--config FILE` selects a
+specific file. Explicit CLI paths override the file. Existing `PROTONPATH` and `WINEPREFIX`
+environment variables override their config entries. Keep the local config on your machine.
+
+For an automatic scenario, the preview lists the milestone, observation time, and per-build
+timeout. Each build starts its own clock. Perform the requested inputs and leave the window open.
+The runner closes it after the observation period and starts the next build. A first mesh bind
+or a title present request identifies renderer activity. Describe the actual image in your notes.
+A crash, an early close, or a timeout leaves a partial comparison. Both builds still get a turn.
+New builds use the game's normal suspend path. Older Windows builds receive a close request.
+On Linux, `wmctrl` enables window close for older builds on compatible desktops. If that fails,
+the runner terminates its test process and marks the ending in the report. `--manual` gives
+control back to the tester. Older kits use their written scenario unless you set `stop_after`
+in your config. A published automatic scenario takes precedence over local timing defaults.
+
 Gameplay comparisons start from the standard `7952987A` save. Place your local
 copy in `saves/7952987A/` at the checkout root, or beside an extracted runner
 in the same layout. It contains `saves/` with your progress and may also contain
@@ -85,8 +104,7 @@ can append it directly to the checkout command. Add `--plan` to preview the scen
 and build revisions. An extracted kit includes both builds and needs no GitHub login.
 
 1. Select your game's `.exe` when prompted. The runner checks both packages and starts
-   **main** first. Follow **WHAT TO DO** above the launch and close the game at the point
-   specified in the scenario.
+   **main** first. Follow **WHAT TO DO** above the launch. For a manual scenario, close the game at the specified point.
 2. The **candidate** opens next. Repeat the same steps with the same settings and window
    size. The runner gives each build its own fresh translation cache.
 3. After the runs, the **Hardware test results** screen shows each build’s timings.
@@ -210,6 +228,9 @@ the GitHub dispatch actor. The PR author can be a third person. Publication
 records the requester and their verified key at that time. If they have no key,
 the results screen offers local review and public summary sharing. Check
 `run-test.py PR_NUMBER --plan` for the intended account before inviting testers.
+When preparing a request, select device readiness, title present request 1,024, first mesh
+bind, or manual close. Set the observation time and startup-inclusive timeout for the scene.
+Use manual close when only the tester can identify the endpoint.
 After publication, [Verify the published hardware request](../.github/workflows/hardware-request-verify.yml)
 previews the PR by number using the same picker as testers. A successful preview
 adds `tester wanted` to the PR. If verification fails, fix the reported problem

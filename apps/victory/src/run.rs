@@ -55,6 +55,9 @@ pub fn run(
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
+    if execute {
+        victory_hle::modules::lifecycle::watch_test_close()?;
+    }
     let cfg = victory_core::Config::load()?;
     let started = diagnostics::operation_started();
     let original = std::fs::read(exe)

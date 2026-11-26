@@ -1,0 +1,19 @@
+# Copy to .victoryconfig in the checkout root or next to the extracted run-test.py.
+# A shared ~/.victoryconfig works across kits. Use plain paths without quotes.
+# Relative paths start at this file. Spaces and Windows backslashes are literal.
+[hardware]
+game_dir = ~/games/GTA6.Xbox.v1.0.2.1
+# Windows example: game_dir = D:\Games\GTA6.Xbox.v1.0.2.1
+# For another executable, title takes precedence over game_dir.
+# title = D:\Games\Game\title.exe
+save_dir = saves/7952987A
+# output_dir = ~/victory-reports
+# Linux only; blank uses the launcher's existing discovery and prefix.
+# proton_dir = ~/.local/share/Steam/steamapps/common/Proton - Experimental
+# wine_prefix = ~/.local/share/victory/proton
+
+# For older kits with no requested endpoint. Published endpoints take precedence.
+# Alternatives: manual, present-1024, first-mesh-bind.
+stop_after = device-ready
+observe_seconds = 180
+timeout_seconds = 900
