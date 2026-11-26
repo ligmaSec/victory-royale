@@ -8,7 +8,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::{Layout, alloc, dealloc};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -386,6 +386,15 @@ struct Slice {
     index: usize,
 }
 
+// A live view keeps its section handle alive even when its page numbers
+// are freed and assigned to a new section.
+impl Slice {
+    fn aliases(&self, base: usize, len: usize) -> impl Iterator<Item = (usize, usize, usize)> {
+        (0..len.div_ceil(PAGE))
+            .map(move |i| (self.section.0 as usize, self.index + i, base + i * PAGE))
+    }
+}
+
 #[derive(Default)]
 struct Physical {
     next_page: usize,
@@ -393,6 +402,9 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// (Section handle, page in section, title address). Built on the first
+    /// physical write and kept in step with successful mappings after that.
+    aliases: Option<BTreeSet<(usize, usize, usize)>>,
 }
 
 impl Physical {
@@ -580,6 +592,28 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     Some(runs)
 }
 
+/// Invalidate guarded GPU copies at every title address that shows the
+/// written section slices. The writer used its own writable view, so the
+/// normal write faults at those title addresses did not run.
+fn pages_written(slice: &Slice, within: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let first = slice.index + within / PAGE;
+    let after = slice.index + (within + len).div_ceil(PAGE);
+    let section = slice.section.0 as usize;
+    let mut physical = physical();
+    let Physical { views, aliases, .. } = &mut *physical;
+    let aliases = aliases.get_or_insert_with(|| {
+        views
+            .iter()
+            .flat_map(|(&base, (size, view))| view.aliases(base, *size))
+            .collect()
+    });
+    let affected = aliases.range((section, first, 0)..(section, after, 0));
+    victory_gpu::physical_pages_written(affected.map(|&(_, _, address)| address));
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
@@ -596,6 +630,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         };
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        pages_written(slice, within, k);
         (within, done) = (0, done + k);
     }
     true
@@ -605,6 +640,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
 /// until dropped: DirectStorage decodes into it instead of a buffer it
 /// would then copy.
 pub(crate) struct PageWindow {
+    slice: Slice,
     view: View,
     within: usize,
     len: usize,
@@ -614,6 +650,18 @@ impl PageWindow {
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
         let (within, len) = (self.within, self.len);
         &mut self.view.bytes()[within..within + len]
+    }
+
+    /// A successful decode knows how much it produced. On error the
+    /// decoder may already have changed any part of the window.
+    pub(crate) fn finish(mut self, written: usize) {
+        self.len = written.min(self.len);
+    }
+}
+
+impl Drop for PageWindow {
+    fn drop(&mut self) {
+        pages_written(&self.slice, self.within, self.len);
     }
 }
 
@@ -628,6 +676,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         return None;
     };
     Some(PageWindow {
+        slice: slice.clone(),
         view: View::map(slice, *n)?,
         within: offset % PAGE,
         len,
@@ -824,6 +873,9 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     for (at, len, part) in made {
         // New contents, read-write: the GPU side's copies no longer guard it.
         victory_gpu::title_memory_remapped(at, len);
+        if let Some(aliases) = &mut physical.aliases {
+            aliases.extend(part.aliases(at, len));
+        }
         physical.views.insert(at, (len, part));
     }
     true
@@ -989,6 +1041,11 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        if let Some(aliases) = &mut physical.aliases {
+            for alias in slice.aliases(at, size) {
+                aliases.remove(&alias);
+            }
+        }
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
@@ -1658,6 +1715,42 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn streamed_pages_refresh_only_the_aliases_present_at_completion() {
+        let (pages, base) = pages_and_reservation(4);
+        let at = |i: usize| base.wrapping_byte_add(i * PAGE);
+        let map_one = |i: usize, page: usize| {
+            assert_eq!(XMemMapPhysicalPages(at(i), 1, &page), at(i));
+        };
+        map_one(0, pages[0]);
+        map_one(1, pages[0]);
+        map_one(2, pages[2]);
+        map_one(3, pages[3]);
+        let mut pending = page_window(&pages, 5, 1).expect("one section page");
+
+        // While the decoder owns a window, replace its first alias, add
+        // another, and let the GPU refresh all four addresses.
+        map_one(0, pages[3]);
+        map_one(2, pages[0]);
+        let changes = |since| victory_gpu::buffer_writes_since(base as usize, 4 * PAGE, since);
+        let (before, _) = changes(0);
+        assert!(changes(before).1.is_empty());
+        pending.bytes()[0] = 71;
+        drop(pending);
+        let (after_window, dirty) = changes(before);
+        assert_eq!(dirty, [at(1) as usize, at(2) as usize]);
+        // Reordered physical pages take the copy path. Only the page
+        // containing the final byte and the page following it changed.
+        assert!(write_physical(&[pages[3], pages[0]], PAGE - 1, &[1, 2]));
+        assert_eq!(
+            changes(after_window).1,
+            [at(0), at(1), at(2), at(3)].map(|p| p as usize)
+        );
+
+        assert_eq!(XMemMapPhysicalPages(base, 4, std::ptr::null()), base);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
 
     /// `n` physical pages (consecutive slices of one section) and a

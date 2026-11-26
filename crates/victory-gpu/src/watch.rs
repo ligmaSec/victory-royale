@@ -12,11 +12,8 @@
 //! write access back. The runtime tells us when it maps or unmaps views
 //! ([`title_memory_remapped`]), which resets their protection.
 //!
-//! shortcut: writes into physical pages through another view (xmem's
-//! `write_physical`, DirectStorage's page destinations) are not seen at
-//! the guarded addresses; they go to the texture pool, whose textures are
-//! hashed, not guarded. A system call writing into a guarded block fails
-//! (none is known to).
+//! DirectStorage writes through its own views, so xmem reports the title
+//! aliases of the pages it finished writing via [`physical_pages_written`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -389,6 +386,16 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
     !blocks.is_empty()
+}
+
+/// A runtime write through a different view of the same physical pages
+/// bypassed the read-only guards. Forget the clean pages it changed; their
+/// protections remain in place for ordinary writes through title addresses.
+pub fn physical_pages_written(addresses: impl Iterator<Item = usize>) {
+    let mut g = guards();
+    for address in addresses {
+        g.clean.remove(&(address / BLOCK));
+    }
 }
 
 /// Before our own write into title memory `[at, at + len)` through the

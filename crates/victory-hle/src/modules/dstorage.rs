@@ -1129,7 +1129,9 @@ fn into_destination(
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        let written = fill(window.bytes())?;
+        window.finish(written);
+        return Ok(());
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
@@ -1930,6 +1932,13 @@ mod tests {
             mapped
         );
 
+        let base = mapped as usize;
+        let (before, _) = victory_gpu::buffer_writes_since(base, 2 * PAGE, 0);
+        assert!(
+            victory_gpu::buffer_writes_since(base, 2 * PAGE, before)
+                .1
+                .is_empty()
+        );
         let plain = pattern(100);
         let (queue, array) = (new_queue(1), status_array(1));
         let mut r = request(
@@ -1948,6 +1957,40 @@ mod tests {
         // SAFETY: both pages are mapped read-write.
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
         assert_eq!(seen, plain);
+        assert_eq!(
+            victory_gpu::buffer_writes_since(base, 2 * PAGE, before).1,
+            [base, base + PAGE]
+        );
+        // A short decode dirties just its output. A decoder reporting an
+        // error after an in-place write supplies no valid byte count.
+        r.page_offset = 0;
+        let (before, _) = victory_gpu::buffer_writes_since(base, 2 * PAGE, 0);
+        assert_eq!(
+            into_destination(&r, 2 * PAGE, |out| {
+                out[0] = 7;
+                Ok(1)
+            }),
+            Ok(())
+        );
+        let (after, dirty) = victory_gpu::buffer_writes_since(base, 2 * PAGE, before);
+        assert_eq!(dirty, [base]);
+        assert_eq!(
+            into_destination(&r, 2 * PAGE, |out| {
+                out[PAGE] = 8;
+                Err(INVALID_DATA)
+            }),
+            Err(INVALID_DATA)
+        );
+        assert_eq!(
+            victory_gpu::buffer_writes_since(base, 2 * PAGE, after).1,
+            [base, base + PAGE]
+        );
+        assert_eq!(
+            xmem::XMemMapPhysicalPages(mapped, 2, std::ptr::null()),
+            mapped
+        );
+        assert_eq!(xmem::XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        void(queue, 0x40);
     }
     #[test]
     fn zlib_into_pages_in_place_and_across_allocations() {
