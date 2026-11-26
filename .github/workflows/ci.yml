@@ -73,7 +73,13 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Hardware test kit (synthetic)
-        run: python -B tests/hardware-test.py
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VICTORY_TEST_AGE: "1"
+        run: |
+          python -B tests/hardware-test.py
+          python -B tests/hardware-delivery.py
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
@@ -82,6 +88,16 @@ jobs:
       # Keep the workspace test run deterministic across Windows GPU/driver configurations.
       - name: Tests
         run: cargo test --workspace --locked -- --test-threads=1
+
+      - name: Check shadow copy-back on WARP
+        env:
+          VICTORY_D3D12_WARP: "1"
+        run: cargo test -p victory-gpu --lib --features diagnostics --locked later_gpu_write_range_keeps_the_titles_newer_bytes -- --test-threads=1
+
+      - name: World capture readback on WARP
+        env:
+          VICTORY_D3D12_WARP: "1"
+        run: cargo test -p victory-gpu --lib --features diagnostics --locked world_capture -- --test-threads=1
 
   msrv:
     needs: fmt-policy
@@ -116,7 +132,14 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Hardware test kit (synthetic)
-        run: python -B tests/hardware-test.py
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VICTORY_TEST_AGE: "1"
+        # Exercise the contributor's terminal entry point without keyboard input.
+        run: |
+          timeout 60s script -qec 'python3 -B tests/hardware-test.py' /dev/null </dev/null
+          python3 -B tests/hardware-delivery.py
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests

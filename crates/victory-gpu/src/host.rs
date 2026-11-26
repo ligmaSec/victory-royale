@@ -922,12 +922,10 @@ impl Host {
         })
     }
 
-    /// Whether the host adapter accepts `WaveSize(32)` compute shaders; logged
-    /// once. Adapters that only support 64-lane waves (`WaveLaneCountMin == 64`)
-    /// return `false` so eligible <=32-thread Wave64 reductions keep `WaveSize(64)`.
-    pub(crate) fn supports_wave32(&self) -> bool {
-        static WAVE32: OnceLock<bool> = OnceLock::new();
-        *WAVE32.get_or_init(|| {
+    /// Compute wave translations that this adapter can execute.
+    pub(crate) fn wave_widths(&self) -> victory_shader::emit::ComputeWaves {
+        static WIDTHS: OnceLock<victory_shader::emit::ComputeWaves> = OnceLock::new();
+        *WIDTHS.get_or_init(|| {
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
             // SAFETY: query writes its own `D3D12_FEATURE_DATA_D3D12_OPTIONS1` struct.
             let ok = unsafe {
@@ -939,19 +937,19 @@ impl Host {
                     )
                     .is_ok()
             };
-            let wave32 = ok
-                && wave32_supported(
-                    options.WaveOps.as_bool(),
-                    options.WaveLaneCountMin,
-                    options.WaveLaneCountMax,
-                );
+            let widths = wave_widths(
+                ok && options.WaveOps.as_bool(),
+                options.WaveLaneCountMin,
+                options.WaveLaneCountMax,
+            );
             tracing::info!(
-                wave32,
+                wave32 = widths.wave32,
+                narrow_quads = widths.narrow_quads,
                 min = options.WaveLaneCountMin,
                 max = options.WaveLaneCountMax,
-                "host wave32 support"
+                "host compute wave widths"
             );
-            wave32
+            widths
         })
     }
 
@@ -4435,23 +4433,30 @@ mod eager_gbv_tests {
     }
 }
 
-/// Whether D3D12 wave-ops capabilities allow fixed `WaveSize(32)`.
-fn wave32_supported(wave_ops: bool, min: u32, max: u32) -> bool {
-    wave_ops && min <= 32 && max >= 32
+fn wave_widths(wave_ops: bool, min: u32, max: u32) -> victory_shader::emit::ComputeWaves {
+    let range = min..=max;
+    victory_shader::emit::ComputeWaves {
+        wave32: wave_ops && range.contains(&32),
+        narrow_quads: wave_ops && (4..64).contains(&max) && (4..=max).contains(&min),
+    }
 }
 
 #[cfg(test)]
 mod wave_tests {
-    use super::wave32_supported;
-
     #[test]
-    fn wave32_support_matches_adapter_lane_range() {
-        assert!(wave32_supported(true, 32, 32)); // NVIDIA
-        assert!(wave32_supported(true, 32, 64)); // AMD RDNA
-        assert!(wave32_supported(true, 16, 32)); // Intel Xe/Arc
-        assert!(wave32_supported(true, 4, 128)); // WARP
-        assert!(!wave32_supported(true, 64, 64)); // Wave64-only (GCN/Vega)
-        assert!(!wave32_supported(false, 32, 32)); // No wave ops
+    fn supported_widths_match_adapter_lane_range() {
+        for (ops, min, max, expected) in [
+            (true, 32, 32, (true, true)),
+            (true, 32, 64, (true, false)),
+            (true, 16, 32, (true, true)),
+            (true, 8, 8, (false, true)),
+            (true, 4, 128, (true, false)),
+            (true, 64, 64, (false, false)),
+            (false, 32, 32, (false, false)),
+        ] {
+            let widths = super::wave_widths(ops, min, max);
+            assert_eq!((widths.wave32, widths.narrow_quads), expected);
+        }
     }
 }
 

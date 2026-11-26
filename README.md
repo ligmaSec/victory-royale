@@ -23,7 +23,7 @@ World gameplay remains unplayable. On Windows a GPU hang can trigger a display
 driver reset. Use the diagnostics build with `VICTORY_D3D12_WARP=1` to
 investigate on the software adapter.
 
-Testing a pull request on Windows or Linux/Proton? The [interactive Series X test](docs/testing.md#run-a-series-x-hardware-test) runs both builds and gives you one ZIP to send back.
+Testing a pull request on Windows or Linux/Proton? The [interactive hardware test](docs/testing.md#run-a-hardware-test) runs both builds and gives you one ZIP to send back.
 
 ## Run on Linux
 
@@ -169,15 +169,15 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_CAPTURE_WORLD=1` | with `VICTORY_CAPTURE`, also saves the first frame that ran 500 draws (the world's first), its 2nd and 6th followers, and logs that frame |
-| `VICTORY_DUMP_TARGETS=1` | with `VICTORY_CAPTURE` and `VICTORY_CAPTURE_FRAMES`, saves every render target of those frames |
+| `VICTORY_CAPTURE_WORLD=1` | with `VICTORY_CAPTURE`, also saves the first frame that ran at least 500 draws and the frames two and six presents later. The log identifies the first frame |
+| `VICTORY_DUMP_TARGETS=1` | with `VICTORY_CAPTURE`, saves supported targets bound or written on explicitly listed frames and the two `VICTORY_CAPTURE_WORLD` follow-ups |
 | `VICTORY_SHOW_TARGET=2560x1440-f28` | shows the last render target of that size and DXGI format each frame instead of the title's frame (copied 1:1 to the top left, only when its format matches the window's), e.g. the world's geometry while its lit image is black |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_GBV_EAGER=1` | with the two above, compile the active GPU validation shader variant at pipeline creation rather than first bind |
 | `VICTORY_D3D12_GBV_EAGER=guarded` | as above, explicitly selecting guarded GPU validation (fails host initialization if guarded mode cannot be verified; diagnostics only) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_LOG=victory_gpu::draw=debug` | with frames listed for capture: one line per draw and dispatch of those frames with its targets (named as in the `VICTORY_DUMP_TARGETS` files) and, if it was dropped, why |
+| `VICTORY_LOG=victory_gpu::draw=debug` | on explicitly listed frames and the two world follow-ups, logs each draw or dispatch with its targets (named as in the `VICTORY_DUMP_TARGETS` files) and, if it was dropped, why |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_SKIP_HOST_PSOS=<name>,...` | omit a host pipeline whose 32-digit library name matches exactly; get names and worker thread IDs with `VICTORY_TRACE_PIPELINES=1` |
 | `VICTORY_SKIP_WAVE64=mesh,compute` | omit draws and dispatches whose pipeline has a program of a listed stage written for 64-lane waves (on hosts with 32-lane waves, such as NVIDIA's, these can hang the GPU) |

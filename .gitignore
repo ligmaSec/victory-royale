@@ -10,9 +10,13 @@
 # Build output
 /target/
 /tests/fixtures/*/target/
+/scripts/hardware-test/__pycache__/*.pyc
 
 # Local configuration (contains paths to YOUR files)
 /victory.toml
+
+# Standard hardware-test save supplied locally.
+/saves/
 
 # Places people tend to drop data into. Keep data outside the repo instead.
 /game/

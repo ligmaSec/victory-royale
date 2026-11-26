@@ -80,4 +80,19 @@ mod watch;
 #[cfg(windows)]
 pub use host::{HdrDisplayInfo, display_hdr_info, on_failure, write_title_memory};
 #[cfg(windows)]
-pub use watch::{kernel_will_write, kernel_wrote, title_memory_remapped};
+pub use watch::{kernel_will_write, kernel_wrote, physical_pages_written, title_memory_remapped};
+
+/// Inspect the buffer write journal in cross-crate memory integration tests.
+#[cfg(all(windows, feature = "test-support"))]
+#[doc(hidden)]
+pub fn buffer_writes_since(address: usize, len: usize, since: u64) -> (u64, Vec<usize>) {
+    let (now, pages) = watch::writes(address, address + len, true).expect("mapped title buffer");
+    (
+        now,
+        pages
+            .into_iter()
+            .filter(|&(_, time)| time > since)
+            .map(|(page, _)| page * watch::PAGE)
+            .collect(),
+    )
+}

@@ -361,13 +361,9 @@ impl Shader {
             // This pipeline owns the finished variant. The shared shader
             // retains the source for any other pipeline that needs it.
             container: Vec::new(),
-            translated: Some(Translated {
-                host,
-                used: native.used,
-            })
-            .into(),
             #[cfg(feature = "diagnostics")]
             wave64: native.wave64.into(),
+            translated: Some(Translated::from_native(host, native)).into(),
         }))
     }
 }
@@ -384,9 +380,26 @@ pub(crate) fn bound_pipeline(
     super::make::ready_with_strides(&super::pipeline(this).host, view_stride)
 }
 
+/// The caller has already bound a live compute pipeline at `this`.
+pub(crate) fn thread_dispatch(
+    this: crate::object::This,
+    base: Arc<HostPipeline>,
+    dims: [u32; 3],
+) -> Option<(Arc<HostPipeline>, [u32; 3])> {
+    let pending = &super::pipeline(this).host;
+    let (groups, partial) = crate::list::thread_groups(dims, base.compute_threads?)?;
+    let pipeline = if partial {
+        super::make::ready_variant(pending, &base.structured_strides, true)?
+    } else {
+        base
+    };
+    Some((pipeline, groups))
+}
+
 pub(crate) struct HostPipeline {
     /// A compute pipeline (else graphics).
     pub(crate) compute: bool,
+    pub(crate) compute_threads: Option<[u32; 3]>,
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
     /// The geometry stage completes rectangle-list primitives after vertex shading.
@@ -651,6 +664,7 @@ impl HostPipeline {
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
+                compute_threads: bound[0].translated().compute_threads,
                 mesh: false,
                 pso,
                 root,
@@ -689,6 +703,7 @@ impl HostPipeline {
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
+                compute_threads: None,
                 mesh: true,
                 pso,
                 root,
@@ -829,6 +844,7 @@ impl HostPipeline {
         );
         Some(HostPipeline {
             compute: false,
+            compute_threads: None,
             mesh: false,
             pso,
             root,

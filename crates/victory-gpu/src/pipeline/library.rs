@@ -4,9 +4,8 @@
 //! 1. Every host pipeline goes into the host's pipeline library, named by
 //!    a hash of all that its host description holds (the translated
 //!    shaders' code, which changes when a translation does, our root
-//!    signature, the graphics state). The library is saved under the cache
-//!    folder; the host refuses a library of another adapter or driver, and
-//!    an entry whose description differs, so neither is ever used.
+//!    signature, the graphics state). Each adapter has a cache directory.
+//!    D3D12 checks the driver and pipeline description before reuse.
 //! 2. The title pipelines a run drew or dispatched with are listed by a key
 //!    known when the title creates them (their shader containers and
 //!    graphics state); the next run hands those to the workers at
@@ -18,20 +17,25 @@
 //! parallel. Stores also hold `SERIALISING` shared and a save holds it
 //! exclusively, so the size cannot change between `GetSerializedSize` and
 //! `Serialize`; loads never touch it, so a save never blocks them.
+//! Across processes, each cache file has a sibling `.lock` file. A writer
+//! holds its exclusive handle only while replacing the destination. Periodic
+//! saves wait up to 250 ms per file. The final save can wait two seconds per
+//! file because shutdown has no later opportunity to publish the compiled work.
 
 use std::collections::HashSet;
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock, TryLockError};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Keeps the pipeline library and the early list in `dir` from now on.
+/// Stores the early list in `dir` and compiled libraries in `dir/adapters/<key>/`.
 pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
@@ -73,6 +77,66 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
+const PERIODIC_LOCK_WAIT: Duration = Duration::from_millis(250);
+const FINAL_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+fn device_adapter(device: &ID3D12Device) -> Option<DXGI_ADAPTER_DESC1> {
+    // SAFETY: these calls query the live device and DXGI adapter metadata.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(device.GetAdapterLuid()).ok()?;
+        adapter.GetDesc1().ok()
+    }
+}
+
+fn adapter_cache_dir(root: &Path, adapter: &DXGI_ADAPTER_DESC1) -> PathBuf {
+    // The LUID identifies the current DXGI adapter, but is not a disk key.
+    let kind = if adapter.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+        "software"
+    } else {
+        "hardware"
+    };
+    root.join("adapters").join(format!(
+        "{kind}-{:04x}-{:04x}-{:08x}-{:02x}",
+        adapter.VendorId, adapter.DeviceId, adapter.SubSysId, adapter.Revision
+    ))
+}
+
+fn cache_dir(root: &Path) -> PathBuf {
+    static ADAPTER: OnceLock<Option<DXGI_ADAPTER_DESC1>> = OnceLock::new();
+    let adapter = ADAPTER.get_or_init(|| device_adapter(&crate::host::host()?.device));
+    match adapter {
+        Some(desc) => adapter_cache_dir(root, desc),
+        None => root.join("adapters").join("unknown"),
+    }
+}
+
+fn read_cache(root: &Path, adapter: &Path) -> Vec<u8> {
+    match std::fs::read(adapter.join(LIBRARY_FILE)) {
+        Ok(blob) => blob,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::read(root.join(LIBRARY_FILE)).unwrap_or_default()
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+fn write_cache(
+    root: &Path,
+    adapter: &Path,
+    blob: &[u8],
+    early: &[u8],
+    final_save: bool,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(adapter)?;
+    let wait = if final_save {
+        FINAL_LOCK_WAIT
+    } else {
+        PERIODIC_LOCK_WAIT
+    };
+    write_atomically(&adapter.join(LIBRARY_FILE), blob, wait)?;
+    write_atomically(&root.join(EARLY_FILE), early, wait)
+}
 
 fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
@@ -81,7 +145,7 @@ fn library() -> Option<&'static Library> {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR
                 .get()
-                .and_then(|d| std::fs::read(d.join(LIBRARY_FILE)).ok())
+                .map(|root| read_cache(root, &cache_dir(root)))
                 .unwrap_or_default();
             let library = open(&device, blob);
             if library.is_none() {
@@ -321,9 +385,7 @@ pub(crate) fn save(now: bool) {
         .flatten()
         .cloned()
         .collect();
-    let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+    let written = write_cache(dir, &cache_dir(dir), &blob, used.join("\n").as_bytes(), now);
     match written {
         Ok(()) => {
             // Keep pipelines stored while the files were being written; only
@@ -351,10 +413,38 @@ pub(crate) fn save(now: bool) {
     }
 }
 
+/// Take turns replacing the cache entry across processes. Proton can deny a
+/// concurrent rename even when every writer has its own staging file.
+fn publish_cache_file(tmp: &Path, path: &Path, wait: Duration) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+    let lock_path = path.with_extension("lock");
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0);
+    let started = Instant::now();
+    loop {
+        match options.open(&lock_path) {
+            Ok(_exclusive_handle) => return std::fs::rename(tmp, path),
+            Err(e)
+                if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION.0 as i32)
+                    && started.elapsed() < wait =>
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Writes `bytes` to a unique temporary file beside `path`, then renames it
 /// over `path`: a reader never sees a part, and overlapping saves do not
 /// share a temporary file.
-fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_atomically(path: &Path, bytes: &[u8], wait: Duration) -> std::io::Result<()> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let extension = format!(
         "tmp-{}-{}",
@@ -362,7 +452,7 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
         NEXT.fetch_add(1, Ordering::Relaxed)
     );
     let tmp = path.with_extension(extension);
-    let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    let written = std::fs::write(&tmp, bytes).and_then(|()| publish_cache_file(&tmp, path, wait));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -408,6 +498,87 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switching_adapters_keeps_each_library_and_shares_early_draw_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let nvidia = adapter_cache_dir(
+            root,
+            &DXGI_ADAPTER_DESC1 {
+                VendorId: 0x10de,
+                DeviceId: 0x2c18,
+                ..Default::default()
+            },
+        );
+        let intel = adapter_cache_dir(
+            root,
+            &DXGI_ADAPTER_DESC1 {
+                VendorId: 0x8086,
+                DeviceId: 0x7d67,
+                ..Default::default()
+            },
+        );
+        let warp = adapter_cache_dir(
+            root,
+            &DXGI_ADAPTER_DESC1 {
+                VendorId: 0x1414,
+                DeviceId: 0x008c,
+                Flags: DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32,
+                ..Default::default()
+            },
+        );
+        std::fs::write(root.join(LIBRARY_FILE), b"legacy").unwrap();
+        assert_eq!(read_cache(root, &nvidia), b"legacy");
+
+        for (dir, blob) in [
+            (&nvidia, &b"gpu A"[..]),
+            (&intel, b"gpu B"),
+            (&warp, b"software"),
+        ] {
+            write_cache(root, dir, blob, b"shared draw keys", false).unwrap();
+        }
+        assert_eq!(read_cache(root, &nvidia), b"gpu A");
+        assert_eq!(read_cache(root, &intel), b"gpu B");
+        assert_eq!(read_cache(root, &warp), b"software");
+        assert_eq!(std::fs::read(root.join(LIBRARY_FILE)).unwrap(), b"legacy");
+        assert_eq!(
+            std::fs::read(root.join(EARLY_FILE)).unwrap(),
+            b"shared draw keys"
+        );
+    }
+
+    #[test]
+    #[ignore = "creates D3D12 devices on every available DXGI adapter"]
+    fn each_d3d12_device_uses_its_own_dxgi_adapter() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+
+        // SAFETY: the factory, adapters and devices stay live for all queries.
+        unsafe {
+            let Ok(factory): windows::core::Result<IDXGIFactory4> =
+                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return;
+            };
+            let hardware = (0..).map_while(|i| factory.EnumAdapters1(i).ok());
+            for adapter in hardware.chain(factory.EnumWarpAdapter::<IDXGIAdapter1>()) {
+                let mut device: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                    continue;
+                }
+                let expected = adapter.GetDesc1().unwrap();
+                let actual = device_adapter(&device.unwrap()).expect("device adapter metadata");
+                assert_eq!(actual.AdapterLuid, expected.AdapterLuid);
+                let path = adapter_cache_dir(Path::new("cache"), &actual);
+                eprintln!(
+                    "{}: {}",
+                    String::from_utf16_lossy(&actual.Description).trim_end_matches('\0'),
+                    path.display()
+                );
+                assert_eq!(path, adapter_cache_dir(Path::new("cache"), &expected));
+            }
+        }
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
@@ -521,7 +692,7 @@ mod tests {
                 start.wait();
                 let byte = thread as u8 + 1;
                 for _ in 0..32 {
-                    write_atomically(&path, &[byte; 64 * 1024]).unwrap();
+                    write_atomically(&path, &[byte; 64 * 1024], PERIODIC_LOCK_WAIT).unwrap();
                 }
             }));
         }
@@ -542,12 +713,69 @@ mod tests {
     }
 
     #[test]
+    fn a_writer_publishes_after_a_competing_cache_save_finishes() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        for (final_save, hold) in [(false, 20), (true, 500)] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let adapter = root.join("adapter");
+            std::fs::create_dir(&adapter).unwrap();
+            let lock = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .share_mode(0)
+                .open(adapter.join(LIBRARY_FILE).with_extension("lock"))
+                .unwrap();
+
+            std::thread::scope(|scope| {
+                let writer =
+                    scope.spawn(|| write_cache(root, &adapter, b"compiled", b"draws", final_save));
+                // The sibling staging file appears before the first lock attempt.
+                while !writer.is_finished() && std::fs::read_dir(&adapter).unwrap().count() == 1 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(Duration::from_millis(hold));
+                drop(lock);
+                writer.join().unwrap().unwrap();
+            });
+            assert_eq!(
+                std::fs::read(adapter.join(LIBRARY_FILE)).unwrap(),
+                b"compiled"
+            );
+            assert_eq!(std::fs::read(root.join(EARLY_FILE)).unwrap(), b"draws");
+        }
+    }
+
+    #[test]
+    fn a_busy_publisher_leaves_the_previous_cache_for_the_next_save() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        write_atomically(&path, b"previous", PERIODIC_LOCK_WAIT).unwrap();
+        let other = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(0)
+            .open(path.with_extension("lock"))
+            .unwrap();
+
+        assert!(write_atomically(&path, b"busy", PERIODIC_LOCK_WAIT).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        drop(other);
+
+        write_atomically(&path, b"next", PERIODIC_LOCK_WAIT).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"next");
+    }
+
+    #[test]
     fn failed_atomic_writes_remove_their_temporary_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LIBRARY_FILE);
         std::fs::create_dir(&path).unwrap();
 
-        assert!(write_atomically(&path, b"not published").is_err());
+        assert!(write_atomically(&path, b"not published", PERIODIC_LOCK_WAIT).is_err());
         assert!(
             !std::fs::read_dir(dir.path())
                 .unwrap()

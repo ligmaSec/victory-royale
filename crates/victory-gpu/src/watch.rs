@@ -12,11 +12,8 @@
 //! write access back. The runtime tells us when it maps or unmaps views
 //! ([`title_memory_remapped`]), which resets their protection.
 //!
-//! shortcut: writes into physical pages through another view (xmem's
-//! `write_physical`, DirectStorage's page destinations) are not seen at
-//! the guarded addresses; they go to the texture pool, whose textures are
-//! hashed, not guarded. A system call writing into a guarded block fails
-//! (none is known to).
+//! DirectStorage writes through its own views, so xmem reports the title
+//! aliases of the pages it finished writing via [`physical_pages_written`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -38,6 +35,14 @@ struct Journal {
 }
 
 impl Journal {
+    /// A successful reset consumes the kernel's dirty bits. Preserve them
+    /// even if a later allocation in the same range cannot be watched.
+    fn record_reset(&mut self, count: usize) {
+        for &address in &self.found[..count] {
+            self.written.insert(address / PAGE, self.asked);
+        }
+    }
+
     fn snapshot(&self, first: usize, last: usize) -> (u64, Vec<(usize, u64)>) {
         (
             self.asked,
@@ -66,12 +71,12 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    j.asked += 1;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // Clean mapped-view blocks are still protected. A write, kernel-write
     // announcement or remap invalidates the corresponding entries.
     if guarded && first < last && guards().clean.range(first..last).copied().eq(first..last) {
-        j.asked += 1;
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
@@ -94,39 +99,35 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             &mut granularity,
         )
     } != 0;
-    let guarded = if failed {
-        count = 0;
-        match by_allocation(first * PAGE, last * PAGE, &mut j.found) {
-            Some(pages) => pages,
-            None if !guarded => return None,
-            None => guard(first * PAGE, last * PAGE)?,
+    if failed {
+        if by_allocation(first * PAGE, last * PAGE, j).is_none() {
+            if !guarded {
+                return None;
+            }
+            for page in guard(first * PAGE, last * PAGE)? {
+                j.written.insert(page, j.asked);
+            }
         }
     } else {
-        Vec::new()
-    };
+        j.record_reset(count);
+    }
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
     }
-    j.asked += 1;
-    let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
-    }
     Some(j.snapshot(first, last))
 }
 
-/// The pages of `[start, end)` written, asked allocation by allocation:
-/// the kernel refuses a range over several (a title buffer spans as many
-/// allocations as the runtime made for it). Parts never committed cannot
+/// Journal dirty pages allocation by allocation when the kernel refuses
+/// the whole range. A title buffer can span several allocations. Each
+/// successful reset is recorded before the next query. Parts never committed cannot
 /// have been written, so a range none of which is committed (a reserved
 /// allocation the title has not committed yet) has no writes. `None` if a
 /// committed part is not write-watched (or the range is one committed
 /// allocation, already refused).
-fn by_allocation(start: usize, end: usize, found: &mut Vec<usize>) -> Option<Vec<usize>> {
+fn by_allocation(start: usize, end: usize, journal: &mut Journal) -> Option<()> {
     use windows_sys::Win32::System::Memory::{
         GetWriteWatch, MEM_COMMIT, MEM_FREE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -137,7 +138,7 @@ fn by_allocation(start: usize, end: usize, found: &mut Vec<usize>) -> Option<Vec
         let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
         (n != 0).then_some(info)
     };
-    let (mut pages, mut at, mut allocations, mut any) = (Vec::new(), start, 0, false);
+    let (mut at, mut allocations, mut any) = (start, 0, false);
     while at < end {
         let info = query(at)?;
         // A committed section view cannot belong to a MEM_WRITE_WATCH
@@ -161,7 +162,7 @@ fn by_allocation(start: usize, end: usize, found: &mut Vec<usize>) -> Option<Vec
         any |= committed;
         if committed {
             let mut count = (to - at) / KERNEL_PAGE;
-            found.resize(count.max(found.len()), 0);
+            journal.found.resize(count.max(journal.found.len()), 0);
             let mut granularity = 0;
             // SAFETY: the answer buffer holds `count` entries.
             let failed = unsafe {
@@ -169,7 +170,7 @@ fn by_allocation(start: usize, end: usize, found: &mut Vec<usize>) -> Option<Vec
                     WRITE_WATCH_FLAG_RESET,
                     at as *const _,
                     to - at,
-                    found.as_mut_ptr().cast(),
+                    journal.found.as_mut_ptr().cast(),
                     &mut count,
                     &mut granularity,
                 )
@@ -177,11 +178,11 @@ fn by_allocation(start: usize, end: usize, found: &mut Vec<usize>) -> Option<Vec
             if failed {
                 return None;
             }
-            pages.extend(found[..count].iter().map(|&a| a / PAGE));
+            journal.record_reset(count);
         }
         at = to;
     }
-    (allocations > 1 || !any).then_some(pages)
+    (allocations > 1 || !any).then_some(())
 }
 
 /// Guarded blocks of view memory.
@@ -387,6 +388,16 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     !blocks.is_empty()
 }
 
+/// A runtime write through a different view of the same physical pages
+/// bypassed the read-only guards. Forget the clean pages it changed; their
+/// protections remain in place for ordinary writes through title addresses.
+pub fn physical_pages_written(addresses: impl Iterator<Item = usize>) {
+    let mut g = guards();
+    for address in addresses {
+        g.clean.remove(&(address / BLOCK));
+    }
+}
+
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// For the title's kernel reads, which other threads' refreshes can
@@ -576,32 +587,28 @@ mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
-    /// Two write-watched allocations side by side (the runtime reserves
-    /// title memory allocation by allocation), asked about as one range, as
-    /// a buffer spanning them is: the pages written in each are reported.
-    #[test]
-    fn a_range_over_several_watched_allocations_is_watched() {
-        let (a, b) = loop {
+    fn adjacent_allocations(second_flags: u32) -> (usize, usize) {
+        loop {
             // SAFETY: a probe reservation, released at once to find room for two.
             let span =
                 unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE) };
             assert!(!span.is_null());
             // SAFETY: the probe above.
             unsafe { VirtualFree(span, 0, MEM_RELEASE) };
-            let at = |p: usize| {
+            let at = |p: usize, flags: u32| {
                 // SAFETY: a fixed address in the room just released.
                 let got = unsafe {
                     VirtualAlloc(
                         p as *const _,
                         2 * PAGE,
-                        MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                        MEM_RESERVE | MEM_COMMIT | flags,
                         PAGE_READWRITE,
                     )
                 };
                 got as usize
             };
-            let a = at(span as usize);
-            let b = at(span as usize + 2 * PAGE);
+            let a = at(span as usize, MEM_WRITE_WATCH);
+            let b = at(span as usize + 2 * PAGE, second_flags);
             if a != 0 && b != 0 {
                 break (a, b);
             }
@@ -609,7 +616,15 @@ mod tests {
                 // SAFETY: ours.
                 unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
             }
-        };
+        }
+    }
+
+    /// Two write-watched allocations side by side (the runtime reserves
+    /// title memory allocation by allocation), asked about as one range, as
+    /// a buffer spanning them is: the pages written in each are reported.
+    #[test]
+    fn a_range_over_several_watched_allocations_is_watched() {
+        let (a, b) = adjacent_allocations(MEM_WRITE_WATCH);
         let _ = writes(a, b + 2 * PAGE, false);
         // SAFETY: committed pages of ours.
         unsafe {
@@ -620,6 +635,51 @@ mod tests {
         assert_eq!(found, [(a / PAGE, now), (b / PAGE + 1, now)]);
         // Not freed: the journal keeps these pages, and a later test given
         // the same addresses would find them written.
+    }
+
+    #[test]
+    fn a_mixed_range_preserves_dirty_pages_for_an_overlapping_buffer() {
+        let (a, b) = adjacent_allocations(0);
+        for guarded in [false, true] {
+            let (before, _) = writes(a, a + PAGE, guarded).expect("first allocation is watched");
+            // SAFETY: the adjoining test allocations stay committed throughout the test.
+            unsafe { ((a + 8) as *mut u8).write_volatile(42) };
+            assert!(
+                writes(a, b + PAGE, guarded).is_none(),
+                "second allocation is unwatched"
+            );
+            let (_, narrow) =
+                writes(a, a + PAGE, guarded).expect("first allocation is still watched");
+            assert!(
+                narrow
+                    .iter()
+                    .any(|&(page, stamp)| page == a / PAGE && stamp > before),
+                "the wide refresh lost a write needed by the overlapping narrow buffer"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_host_copy_sees_the_write_after_a_mixed_buffer_refresh() {
+        let _scope = crate::host::isolated_retire_scope();
+        if crate::host::host().is_none() {
+            return;
+        }
+        let (a, _) = adjacent_allocations(0);
+        let narrow = a + PAGE;
+        crate::shadow::register(a, a as u64, 4 * PAGE as u64);
+        crate::shadow::register(narrow, narrow as u64, PAGE as u64);
+        let wide = crate::shadow::find(a as u64, 4 * PAGE as u64).unwrap();
+        let view = crate::shadow::find(narrow as u64, PAGE as u64).unwrap();
+        view.update(narrow, PAGE);
+        // SAFETY: the narrow range belongs to our committed write-watched allocation.
+        unsafe { ((narrow + 8) as *mut u8).write_volatile(42) };
+        wide.update(a, 4 * PAGE);
+        view.update(narrow, PAGE);
+        let byte = view.bytes((narrow + 8) as u64, 1).unwrap()[0];
+        crate::shadow::unregister(narrow, narrow as u64);
+        crate::shadow::unregister(a, a as u64);
+        assert_eq!(byte, 42, "overlapping buffer still holds its old byte");
     }
 
     /// A range in an allocation reserved but not committed yet (as the

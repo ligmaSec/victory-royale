@@ -634,6 +634,16 @@ impl State {
         let Some(p) = self.bound_pipeline(false) else {
             return false;
         };
+        self.prepare_graphics(list, indexed, mesh, &p)
+    }
+
+    fn prepare_graphics(
+        &mut self,
+        list: &HostList,
+        indexed: bool,
+        mesh: bool,
+        p: &HostPipeline,
+    ) -> bool {
         if p.compute || p.mesh != mesh {
             once!(
                 mesh,
@@ -645,7 +655,7 @@ impl State {
             once!("a rectangle pipeline drawn with another topology");
             return false;
         }
-        if !self.bind(list, &p, false) {
+        if !self.bind(list, p, false) {
             return false;
         }
         let l = &list.list;
@@ -724,6 +734,16 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        self.bind_dispatch::<false>(list, p, compute, [0; 3])
+    }
+
+    fn bind_dispatch<const THREADS: bool>(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        compute: bool,
+        dims: [u32; 3],
+    ) -> bool {
         list.mark_work();
         self.depth_sampled = false;
         let l = &list.list;
@@ -803,6 +823,10 @@ impl State {
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
+                    if THREADS && u.root == victory_shader::emit::DISPATCH_THREADS {
+                        values[u.index as usize] = dims[u.dword as usize];
+                        continue;
+                    }
                     if u.indexed_buffer {
                         let selected =
                             self.user_value(compute, u.slot, RootType::Constants, u.dword);
@@ -962,7 +986,7 @@ impl State {
         let host = heap.host()?;
         // The console forms this byte offset with a 32-bit shift by five.
         let Some(read) = heap.selected_buffer(selected & (u32::MAX >> 5)) else {
-            return Some([self.raw_slot(host, key, RawAccess::Read, None)?, 0, 0]);
+            return Some([self.raw_slot(host, key, RawAccess::Read, None)? << 4, 0, 0]);
         };
         let offset = read.shadow.offset(read.address);
         let bias = offset % 16;
@@ -980,7 +1004,9 @@ impl State {
         };
         read.shadow
             .refresh_as(list, read.address, read.bytes, state);
-        Some([index, read.stride, bias as u32])
+        // VIEW_HEAP_LIMIT leaves room for the four-bit alignment bias.
+        const { assert!(victory_shader::emit::VIEW_HEAP_LIMIT <= 1 << 28) };
+        Some([(index << 4) | bias as u32, read.stride, read.bytes as u32])
     }
 
     /// Bind a raw view of the remaining host buffer. A writable view, its
@@ -1236,12 +1262,30 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    pub(crate) fn dispatch_mode<const THREADS: bool>(
+        &mut self,
+        list: &HostList,
+        x: u32,
+        y: u32,
+        z: u32,
+    ) {
+        let dims = [x, y, z];
+        #[cfg(feature = "diagnostics")]
+        let describe = || {
+            if THREADS {
+                format!("thread dispatch {x}x{y}x{z}")
+            } else {
+                format!("dispatch {x}x{y}x{z}")
+            }
+        };
+        if THREADS && dims.contains(&0) {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
-            self.frame_op(&format!("dispatch {x}x{y}x{z}"), true, false);
+            self.frame_op(&describe(), true, false);
             return;
         }
         let Some(p) = self.bound_pipeline(true) else {
@@ -1253,34 +1297,46 @@ impl State {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             #[cfg(feature = "diagnostics")]
-            self.frame_op(&format!("dispatch {x}x{y}x{z}"), true, false);
+            self.frame_op(&describe(), true, false);
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
             #[cfg(feature = "diagnostics")]
-            self.frame_op_why(
-                &format!("dispatch {x}x{y}x{z}"),
-                true,
-                false,
-                Some("a graphics pipeline"),
-            );
+            self.frame_op_why(&describe(), true, false, Some("a graphics pipeline"));
             return;
         }
-        if !self.bind(list, &p, true) {
+        let (p, [x, y, z]) = if THREADS {
+            let Some(plan) = crate::pipeline::host::thread_dispatch(self.pipeline as This, p, dims)
+            else {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                self.frame_op_why(
+                    &describe(),
+                    true,
+                    false,
+                    Some("invalid size or partial compute pipeline unavailable"),
+                );
+                return;
+            };
+            plan
+        } else {
+            (p, dims)
+        };
+        if !self.bind_dispatch::<THREADS>(list, &p, true, dims) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        list.note_op(|| self.op_text(describe(), true));
         #[cfg(feature = "diagnostics")]
-        self.frame_op(&format!("dispatch {x}x{y}x{z}"), true, true);
+        self.frame_op(&describe(), true, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// In frames listed for capture, at debug level: one line per draw or
+    /// In detailed capture frames, at debug level: one line per draw or
     /// dispatch with its render targets and depth (named as in
     /// `VICTORY_DUMP_TARGETS` files) and whether it ran, else why it was
     /// dropped (diagnostics builds).
@@ -1293,9 +1349,11 @@ impl State {
     /// was looked at (else the pipeline's).
     #[cfg(feature = "diagnostics")]
     fn frame_op_why(&self, kind: &str, compute: bool, ran: bool, why: Option<&str>) {
-        if !tracing::enabled!(tracing::Level::DEBUG)
-            || !crate::capture::listed(crate::queue::presented() + 1)
-        {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let frame = crate::queue::presented() + 1;
+        if !crate::capture::detailed(frame) {
             return;
         }
         let targets: Vec<String> = if compute {
@@ -1317,7 +1375,7 @@ impl State {
         let text = self.op_text(kind.to_owned(), compute);
         tracing::debug!(
             "frame {} op: pipeline {:#x} topology {} targets {targets:?} depth {:#x} -> {outcome} || {text}",
-            crate::queue::presented() + 1,
+            frame,
             self.pipeline,
             self.topology,
             self.depth.map_or(0, |d| d.resource)
@@ -1788,9 +1846,9 @@ impl State {
         if !tracing::enabled!(tracing::Level::DEBUG) {
             return;
         }
-        // Listed frames: `frame_op` logs every operation instead.
-        let listed = crate::capture::listed(crate::queue::presented() + 1);
-        let logged = !listed && TRACED.fetch_add(1, Ordering::Relaxed) < 64;
+        // Detailed frames have a separate trace of every operation.
+        let detailed = crate::capture::detailed(crate::queue::presented() + 1);
+        let logged = !detailed && TRACED.fetch_add(1, Ordering::Relaxed) < 64;
         let targets: Vec<String> = self
             .targets
             .iter()
@@ -2152,6 +2210,20 @@ impl State {
             );
             return false;
         };
+        // Clamping charges the list budget and can empty subsequent records.
+        // Only record it after the target pipeline is available.
+        let Some(p) = self.bound_pipeline(kind == DISPATCH) else {
+            *dropped = "no host pipeline";
+            #[cfg(feature = "diagnostics")]
+            {
+                self.frame_op("indirect", kind == DISPATCH, false);
+                crate::pipeline::note_why(format!(
+                    "indirect kind {kind}: {}",
+                    crate::pipeline::drop_reason(self.pipeline as This)
+                ));
+            }
+            return false;
+        };
         args.refresh_as(list, arguments, len, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
@@ -2172,38 +2244,23 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
-            DISPATCH => match self.bound_pipeline(true) {
-                Some(p) if p.compute => self.bind(list, &p, true),
-                _ => false,
-            },
+            DRAW | INDEXED | MESH => self.prepare_graphics(list, kind == INDEXED, kind == MESH, &p),
+            DISPATCH => p.compute && self.bind(list, &p, true),
             _ => false,
         };
         #[cfg(feature = "diagnostics")]
         self.frame_op("indirect", kind == DISPATCH, ran);
         if !ran {
-            let p = self.bound_pipeline(kind == DISPATCH);
-            *dropped = if p.is_none() {
-                "no host pipeline"
-            } else if kind == DISPATCH {
+            *dropped = if kind == DISPATCH {
                 "prepare/bind failed (compute)"
             } else {
                 "prepare/bind failed"
             };
             #[cfg(feature = "diagnostics")]
-            match &p {
-                // Named so the frame's table says which drops are indirect
-                // executions, and which shader keeps them from running.
-                None => crate::pipeline::note_why(format!(
-                    "indirect kind {kind}: {}",
-                    crate::pipeline::drop_reason(self.pipeline as This)
-                )),
-                Some(p) => why(&format!(
-                    "prepare failed (compute {}, mesh {})",
-                    p.compute, p.mesh
-                )),
-            }
+            why(&format!(
+                "prepare failed (compute {}, mesh {})",
+                p.compute, p.mesh
+            ));
             return false;
         }
         #[cfg(feature = "diagnostics")]
@@ -3143,12 +3200,9 @@ mod depth_tests {
 #[cfg(test)]
 mod table_tests {
     use super::*;
-    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-    use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::Win32::Graphics::Dxgi::Common::{
         DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_FLOAT, DXGI_SAMPLE_DESC,
     };
-    use windows::core::s;
 
     struct TitleObject(This);
 
@@ -3231,6 +3285,95 @@ mod table_tests {
         TitleObject(out)
     }
 
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn world_capture_dumps_targets_on_followups_and_listed_frames() {
+        // Frame numbers and capture settings belong to the process.
+        const CHILD: &str = "VICTORY_TEST_WORLD_TARGETS";
+        if std::env::var_os(CHILD).is_none() {
+            let folder = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "draw::table_tests::world_capture_dumps_targets_on_followups_and_listed_frames",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("VICTORY_CAPTURE", folder.path())
+                .env("VICTORY_DUMP_TARGETS", "1")
+                .env("VICTORY_CAPTURE_WORLD", "1")
+                .env("VICTORY_CAPTURE_FRAMES", "8,10")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+            return;
+        }
+        let Some(host) = crate::host::host() else {
+            assert!(
+                !crate::switch::on("VICTORY_D3D12_WARP"),
+                "the requested WARP device must initialize for the readback test"
+            );
+            return;
+        };
+        let target = create_title_texture(
+            4,
+            4,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+        );
+        let mut slot = [0u64; 16];
+        let handle = slot.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(std::ptr::null(), target.0, std::ptr::null(), handle);
+        let rtv = host.rtv(crate::resource::host_resource(target.0), None);
+        let (queue, signal) = crate::queue::test_queue();
+        let queue = TitleObject(queue);
+        type Present = extern "system" fn(
+            This,
+            u32,
+            *const crate::queue::Plane,
+            *const u8,
+        ) -> crate::object::HRESULT;
+        let present = crate::object::slot::<Present>(queue.0, signal + 0x80);
+        let mut state = State::default();
+        for frame in 1..=11 {
+            let list = host.new_list().unwrap();
+            state.set_targets(&list, &[handle], 0);
+            state.set_targets(&list, &[handle], 0);
+            // SAFETY: the open list has a live RTV in render-target state.
+            unsafe {
+                list.list
+                    .ClearRenderTargetView(rtv, &[frame as f32 / 16.0, 0.0, 1.0, 1.0], None)
+            };
+            list.close();
+            host.execute(&[&list]);
+            if frame == 3 {
+                super::DRAWN.fetch_add(500, Ordering::Relaxed);
+            }
+            assert_eq!(
+                present(queue.0, 0, std::ptr::null(), std::ptr::null()),
+                crate::object::S_OK
+            );
+        }
+        let folder = crate::capture::folder().unwrap();
+        assert_eq!(std::fs::read_dir(folder).unwrap().count(), 4);
+        for frame in [5, 8, 9, 10] {
+            let expected = [((frame * 255 + 8) / 16) as u8, 0, 255, 255].repeat(16);
+            crate::capture::save(frame, 4, 4, 16, false, &expected);
+            let dumped = folder.join(format!("frame-{frame}-00-{:?}-4x4-f28.png", target.0));
+            let reference = folder.join(format!("frame-{frame}.png"));
+            assert_eq!(
+                std::fs::read(dumped).unwrap(),
+                std::fs::read(reference).unwrap()
+            );
+        }
+    }
+
     fn create_sampler_at(desc: &D3D12_SAMPLER_DESC, handle: u64) {
         const _: () = assert!(size_of::<D3D12_SAMPLER_DESC>() == size_of::<[u32; 13]>());
         // SAFETY: `D3D12_SAMPLER_DESC` is 13 32-bit words with no padding.
@@ -3263,47 +3406,16 @@ mod table_tests {
         sampler_slot: u32,
         uv: [f32; 2],
     ) -> [f32; 4] {
-        const SOURCE: &str = r#"
-            #define RS "RootConstants(num32BitConstants=2, b0), DescriptorTable(SRV(t0, numDescriptors=1)), DescriptorTable(Sampler(s0, numDescriptors=1)), UAV(u0)"
-            cbuffer Coords : register(b0) { float2 uv; };
-            Texture2D<float4> tex : register(t0);
-            SamplerState samp : register(s0);
-            RWByteAddressBuffer out_buf : register(u0);
-            [RootSignature(RS)]
-            [numthreads(1, 1, 1)]
-            void main() {
-                float4 c = tex.SampleLevel(samp, uv, 0);
-                out_buf.Store4(0, asuint(c));
-            }
-        "#;
-        let mut blob: Option<ID3DBlob> = None;
-        // SAFETY: source and entry/target names are live; `blob` is our output.
-        unsafe {
-            D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
-                s!("table-probe"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut blob,
-                None,
-            )
-            .expect("compile probe compute shader");
-        }
-        let blob = blob.expect("compiled shader blob");
-        // SAFETY: `blob` owns its bytecode buffer.
-        let code = unsafe {
-            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
-        };
+        let code = crate::hlsl::compile_compute(
+            "table probe",
+            include_str!("../shaders/table_probe.hlsl"),
+        )
+        .expect("compile sampler readback shader");
         // SAFETY: root signature and compute PSO creation on live device.
         let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
             let root: ID3D12RootSignature = host
                 .device
-                .CreateRootSignature(0, code)
+                .CreateRootSignature(0, &code)
                 .expect("compute root signature");
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
@@ -3491,6 +3603,22 @@ mod table_tests {
             [0.5, 0.5],
         );
         assert_eq!(sampled, [0.0, 1.0, 0.0, 1.0]);
+
+        // A direct index outside the four title slots can still reach the last
+        // host slot. Its fallback sampler clamps to the green edge texel.
+        let last = victory_shader::emit::SAMPLER_HEAP_LIMIT - 1;
+        // SAFETY: this is the live heap about to be bound.
+        assert!(last < unsafe { sampler_host.heap.GetDesc() }.NumDescriptors);
+        let padded = sample_via_host_heaps(
+            host,
+            &view_host.heap,
+            first,
+            &sampler_host.heap,
+            last,
+            [1.25, 0.5],
+        );
+        assert_eq!(padded, [0.0, 1.0, 0.0, 1.0]);
+        eprintln!("sampler readback matched at slots 0 and {last}");
     }
 
     #[test]
@@ -4217,6 +4345,7 @@ mod bindless_tests {
         };
 
         let gfx_srv_uav = HostPipeline {
+            compute_threads: None,
             structured_strides: Vec::new(),
             compute: false,
             mesh: false,
@@ -4235,6 +4364,7 @@ mod bindless_tests {
             name: "gfx_srv_uav".into(),
         };
         let gfx_srv_only = HostPipeline {
+            compute_threads: None,
             structured_strides: Vec::new(),
             compute: false,
             mesh: false,
@@ -4253,6 +4383,7 @@ mod bindless_tests {
             name: "gfx_srv_only".into(),
         };
         let compute_srv = HostPipeline {
+            compute_threads: Some([1; 3]),
             structured_strides: Vec::new(),
             compute: true,
             mesh: false,
@@ -4877,7 +5008,7 @@ mod structured_alias_tests {
         let desc = HeapDesc {
             desc: D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 4,
+                NumDescriptors: 6,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             },
@@ -4902,8 +5033,9 @@ mod structured_alias_tests {
         resource[0] = 1;
         resource[4] = 256;
         // The first view starts at byte 12 and has stride 12. The second starts
-        // at byte 32 and has stride 32. The last contains only one record.
-        for (slot, stride, count) in [(1, 12, 2), (2, 32, 2), (3, 16, 1)] {
+        // at byte 32 and has stride 32. The last two test reads starting just
+        // past a view and reads straddling its final dword.
+        for (slot, stride, count) in [(1, 12, 2), (2, 32, 2), (3, 16, 1), (4, 20, 1), (5, 8, 2)] {
             let mut words = [0u32; 16];
             words[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
             words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -4919,7 +5051,7 @@ mod structured_alias_tests {
                 heap.start + slot * 32,
             );
         }
-        let (buffer, mapped) = host.readback_buffer(48).unwrap();
+        let (buffer, mapped) = host.readback_buffer(64).unwrap();
         let mut state = State::default();
         state.set_heaps(&[views]);
         let list = host.new_list().unwrap();
@@ -4928,6 +5060,8 @@ mod structured_alias_tests {
             (1, 1),
             (2, 1),
             (3, 1),
+            (4, 1),
+            (5, 1),
             (99, 1),
             (2, 0x0800_0001),
             (1, 0x1555_5555),
@@ -4955,14 +5089,16 @@ mod structured_alias_tests {
         }
         list.close();
         host.execute(&[&list]);
-        // SAFETY: the submission completed, and the mapped buffer holds six pairs of dwords.
-        let got = unsafe { mapped.cast::<[[u32; 2]; 6]>().read_unaligned() };
+        // SAFETY: the submission completed, and the mapped buffer holds eight pairs of dwords.
+        let got = unsafe { mapped.cast::<[[u32; 2]; 8]>().read_unaligned() };
         assert_eq!(
             got,
             [
                 [backing[7], backing[8]],
                 [backing[17], backing[18]],
                 [0; 2],
+                [0; 2],
+                [backing[5], 0],
                 [0; 2],
                 [0; 2],
                 [0; 2]
