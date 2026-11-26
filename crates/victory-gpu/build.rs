@@ -22,6 +22,7 @@ fn main() {
         "rect_rewrite",
         "rect_expand",
         "packed_copy",
+        "table_probe",
     ] {
         let source = format!("shaders/{name}.hlsl");
         println!("cargo:rerun-if-changed={source}");

@@ -22,7 +22,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::{Shader, Translated};
-use victory_shader::emit::{StructuredBinding, translate_with_view_strides};
+use victory_shader::emit::{StructuredBinding, translate_for_adapter};
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 type Strides = Vec<(StructuredBinding, u32)>;
@@ -118,15 +118,15 @@ impl Pending {
             if shader.translated().is_none() {
                 // Probe lowering with a valid annotation. Only the binding
                 // locations survive the probe; its DXIL never reaches D3D12.
-                translate_with_view_strides(
+                translate_for_adapter::<false>(
                     &shader.container,
-                    host.supports_wave32(),
-                    &|binding, required| {
+                    host.wave_widths(),
+                    Some(&|binding, required| {
                         required.then(|| {
                             bindings.borrow_mut().insert(binding);
                             4
                         })
-                    },
+                    }),
                 )
                 .ok()?;
             }
@@ -144,14 +144,14 @@ impl Pending {
                 }
                 let accessed = std::cell::RefCell::new(BTreeSet::new());
                 let translate = if self.partial {
-                    victory_shader::emit::translate_partial_dispatch
+                    translate_for_adapter::<true>
                 } else {
-                    translate_with_view_strides
+                    translate_for_adapter::<false>
                 };
-                let (host, mut used) = translate(
+                let (host, mut native) = translate(
                     &shader.container,
-                    host.supports_wave32(),
-                    &|binding, _| {
+                    host.wave_widths(),
+                    Some(&|binding, _| {
                         let i = self
                             .strides
                             .binary_search_by_key(&binding, |&(key, _)| key)
@@ -159,7 +159,7 @@ impl Pending {
                         let stride = self.strides[i].1;
                         accessed.borrow_mut().insert((binding, stride));
                         Some(stride)
-                    },
+                    }),
                 )
                 .map_err(|error| {
                     tracing::warn!(?shader, %error, partial_dispatch = self.partial, "specialized shader refused");
@@ -173,7 +173,7 @@ impl Pending {
                     } else {
                         ResourceType::Srv
                     };
-                    if let Some(entry) = used.iter_mut().find(|u| {
+                    if let Some(entry) = native.used.iter_mut().find(|u| {
                         u.root == RootType::Table
                             && u.slot == binding.slot
                             && u.table_offset_dwords == binding.offset_dwords
@@ -186,7 +186,7 @@ impl Pending {
                             .iter()
                             .find(|u| u.root == RootType::Table && u.slot == binding.slot)?
                             .index;
-                        used.push(UsedResource {
+                        native.used.push(UsedResource {
                             kind,
                             root: RootType::Table,
                             table_offset_dwords: binding.offset_dwords,
@@ -202,7 +202,7 @@ impl Pending {
                     stage: shader.stage,
                     hash: shader.hash.clone(),
                     container: Vec::new(),
-                    translated: OnceLock::from(Some(Translated { host, used })),
+                    translated: OnceLock::from(Some(Translated::from_native(host, native))),
                     #[cfg(feature = "diagnostics")]
                     wave64: OnceLock::new(),
                 }))

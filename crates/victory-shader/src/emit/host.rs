@@ -1188,6 +1188,8 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
+    /// An RGBA32F texture SRV with mip levels, largest first.
+    TextureMips(u32, u32, u16, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, mip count, texels by face then mip).
     Cube(u32, u16, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
@@ -1363,9 +1365,10 @@ impl Host {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
-                    View::Texture(..) | View::Cube(..) => {
+                    View::Texture(..) | View::TextureMips(..) | View::Cube(..) => {
                         let (w, h, texels, faces, levels) = match *v {
                             View::Texture(w, h, t) => (w, h, t, 1, 1),
+                            View::TextureMips(w, h, levels, t) => (w, h, t, 1, levels),
                             View::Cube(n, levels, t) => (n, n, t, 6, levels),
                             _ => unreachable!(),
                         };

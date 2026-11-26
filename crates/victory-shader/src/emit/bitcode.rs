@@ -504,6 +504,10 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
+    pub(crate) fn uses_whole_wave(&self) -> bool {
+        self.funcs.iter().any(|f| f.name.starts_with("dx.op.wave"))
+    }
+
     pub(crate) fn has_dx_op(&self, name: &str, opcode: i64) -> bool {
         self.insts.iter().any(|inst| match &inst.op {
             Op::Call(fid, args) => {

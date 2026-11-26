@@ -2,8 +2,8 @@
 //! expander), compiled at run time from HLSL with their root signature
 //! inside: by the system's compiler (`D3DCompile`, `cs_5_1`) and, when it
 //! refuses them, by DXC (`cs_6_0`). Wine's `d3dcompiler_47` (vkd3d-shader)
-//! rejects `RWByteAddressBuffer` loads, which every one of them uses; DXC
-//! compiles the same source.
+//! can reject raw-buffer operations or return bytecode without the HLSL root
+//! signature. The bundled and runtime DXC paths keep those bindings.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -12,35 +12,24 @@ use windows::core::{PCSTR, s};
 /// Compiles compute shader `source` (entry `main`) named `name` in
 /// messages: the system's compiler first, then DXC.
 pub(crate) fn compile_compute(name: &str, source: &str) -> windows::core::Result<Vec<u8>> {
-    let compiled = system_compile(name, source).and_then(|code| {
-        // Wine can accept the HLSL while omitting the root signature attribute.
-        if has_root_signature(&code) {
-            Ok(code)
-        } else {
-            Err((
-                windows::core::Error::empty(),
-                "missing embedded root signature".into(),
-            ))
-        }
-    });
-    match compiled {
-        Ok(code) => Ok(code),
+    match system_compile(name, source) {
+        Ok(code) if has_root_signature(&code) => return Ok(code),
+        Ok(_) => tracing::info!("{name}: system compiler omitted the root signature"),
         Err((e, msg)) => {
-            #[cfg(victory_bundled_hlsl)]
-            if let Some(bytes) = bundled_shader(source) {
-                tracing::info!("{name}: using build-time DXC shader");
-                return Ok(bytes.to_vec());
-            }
-            tracing::info!(error = %e, "{name}: the system compiler refused it ({}); trying DXC", msg.trim());
-            dxc_compile(name, source)
-                .inspect_err(|e| tracing::warn!(error = %e, "{name}: DXC failed too"))
+            tracing::info!(error = %e, "{name}: system compiler refused it ({})", msg.trim())
         }
     }
+    #[cfg(victory_bundled_hlsl)]
+    if let Some(bytes) = bundled_shader(source) {
+        tracing::info!("{name}: using build-time DXC shader");
+        return Ok(bytes.to_vec());
+    }
+    dxc_compile(name, source).inspect_err(|e| tracing::warn!(error = %e, "{name}: DXC failed"))
 }
 
 fn has_root_signature(code: &[u8]) -> bool {
-    victory_shader::Container::parse(code)
-        .is_ok_and(|container| container.part(victory_shader::FourCC::RTS0).is_some())
+    use victory_shader::{Container, FourCC};
+    Container::parse(code).is_ok_and(|c| c.part(FourCC::RTS0).is_some())
 }
 
 // Match the source so a changed shader can never pick up another helper's bytecode.
@@ -56,6 +45,8 @@ fn bundled_shader(source: &str) -> Option<&'static [u8]> {
         include_str!("../shaders/rect_rewrite.hlsl") => Some(bytecode!("rect_rewrite")),
         include_str!("../shaders/rect_expand.hlsl") => Some(bytecode!("rect_expand")),
         include_str!("../shaders/packed_copy.hlsl") => Some(bytecode!("packed_copy")),
+        #[cfg(test)]
+        include_str!("../shaders/table_probe.hlsl") => Some(bytecode!("table_probe")),
         _ => None,
     }
 }
@@ -220,9 +211,11 @@ mod tests {
             include_str!("../shaders/rect_rewrite.hlsl"),
             include_str!("../shaders/rect_expand.hlsl"),
             include_str!("../shaders/packed_copy.hlsl"),
+            include_str!("../shaders/table_probe.hlsl"),
         ] {
             let expected = bundled_shader(source).unwrap();
             let bytes = compile_compute("bundled helper", source).unwrap();
+            assert!(has_root_signature(&bytes));
             if !system_compile("bundled helper", source).is_ok_and(|code| has_root_signature(&code))
             {
                 assert_eq!(bytes, expected);
@@ -247,7 +240,9 @@ mod tests {
             assert_eq!(&code[..4], b"DXBC");
         }
         if system.is_ok_and(|code| has_root_signature(&code)) || dxc.is_ok() {
-            assert_eq!(&compile_compute("probe", PROBE).unwrap()[..4], b"DXBC");
+            assert!(has_root_signature(
+                &compile_compute("probe", PROBE).unwrap()
+            ));
         } else {
             assert!(compile_compute("probe", PROBE).is_err());
         }
