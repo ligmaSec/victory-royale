@@ -712,24 +712,33 @@ impl<'a> Lower<'a> {
                 && !numeric_selects
                 && entry_lds_max(x)
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
-            // One unmasked straight-line wave: every thread reaches every
-            // exchange. Guest flat IDs directly name all 64 lanes, regardless
-            // of the host wave width or the order it schedules its threads.
+            // Every exchange must be reached unmasked by all lanes, in the
+            // same order. A branch may guard a store between two exchanges.
+            // An all-ones mbcnt counts the guest flat thread's lower lanes.
+            let exchange = |i: &Inst| matches!(i.name(), "v_readlane_b32" | "ds_swizzle_b32");
+            let lane_rank = |i: &Inst| {
+                matches!(i.name(), "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32")
+                    && matches!(&i.fields, Fields::Valu(v) if v.dpp.is_none() && v.src.first() == Some(&Operand::Const(193)))
+            };
             group_exchange = waves.narrow_quads
                 && x.native.wave64
                 && threads == 64
                 && s.lds_dwords == 0
-                && matches!(x.st.exits.as_slice(), [LaneExit::End])
-                && x.st.guards[0].iter().all(Option::is_none)
                 && !masks_held
                 && !numeric_selects
-                && super::wave::sections(p, 0).is_empty()
-                && insts().any(|i| i.name() == "v_readlane_b32")
-                && insts().all(|i| {
-                    matches!(i.name(), "v_readlane_b32" | "ds_swizzle_b32")
-                        || (!is_console_lane_op(i)
-                            && !i.name().starts_with("ds_")
-                            && !matches!(i.name(), "v_readfirstlane_b32" | "s_barrier"))
+                && insts().any(exchange)
+                && p.blocks.iter().enumerate().all(|(b, block)| {
+                    block.preds.iter().all(|&pred| pred < b)
+                        && super::wave::sections(p, b).is_empty()
+                        && block.insts.iter().enumerate().all(|(at, i)| {
+                            (exchange(i)
+                                && x.st.reach[b] == Bool::TRUE
+                                && x.st.guards[b][at].is_none())
+                                || lane_rank(i)
+                                || (!is_console_lane_op(i)
+                                    && !i.name().starts_with("ds_")
+                                    && !matches!(i.name(), "v_readfirstlane_b32" | "s_barrier"))
+                        })
                 });
             if group_exchange {
                 console_lanes = false;

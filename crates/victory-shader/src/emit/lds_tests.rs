@@ -459,3 +459,46 @@ fn single_wave_group_reads_values_from_both_halves() {
     #[cfg(not(windows))]
     let _ = shader;
 }
+
+#[test]
+fn group_exchange_waits_for_reconvergence_after_a_masked_branch() {
+    let prefix = [
+        0xd765_0003,
+        0x0001_00c1, // v3 = popcount of lower lanes in the low half
+        0xd766_0003,
+        0x0002_06c1, // v3 += popcount of lower lanes in the high half
+        0x3402_0082, // v1 = group thread ID * 4 (output address)
+        0xd8d4_401f,
+        0x0500_0003, // v5 = lane ID of the neighbour at XOR 16
+        0xd4c1_0004,
+        0x0001_4103, // s[4:5] = v3 < 32
+        0xbe86_2404, // save exec, enable only the low half
+    ];
+    let add = 0x4a0a_0a87; // v5 += 7
+    let restore = 0xbefe_0406; // restore exec from s[6:7]
+    let swap = [0xd8d4_041f, 0x0600_0005]; // v6 = neighbour's v5 at XOR 1
+    let store = [0xe070_1000, 0x8002_0601]; // store v6 at v1
+    let narrow = super::ComputeWaves {
+        wave32: true,
+        narrow_quads: true,
+    };
+    let joined = [&prefix[..], &[0xbf88_0001, add, restore], &swap, &store].concat();
+    let (shader, barriers) =
+        build_lds_program::<false>(&joined, true, [64, 1, 1], narrow, 0).unwrap();
+    assert_eq!(wave_range(&shader), [0, u32::MAX]);
+    assert_eq!(barriers, 2);
+    // Moving the second exchange inside the branch would deadlock a group
+    // barrier. Keep that shader on a full native wave.
+    let masked = [&prefix[..], &[0xbf88_0003, add], &swap, &[restore], &store].concat();
+    let (other, barriers) =
+        build_lds_program::<false>(&masked, true, [64, 1, 1], narrow, 0).unwrap();
+    assert_eq!(wave_range(&other), [64, 64]);
+    assert_eq!(barriers, 0);
+    #[cfg(windows)]
+    {
+        let expected: Vec<_> = (0..64)
+            .map(|lane| (lane ^ 1 ^ 16) + if lane < 32 { 7 } else { 0 })
+            .collect();
+        check_readback(shader, &expected);
+    }
+}
