@@ -255,6 +255,37 @@ cargo test -p victory-shader --locked
 cargo test -p victory-shader --locked -- <test name> --nocapture
 ```
 
+### Running the title under Wine without a sound device
+
+On a headless Linux host, an X display can be working while Wine has no
+default playback endpoint. In that configuration the Series X 1.0.2.1
+opening repeatedly stopped at guest frame 82. Check the title's local
+crash report for its frame number. The host can present hundreds of
+frames before the title stops.
+
+For Wine using ALSA, a silent playback device lets a graphics test run
+past this point. In a shell with your test Wine prefix and graphics
+runtime already configured, give just the launch its own ALSA config:
+
+```sh
+audio_config=$(mktemp)
+cat > "$audio_config" <<'EOF'
+</usr/share/alsa/alsa.conf>
+pcm.!default {
+    type null
+    hint { show on description "VIctory software playback" }
+}
+EOF
+ALSA_CONFIG_PATH="$audio_config" wine ./victory.exe run "$TITLE_EXE" --execute --console series-x
+rm -f "$audio_config"
+```
+
+Set `TITLE_EXE` to the Windows path to your executable. Use a fresh Wine
+session for each side so its audio driver picks up the setting. Record
+`ALSA null` with the GPU, runtime and scene cue for both builds. This
+setup exercises silent playback. Audible output needs a separate test
+with a working sound device.
+
 ## Comparing frame pacing
 
 Keep the build settings, driver, window size and launch sequence the same. Compare
