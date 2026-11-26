@@ -43,6 +43,7 @@ fn run_lds_program(body: &[u32], expected: &[u32]) {
         false,
         [64, 1, 1],
         super::ComputeWaves::with_wave32(true),
+        2,
     )
     .unwrap();
     #[cfg(windows)]
@@ -56,6 +57,7 @@ fn build_lds_program<const PARTIAL: bool>(
     guest_wave64: bool,
     threads: [u32; 3],
     waves: super::ComputeWaves,
+    lds_blocks: u32,
 ) -> Result<(HostShader, usize), crate::ShaderError> {
     let slot = 3;
     let mut words = vec![
@@ -93,8 +95,8 @@ fn build_lds_program<const PARTIAL: bool>(
             slot,
         }],
         io: StageIo::Cs(ComputeIo {
-            // 4 user SGPRs (bits 5:1) + 256 dwords of LDS (bits 23:15).
-            rsrc2: (4 << 1) | (2 << 15) | (u32::from(threads[1] > 1) << 11),
+            // Four user SGPRs plus LDS in 128-dword blocks.
+            rsrc2: (4 << 1) | (lds_blocks << 15) | (u32::from(threads[1] > 1) << 11),
             threads,
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
@@ -326,6 +328,13 @@ fn lds_d16_destination_forms_on_hardware() {
     run_lds_program(&body, &expected);
 }
 
+fn wave_range(shader: &HostShader) -> [u32; 2] {
+    let container = crate::Container::parse(&shader.dxil).unwrap();
+    let psv = container.part(crate::FourCC::PSV0).unwrap().data;
+    let word = |i| u32::from_le_bytes(psv[i..i + 4].try_into().unwrap());
+    [word(20), word(24)]
+}
+
 #[test]
 fn lds_max_across_a_split_wave64() {
     let body = [
@@ -343,15 +352,10 @@ fn lds_max_across_a_split_wave64() {
     };
     let native = super::ComputeWaves::with_wave32(true);
     let build = |body: &[u32], waves, expected_barriers| {
-        let (shader, barriers) = build_lds_program::<false>(body, true, [8, 8, 1], waves).unwrap();
+        let (shader, barriers) =
+            build_lds_program::<false>(body, true, [8, 8, 1], waves, 2).unwrap();
         assert_eq!(barriers, expected_barriers, "group syncs in lowered shader");
         shader
-    };
-    let wave_range = |shader: &HostShader| {
-        let container = crate::Container::parse(&shader.dxil).unwrap();
-        let psv = container.part(crate::FourCC::PSV0).unwrap().data;
-        let word = |i| u32::from_le_bytes(psv[i..i + 4].try_into().unwrap());
-        [word(20), word(24)]
     };
     assert_eq!(wave_range(&build(&body, native, 0)), [64, 64]);
     let shader = build(&body, narrow, 2);
@@ -360,7 +364,7 @@ fn lds_max_across_a_split_wave64() {
     // A thread-count dispatch that ends inside a group cannot run the two
     // generated group barriers after the inactive threads have returned.
     assert!(matches!(
-        build_lds_program::<true>(&body, true, [8, 8, 1], narrow),
+        build_lds_program::<true>(&body, true, [8, 8, 1], narrow, 2),
         Err(crate::ShaderError::Unsupported {
             what: "a partial dispatch with a group barrier",
             ..
@@ -395,4 +399,63 @@ fn lds_max_across_a_split_wave64() {
         check_readback(shader, &[63; 64]);
         check_readback(partial, &[23; 64]);
     }
+}
+
+#[test]
+fn single_wave_group_reads_values_from_both_halves() {
+    let words = [
+        0x3410_0283,
+        0x4a00_1100, // v0 = 8*y + x
+        0x3402_0084, // v1 = flat * 16 output byte offset
+        0xd8d4_401f,
+        0x0500_0000, // v5 = v0 from lane XOR 16 within each half
+        0xd760_0002,
+        0x0001_0905, // s2 = v5 from lane 4
+        0xd760_0003,
+        0x0001_4905, // s3 = v5 from lane 36
+        0x7e0c_0202,
+        0x7e0e_0203, // copy both results to v6,v7
+        0xd8d4_041f,
+        0x0800_0005, // v8 = v5 from lane XOR 1
+        0xd760_0006,
+        0x0001_7f08, // s6 = v8 from lane 63
+        0x7e10_0206, // v8 = s6
+        0xe078_1000,
+        0x8002_0501, // store v[5:8] for every thread
+    ];
+    let narrow = super::ComputeWaves {
+        wave32: true,
+        narrow_quads: true,
+    };
+    let (shader, barriers) =
+        build_lds_program::<false>(&words, true, [8, 8, 1], narrow, 0).unwrap();
+    assert_eq!(barriers, 3);
+    let native = super::ComputeWaves::with_wave32(true);
+    let (native_shader, native_barriers) =
+        build_lds_program::<false>(&words, true, [8, 8, 1], native, 0).unwrap();
+    assert_eq!(native_barriers, 0);
+    assert_eq!(wave_range(&native_shader), [64, 64]);
+    assert_eq!(wave_range(&shader), [0, u32::MAX]);
+    // Existing shared memory and multiple console waves require different
+    // addressing and synchronization. Both retain the native path.
+    for (threads, blocks) in [([8, 8, 1], 1), ([16, 8, 1], 0)] {
+        let (other, barriers) =
+            build_lds_program::<false>(&words, true, threads, narrow, blocks).unwrap();
+        assert_eq!(barriers, 0);
+        assert_eq!(wave_range(&other), [64, 64]);
+    }
+    assert!(matches!(
+        build_lds_program::<true>(&words, true, [8, 8, 1], narrow, 0),
+        Err(crate::ShaderError::Unsupported {
+            what: "a partial dispatch with a group barrier",
+            ..
+        })
+    ));
+    #[cfg(windows)]
+    {
+        let expected: Vec<_> = (0..64).flat_map(|lane| [lane ^ 16, 20, 52, 46]).collect();
+        check_readback(shader, &expected);
+    }
+    #[cfg(not(windows))]
+    let _ = shader;
 }

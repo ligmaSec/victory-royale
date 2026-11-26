@@ -270,6 +270,11 @@ struct Lower<'a> {
     flat_quads: Option<[u32; 3]>,
     /// The entry block needs a group rendezvous after initialization and after its atomic max.
     sync_lds_max: bool,
+    /// A single console wave exchanges values by flat group ID on narrow hosts.
+    group_exchange: bool,
+    /// Last register value published by all lanes into the exchange array.
+    exchange_value: Option<V>,
+    exchange_bank: u32,
     /// Retry a compute shader with numeric selects only when the normal
     /// translation needs one. Unused selects need no fixed wave size.
     numeric_selects: bool,
@@ -624,6 +629,7 @@ impl<'a> Lower<'a> {
         let mut console_lanes = false;
         let mut flat_quads = None;
         let mut sync_lds_max = false;
+        let mut group_exchange = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -706,7 +712,29 @@ impl<'a> Lower<'a> {
                 && !numeric_selects
                 && entry_lds_max(x)
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
-            if quad_samples_only {
+            // One unmasked straight-line wave: every thread reaches every
+            // exchange. Guest flat IDs directly name all 64 lanes, regardless
+            // of the host wave width or the order it schedules its threads.
+            group_exchange = waves.narrow_quads
+                && x.native.wave64
+                && threads == 64
+                && s.lds_dwords == 0
+                && matches!(x.st.exits.as_slice(), [LaneExit::End])
+                && x.st.guards[0].iter().all(Option::is_none)
+                && !masks_held
+                && !numeric_selects
+                && super::wave::sections(p, 0).is_empty()
+                && insts().any(|i| i.name() == "v_readlane_b32")
+                && insts().all(|i| {
+                    matches!(i.name(), "v_readlane_b32" | "ds_swizzle_b32")
+                        || (!is_console_lane_op(i)
+                            && !i.name().starts_with("ds_")
+                            && !matches!(i.name(), "v_readfirstlane_b32" | "s_barrier"))
+                });
+            if group_exchange {
+                console_lanes = false;
+                s.lds_dwords = 2 * threads;
+            } else if quad_samples_only {
                 flat_quads = Some(cs.threads);
                 s.threads = Some([threads, 1, 1]);
                 console_lanes = false;
@@ -804,6 +832,9 @@ impl<'a> Lower<'a> {
             console_lanes,
             flat_quads,
             sync_lds_max,
+            group_exchange,
+            exchange_value: None,
+            exchange_bank: 0,
             numeric_selects,
             flat: None,
             no_barrier,
@@ -1351,7 +1382,9 @@ impl<'a> Lower<'a> {
         self.fill_phis()?;
         // Lowering can also introduce whole-wave operations for implicit masks.
         // Keep the native program when the split group still depends on a whole wave.
-        if (self.flat_quads.is_some() || self.sync_lds_max) && self.s.m.uses_whole_wave() {
+        if (self.flat_quads.is_some() || self.sync_lds_max || self.group_exchange)
+            && self.s.m.uses_whole_wave()
+        {
             return Err(Stop::NeedsNativeWave);
         }
         if PARTIAL {
@@ -1545,7 +1578,7 @@ impl<'a> Lower<'a> {
             Input::MergedWaveInfo => {
                 // shortcut: only the wave index (bits 24-27) is set; the
                 // console's other bits (lane counts) are read by no program.
-                let f = self.mesh_thread();
+                let f = self.flat_thread();
                 let shift = self.s.m.i32(self.wave().trailing_zeros());
                 let w = self.s.m.bin(self.s.entry, Bin::LShr, f, shift);
                 let k24 = self.s.m.i32(24);
@@ -2658,6 +2691,9 @@ impl<'a> Lower<'a> {
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
             return Err("a cross-lane operation outside compute");
         }
+        if self.group_exchange {
+            return Ok(());
+        }
         debug_assert!(
             self.s.threads.is_none() || self.console_lanes || (quad && self.flat_quads.is_some())
         );
@@ -2738,7 +2774,7 @@ impl<'a> Lower<'a> {
         );
         self.s
             .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
-        let flat = self.mesh_thread();
+        let flat = self.flat_thread();
         let z = self.s.m.i32(0);
         let passes = mesh.max_primitives.div_ceil(threads.max(1));
         for pass in 0..passes {
@@ -2766,7 +2802,7 @@ impl<'a> Lower<'a> {
 
     /// Mesh: the thread's index in the group, which is its vertex and
     /// primitive index.
-    fn mesh_thread(&mut self) -> V {
+    fn flat_thread(&mut self) -> V {
         if let Some(f) = self.flat {
             return f;
         }
@@ -2789,10 +2825,13 @@ impl<'a> Lower<'a> {
     }
 
     fn lane_index(&mut self) -> V {
+        if self.group_exchange {
+            return self.flat_thread();
+        }
         if self.s.mesh.is_some() {
             // The console's lane: mesh code reads no other lanes, so host
             // waves need not match the console's.
-            let f = self.mesh_thread();
+            let f = self.flat_thread();
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
         }
@@ -2843,6 +2882,25 @@ impl<'a> Lower<'a> {
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
+        if self.group_exchange {
+            let shared = self.s.lds();
+            if self.exchange_value != Some(x) {
+                // Alternate banks. The other bank's publish barrier has
+                // already waited for every reader of the bank we reuse.
+                self.exchange_bank ^= 64;
+                let thread = self.flat_thread();
+                let bank = self.s.m.i32(self.exchange_bank);
+                let i = self.s.m.bin(self.cur, Bin::Add, bank, thread);
+                let to = self.s.m.element(self.cur, shared, i);
+                self.s.m.store(self.cur, to, x);
+                self.sync_shared_memory();
+                self.exchange_value = Some(x);
+            }
+            let bank = self.s.m.i32(self.exchange_bank);
+            let i = self.s.m.bin(self.cur, Bin::Add, bank, lane);
+            let from = self.s.m.element(self.cur, shared, i);
+            return self.s.m.load(self.cur, from);
+        }
         self.s.op(
             self.cur,
             "waveReadLaneAt.i32",
@@ -8842,7 +8900,7 @@ impl<'a> Lower<'a> {
                 m.max_vertices
             };
             let guard = if threads > limit {
-                let flat = self.mesh_thread();
+                let flat = self.flat_thread();
                 let lim = self.s.m.i32(limit);
                 let in_bounds = self.s.m.cmp(self.cur, pred::IULT, flat, lim);
                 Some(match guard {
@@ -8910,7 +8968,7 @@ impl<'a> Lower<'a> {
                 x,
             ];
             if mesh {
-                args.push(self.mesh_thread());
+                args.push(self.flat_thread());
             }
             let void = self.s.t.void;
             self.s.op(
@@ -8934,7 +8992,7 @@ impl<'a> Lower<'a> {
         let x = self.i32_of(v)?;
         let mesh = self.s.mesh.expect("mesh");
         let threads = self.s.threads.expect("mesh")[0];
-        let flat = self.mesh_thread();
+        let flat = self.flat_thread();
         let guard = if threads > mesh.max_primitives {
             let mp = self.s.m.i32(mesh.max_primitives);
             let in_bounds = self.s.m.cmp(self.cur, pred::IULT, flat, mp);
