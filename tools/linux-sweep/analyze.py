@@ -32,6 +32,7 @@ PRESENT = re.compile(
     r"(?P<over1s>\d+) over 1 s"
 )
 FAULT = re.compile(r"\bshader fault\b|\bdevice lost\b|\bDeviceLost\b", re.IGNORECASE)
+CRASH = re.compile(r"\bunhandled exception\b|\bWER - Saving\b", re.IGNORECASE)
 INDIRECT_FAIL = re.compile(r"no argument clamp: indirect execution dropped")
 DEPTH_FAIL = re.compile(r"no pipeline to draw a depth plane from its twin")
 
@@ -45,6 +46,7 @@ def analyse(log: Path, captures: Path) -> int:
     world: tuple[int, int, int] | None = None
     presents: list[dict[str, float]] = []
     faults = 0
+    crashes = 0
     indirect = 0
     depth = 0
 
@@ -70,6 +72,8 @@ def analyse(log: Path, captures: Path) -> int:
             )
         if FAULT.search(clean):
             faults += 1
+        if CRASH.search(clean):
+            crashes += 1
         if INDIRECT_FAIL.search(clean):
             indirect += 1
         if DEPTH_FAIL.search(clean):
@@ -126,7 +130,7 @@ def analyse(log: Path, captures: Path) -> int:
 
     print(f"log_lines={len(lines)} captures={len(pngs)} nonblank={len(big)}")
     print(f"world_marker={world or 'NONE'}")
-    print(f"faults={faults} indirect_drops={indirect} depth_plane_drops={depth}")
+    print(f"faults={faults} crashes={crashes} indirect_drops={indirect} depth_plane_drops={depth}")
     print(f"black_frame_warnings={len(black_frames)} last={black_frames[-1] if black_frames else None}")
     print(f"shader_translation_drops={len(shader_drops)}")
     for (stage, h, err), count in Counter(shader_drops).most_common(12):
@@ -149,8 +153,8 @@ def analyse(log: Path, captures: Path) -> int:
         max(r, g) / max(b, 1.0) > 1.6 for _, r, g, b, _ in tint
     )
     blown = bool(tint) and max(x[4] for x in tint) > 0.25
-    ok = (bool(world) and not faults and not shader_drops and not black_frames
-          and not dark_screen and not color_cast)
+    ok = (bool(world) and not faults and not crashes and not shader_drops
+          and not black_frames and not dark_screen and not color_cast)
     if dark_screen:
         print("DARK_SCREEN: every large capture is a dark loading screen, not the world")
     if color_cast:
