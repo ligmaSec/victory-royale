@@ -1113,9 +1113,17 @@ impl State {
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
-            let publish = !crate::pipeline::builder_quarantined(self.pipeline as This);
+            let pipeline = self.pipeline as This;
+            let publish = !crate::pipeline::builder_quarantined(pipeline);
             let writes = publish && (t.stores || !write_skip());
-            let raw_writes = publish && (t.host.writes_guest_memory || !write_skip());
+            // The builder's structure bytes stay in the host copies: the
+            // programs that walk them read those copies. Only its small
+            // root-UAV results (sizes, counters) go back to title memory.
+            // Copying the raw guest ranges back lands structure data on the
+            // title's neighbours and ends in a null read in its image DLL.
+            let raw_writes = publish
+                && !crate::pipeline::is_builder(pipeline)
+                && (t.host.writes_guest_memory || !write_skip());
             // Title memory by address: what the shader finds it by.
             let memory = if t
                 .host
