@@ -30,6 +30,11 @@ void main(uint3 id : SV_DispatchThreadID) {
     } else {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = args.Load3(at);
+        // An unfilled record must run empty without charging the list's budget.
+        if (all(g == 0xffffffffu)) {
+            args.Store3(at, uint3(0, 0, 0));
+            return;
+        }
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
