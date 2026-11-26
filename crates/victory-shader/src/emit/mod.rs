@@ -1056,7 +1056,13 @@ mod tests {
                 }),
                 code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
             };
-            translate_native(&container, &native, true, None, None)
+            translate_native::<false>(
+                &container,
+                &native,
+                ComputeWaves::with_wave32(true),
+                None,
+                None,
+            )
         };
         let host = build(false).expect("register holds scalar data at the export");
         assert_eq!(host.stage, HwStage::Ms);
