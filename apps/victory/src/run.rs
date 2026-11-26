@@ -50,6 +50,9 @@ pub fn run(
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
+    if let Some(version) = crate::proton::version() {
+        println!("Proton version: {version}");
+    }
     if execute {
         check_cpu_features()?;
     }
