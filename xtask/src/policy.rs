@@ -160,6 +160,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
             | "tests/metal/probe.swift"
             | "scripts/hardware-test/run-test.py"
             | "scripts/hardware-test/session.py"
+            | "scripts/hardware-test/window_capture.py"
             | ".victoryconfig.example"
             | "scripts/hardware-test/prepare.py"
             | "scripts/hardware-test/report_ui.py"
@@ -168,6 +169,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
             | "scripts/hardware-test/report_keys.py"
             | "scripts/hardware-test/report-inbox.py"
             | "tests/hardware-test.py"
+            | "tests/hardware-x11-window.py"
             | "tests/hardware-delivery.py"
     ) || ALLOWED_NAMES.contains(&name)
         || ext
