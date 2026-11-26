@@ -2364,8 +2364,8 @@ impl HostList {
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// range that covers them. A shader-write snapshot needs its own buffer
+/// current. A title-memory write or GPU submission needs them all current.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
@@ -2396,7 +2396,14 @@ impl Batch {
             // The first declaration needs the refreshed bytes for its snapshot.
             // Another declaration of this exact range is already pending until
             // the GPU submission finishes, so it needs no refresh boundary.
-            self.flush();
+            if let Some(index) = self
+                .refreshes
+                .iter()
+                .position(|(copy, ..)| std::sync::Arc::ptr_eq(copy, shadow))
+            {
+                let (copy, from, to) = self.refreshes.remove(index);
+                Self::refresh(&copy, from, to);
+            }
             shadow.writing(address, len);
             self.gpu_writes.push((shadow.clone(), address, len));
         }
@@ -2430,19 +2437,23 @@ impl Batch {
 
     fn flush(&mut self) {
         for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            if let Some(bytes) = crate::shadow::skipped(to - from, copied) {
-                crate::copystat::add(crate::copystat::C::Skipped, 1);
-                crate::copystat::add(crate::copystat::C::SkippedBytes, bytes);
-            }
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            Self::refresh(&shadow, from, to);
         }
+    }
+
+    fn refresh(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        let started = std::time::Instant::now();
+        let copied = shadow.update(from, to - from);
+        let us = started.elapsed().as_micros() as u64;
+        #[cfg(feature = "diagnostics")]
+        if let Some(bytes) = crate::shadow::skipped(to - from, copied) {
+            crate::copystat::add(crate::copystat::C::Skipped, 1);
+            crate::copystat::add(crate::copystat::C::SkippedBytes, bytes);
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::range(from, to - from, us, 0);
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     }
 }
 
@@ -4247,6 +4258,93 @@ mod batch {
     // Batch::texture_due lives here; `mod tests` is already taken above
     use super::Batch;
     use std::sync::Arc;
+
+    // Each pass reads the same 4 MiB and declares a distinct 16-byte output.
+    // The second workload adds a title-write boundary between passes.
+    // Sample columns are title-write boundary, batch microseconds, bytes refreshed.
+    #[test]
+    #[ignore = "measures submission-time buffer refreshes"]
+    fn benchmark_shader_write_refreshes() {
+        assert!(super::host().is_some(), "benchmark needs a D3D12 adapter");
+        let _scope = super::isolated_retire_scope();
+        let source = vec![23u8; 4 << 20];
+        let output = vec![35u8; 4096];
+        let src = source.as_ptr() as usize;
+        let dst = output.as_ptr() as usize;
+        crate::shadow::register(src, src as u64, source.len() as u64);
+        crate::shadow::register(dst, dst as u64, output.len() as u64);
+        let read = crate::shadow::find(src as u64, source.len() as u64).unwrap();
+        let write = crate::shadow::find(dst as u64, output.len() as u64).unwrap();
+        for barrier in [false, true] {
+            for sample in 0..18 {
+                let mut batch = Batch::default();
+                let before = super::PREPARING[1].load(super::Ordering::Relaxed);
+                let clock = std::time::Instant::now();
+                for pass in 0..12 {
+                    batch.add(&read, src, source.len());
+                    let at = dst + pass * 16;
+                    batch.add(&write, at, 16);
+                    batch.gpu_write(&write, at, 16);
+                    if barrier {
+                        batch.title_written();
+                    }
+                }
+                batch.flush();
+                for (copy, at, len) in batch.gpu_writes.drain(..) {
+                    assert_eq!(copy.copy_back(at, len), 0);
+                }
+                let micros = clock.elapsed().as_micros();
+                let bytes = super::PREPARING[1].load(super::Ordering::Relaxed) - before;
+                assert_eq!(read.bytes(src as u64, 1).unwrap(), [23]);
+                if sample >= 2 {
+                    println!("refresh_sample {barrier} {micros} {bytes}");
+                }
+            }
+        }
+        crate::shadow::unregister(dst, dst as u64);
+        crate::shadow::unregister(src, src as u64);
+    }
+
+    #[test]
+    fn shader_write_updates_its_own_copy_before_the_snapshot() {
+        if super::host().is_none() {
+            return;
+        }
+        let _scope = super::isolated_retire_scope();
+        let mut data = vec![31u8; 4096];
+        let start = data.as_ptr() as usize;
+        let inner = start + 128;
+        crate::shadow::register(start, start as u64, data.len() as u64);
+        crate::shadow::register(inner, inner as u64, 256);
+        let wide = crate::shadow::find(start as u64, data.len() as u64).unwrap();
+        let narrow = crate::shadow::find(inner as u64, 256).unwrap();
+        assert!(!Arc::ptr_eq(&wide, &narrow));
+        wide.update(start, data.len());
+        narrow.update(inner, 256);
+        data[128] = 42;
+
+        let mut batch = Batch::default();
+        batch.add(&wide, start, data.len());
+        batch.add(&narrow, inner, 256);
+        batch.gpu_write(&narrow, inner, 256);
+        assert_eq!(narrow.bytes(inner as u64, 1).unwrap(), [42]);
+        assert_eq!(wide.bytes(inner as u64, 1).unwrap(), [31]);
+
+        // A title write first flushes the other copy, even when it aliases
+        // the snapshotted buffer in title memory.
+        batch.title_written();
+        assert_eq!(wide.bytes(inner as u64, 1).unwrap(), [42]);
+        data[128] = 53;
+        batch.add(&wide, start, data.len());
+        batch.add(&narrow, inner, 256);
+        batch.flush();
+        assert_eq!(wide.bytes(inner as u64, 1).unwrap(), [53]);
+        assert_eq!(narrow.bytes(inner as u64, 1).unwrap(), [42]);
+        assert_eq!(narrow.copy_back(inner, 256), 0);
+        assert_eq!(data[128], 53);
+        crate::shadow::unregister(inner, inner as u64);
+        crate::shadow::unregister(start, start as u64);
+    }
 
     #[test]
     fn exact_gpu_writes_are_declared_once_per_submission() {
