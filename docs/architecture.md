@@ -114,3 +114,18 @@ lists what they cannot handle yet.
 A `victory-pipeline` converter produces the same output for the same input.
 Its cache key includes the converter ID, version, and input bytes. Bump the
 converter version when the output format or conversion result changes.
+
+## Host pipeline cache
+
+The D3D12 pipeline library lives in an adapter-specific directory under
+`adapters/` in the pipeline cache. Switching between integrated, discrete
+and software adapters preserves their compiled libraries. The key uses the
+DXGI software flag and the vendor, device, subsystem and revision IDs.
+Adapters with the same key share a directory. If DXGI cannot identify the
+device, the runtime uses `adapters/unknown/`.
+
+On the first load for an adapter, the runtime can read the previous
+top-level `host-pipelines.bin`. D3D12 checks compatibility and starts an
+empty library if it rejects the file. Future saves go to the adapter
+directory. The top-level `early-pipelines.txt` records which title pipelines
+to prepare during loading and stays shared across adapters.

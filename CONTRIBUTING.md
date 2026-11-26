@@ -6,7 +6,7 @@ If this is your first contribution, try one test and tell us what happened.
 You can help without writing a patch. Browse [PRs looking for testers](https://github.com/ligmaSec/victory-royale/pulls?q=is%3Apr+is%3Aopen+label%3A%22tester+wanted%22) to find a test. A result from a second machine can
 show whether a failure follows a particular build, GPU driver, or setting.
 
-- **Testing a pull request?** Use the [interactive Series X test](docs/testing.md#run-a-series-x-hardware-test) on Windows or Linux/Proton. Pick the PR and follow the same scenario twice. Logs may contain usernames, local paths, or other sensitive information. Review them before sharing a ZIP privately, or send a written summary.
+- **Testing a pull request?** Use the [interactive Series X test](docs/testing.md#run-a-series-x-hardware-test) on Windows or Linux/Proton. Pick the PR and follow the same scenario twice. Choose **Describe what you saw** to record observations for main and candidate. Paste a screenshot for either build there. The public comment includes reviewed notes and timings. Screenshots travel in the encrypted ZIP if you choose private delivery. Logs may contain usernames, local paths, or other sensitive information. Use the results screen to preview the summary, redact text or exclude files before sharing. The runner previews a summary you can post to the PR and can send detailed diagnostics encrypted to the verified requester named on screen using GitHub CLI authenticated with gist access. Keep the raw logs local.
 - **Reporting a single Linux run?** Install UMU (`umu-run`) and extract a tested
   [Proton build](docs/testing.md#ci-and-build-downloads). From its `victory`
   directory, run `./victory-proton.sh --report "/path/to/title.exe"`.
@@ -26,10 +26,27 @@ hardware, and result. A successful run on a machine where a fix needed checking
 is worth posting too. For a new failure, open **one issue per distinct symptom**
 using the [test report form](https://github.com/ligmaSec/victory-royale/issues/new?template=test-report.yml).
 
+**Requesting or publishing a hardware test?** From the repository root, run
+`python3 scripts/hardware-test/report-inbox.py setup` once with your own GitHub CLI
+login and gist access (Windows uses `py`). Back up the private folder it prints.
+If a maintainer will publish for you, start a comment on the target PR with
+`/victory hardware-test` alone on its first line. Give the scenario below it and
+send the maintainer the comment link. When publishing on someone’s behalf, enter
+that link in the workflow’s **requester_comment** field. For your own request,
+leave it empty. Check the requester shown by `--plan` before inviting testers.
+The requester’s Gist notification includes the command to decrypt the reviewed
+ZIP in their own `~/uploads`. For automatic pickup run
+`python3 scripts/hardware-test/report-inbox.py collect --watch` on the machine with the requester key.
+Testers may opt into a public encrypted receipt after sending. Their username and posting time
+are visible on the requester’s key Gist. Keep this optional when recruiting testers. [Setup, rotation and report retrieval](docs/testing.md#receive-private-hardware-reports).
+
 When you ask for testers on a pull request, add the `tester wanted` label to
 the PR. If you cannot set labels, ask a maintainer in the same request. Say
 which configurations still need a run and remove the label when those results
-are in or the request is withdrawn.
+are in or the request is withdrawn. For a test that runs by PR number, publish
+the [matched kit](docs/testing.md#run-a-series-x-hardware-test) from `main` and
+check `python3 scripts/hardware-test/run-test.py PR_NUMBER --plan` before sharing
+the command. Put any manual test instructions in the PR.
 
 ## Help by reviewing pull requests
 

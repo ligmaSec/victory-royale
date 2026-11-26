@@ -87,6 +87,7 @@ pub(crate) struct Parts<'a> {
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
+    NeedsNativeWave,
     Fail(ShaderError),
 }
 
@@ -105,16 +106,16 @@ const UNTRACKED_SELECT: Why = "a select on an untracked mask";
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_with_wave32(parts, true, None, None)
+    lower_with_waves::<false>(parts, super::ComputeWaves::with_wave32(true), None, None)
 }
 
-pub(crate) fn lower_with_wave32(
+pub(crate) fn lower_with_waves<const PARTIAL: bool>(
     parts: &Parts,
-    allow_wave32: bool,
+    waves: super::ComputeWaves,
     pixel_inputs: Option<&[SigElement]>,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<Lowered, ShaderError> {
-    let attempt = |mode| lower_program(parts, mode, allow_wave32, pixel_inputs, view_stride);
+    let attempt = |mode| lower_program::<PARTIAL>(parts, mode, waves, pixel_inputs, view_stride);
     match attempt(LowerMode::Normal) {
         Err(ShaderError::Unsupported {
             what: UNTRACKED_SELECT,
@@ -128,16 +129,17 @@ pub(crate) fn lower_with_wave32(
     }
 }
 
-fn lower_program(
+fn lower_program<const PARTIAL: bool>(
     parts: &Parts,
     mode: LowerMode,
-    allow_wave32: bool,
+    waves: super::ComputeWaves,
     pixel_inputs: Option<&[SigElement]>,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    let mut waves = waves;
     loop {
-        match Lower::new(parts, &bad, mode, allow_wave32, view_stride).run(pixel_inputs) {
+        match Lower::new(parts, &bad, mode, waves, view_stride).run::<PARTIAL>(pixel_inputs) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -146,6 +148,10 @@ fn lower_program(
                         what: "a phi that does not settle",
                     });
                 }
+            }
+            Err(Stop::NeedsNativeWave) => {
+                waves.narrow_quads = false;
+                bad.clear();
             }
             Err(Stop::Fail(e)) => return Err(e),
         }
@@ -270,6 +276,8 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// Original group dimensions when four consecutive flat ids form one host quad.
+    flat_quads: Option<[u32; 3]>,
     mode: LowerMode,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
@@ -512,7 +520,7 @@ impl<'a> Lower<'a> {
         x: &'a Parts<'a>,
         bad: &'a HashMap<Value, Why>,
         mode: LowerMode,
-        allow_wave32: bool,
+        waves: super::ComputeWaves,
         view_stride: Option<ViewStride<'a>>,
     ) -> Self {
         let p = x.p;
@@ -531,6 +539,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
+        let mut flat_quads = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -583,13 +592,33 @@ impl<'a> Lower<'a> {
             // independent lane exchange outside those sections), lowering it
             // with WaveSize(32) matches the 64-lane reduction identically on
             // 32-lane hosts (`thread_id()` reads `s.wave_size = 32`).
-            let one_wave32 = allow_wave32
+            let one_wave32 = waves.wave32
                 && x.native.wave64
                 && threads == 32
                 && s.lds_dwords == 0
                 && !masks_held
                 && super::wave::single_wave32_reductions(p);
-            if one_wave32 {
+            // Explicit gradients only read lanes 0, 1 and 2 of each quad. A
+            // one-dimensional host group gives each four consecutive flat
+            // thread IDs the same quad as the console.
+            let quad_samples_only = waves.narrow_quads
+                && x.native.wave64
+                && threads == 64
+                && s.lds_dwords == 0
+                && !masks_held
+                && mode != LowerMode::NumericSelects
+                && insts().any(|i| implicit_derivatives(i.name()))
+                && insts().all(|i| {
+                    (!is_console_lane_op(i) || implicit_derivatives(i.name()))
+                        && !matches!(i.name(), "v_readfirstlane_b32" | "s_barrier")
+                        && !i.name().starts_with("ds_")
+                })
+                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+            if quad_samples_only {
+                flat_quads = Some(cs.threads);
+                s.threads = Some([threads, 1, 1]);
+                console_lanes = false;
+            } else if one_wave32 {
                 s.wave_size = Some(32);
             } else if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -681,6 +710,7 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            flat_quads,
             mode,
             flat: None,
             no_barrier,
@@ -1132,7 +1162,17 @@ impl<'a> Lower<'a> {
         acc
     }
 
-    fn run(mut self, pixel_inputs: Option<&[SigElement]>) -> Result<Lowered, Stop> {
+    fn run<const PARTIAL: bool>(
+        mut self,
+        pixel_inputs: Option<&[SigElement]>,
+    ) -> Result<Lowered, Stop> {
+        let entry = self.s.entry;
+        if PARTIAL {
+            if self.x.native.stage != HwStage::Cs {
+                return Err(unsupported(0, "thread dimensions outside compute"));
+            }
+            self.s.entry = self.s.m.new_block();
+        }
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -1209,6 +1249,19 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        // Lowering can also introduce whole-wave operations for implicit masks.
+        // Keep the native program when a dependency crosses a quad boundary.
+        if self.flat_quads.is_some() && self.s.m.uses_whole_wave() {
+            return Err(Stop::NeedsNativeWave);
+        }
+        if PARTIAL {
+            // A group barrier inside a partial group can deadlock. Inspect
+            // the emitted operations so generated barriers are covered too.
+            if self.s.m.has_dx_op("dx.op.barrier", 80) {
+                return Err(unsupported(0, "a partial dispatch with a group barrier"));
+            }
+            self.dispatch_guard(entry)?;
+        }
         self.s.prune_pixel_inputs();
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
@@ -1262,6 +1315,53 @@ impl<'a> Lower<'a> {
     fn has_done_export(&self, b: usize) -> bool {
         (0..self.x.p.blocks[b].insts.len())
             .any(|i| self.exports.get(&(b, i)).is_some_and(|e| e.done))
+    }
+
+    /// Branch before any guest code. Compute the cutoff in the same lane
+    /// order as guest thread IDs on hosts where wave lanes are relabelled.
+    fn dispatch_guard(&mut self, entry: usize) -> Result<(), Stop> {
+        let body = std::mem::replace(&mut self.s.entry, entry);
+        self.cur = entry;
+        self.user_data = None;
+        let mut active = self.s.m.bool(true);
+        let threads = self.flat_quads.or(self.s.threads).expect("compute");
+        for (axis, width) in threads.into_iter().enumerate() {
+            if width == 1 {
+                continue;
+            }
+            let index = self.s.user_data;
+            if index >= 64 {
+                return Err(unsupported(
+                    0,
+                    "partial dispatch beyond the root constant budget",
+                ));
+            }
+            self.user_reads.insert(
+                index,
+                UserData {
+                    indexed_buffer: false,
+                    index,
+                    slot: 0,
+                    root: super::DISPATCH_THREADS,
+                    dword: axis as u32,
+                },
+            );
+            let limit = self.user_word(index);
+            let Val::I32(group) = self.compute_id("groupId.i32", 94, axis as u8) else {
+                unreachable!()
+            };
+            let Val::I32(local) = self.thread_id(axis as u8) else {
+                unreachable!()
+            };
+            let width = self.s.m.i32(width);
+            let base = self.s.m.bin(entry, Bin::Mul, group, width);
+            let global = self.s.m.bin(entry, Bin::Add, base, local);
+            let inside = self.s.m.cmp(entry, pred::IULT, global, limit);
+            active = self.s.m.bin(entry, Bin::And, active, inside);
+        }
+        let done = self.abort_block();
+        self.s.m.terminate(entry, Term::CondBr(active, body, done));
+        Ok(())
     }
 
     /// Values of the program's input registers.
@@ -2556,7 +2656,9 @@ impl<'a> Lower<'a> {
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
             return Err("a cross-lane operation outside compute");
         }
-        debug_assert!(self.s.threads.is_none() || self.console_lanes);
+        debug_assert!(
+            self.s.threads.is_none() || self.console_lanes || (quad && self.flat_quads.is_some())
+        );
         self.s.flags |= flags::WAVE_OPS;
         Ok(())
     }
@@ -2567,10 +2669,10 @@ impl<'a> Lower<'a> {
     /// plus the lane index. (A bijection while each host wave holds a
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
-        if !self.console_lanes {
+        if !self.console_lanes && self.flat_quads.is_none() {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
-        let [x, y, _] = self.s.threads.expect("compute");
+        let [x, y, _] = self.flat_quads.or(self.s.threads).expect("compute");
         let e = self.s.entry;
         let i32t = self.s.t.i32;
         let flat = self.s.op(
@@ -2581,20 +2683,24 @@ impl<'a> Lower<'a> {
             96,
             &[],
         );
-        let first = self.s.op(
-            e,
-            "waveReadLaneFirst.i32",
-            Attr::NoUnwind,
-            i32t,
-            118,
-            &[flat],
-        );
-        let wave = self.s.wave_size.expect("set with console lanes");
-        let mask = self.s.m.i32(!(wave - 1));
-        let base = self.s.m.bin(e, Bin::And, first, mask);
-        let lane = self.lane_index();
-        let f = self.s.m.bin(e, Bin::Add, base, lane);
-        self.s.flags |= flags::WAVE_OPS;
+        let f = if self.console_lanes {
+            let first = self.s.op(
+                e,
+                "waveReadLaneFirst.i32",
+                Attr::NoUnwind,
+                i32t,
+                118,
+                &[flat],
+            );
+            let wave = self.s.wave_size.expect("set with console lanes");
+            let mask = self.s.m.i32(!(wave - 1));
+            let base = self.s.m.bin(e, Bin::And, first, mask);
+            let lane = self.lane_index();
+            self.s.flags |= flags::WAVE_OPS;
+            self.s.m.bin(e, Bin::Add, base, lane)
+        } else {
+            flat
+        };
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
         Val::I32(match c {
             0 => self.s.m.bin(e, Bin::URem, f, xk),
@@ -2738,25 +2844,39 @@ impl<'a> Lower<'a> {
     /// `scale` if given.
     fn quad_gradients(&mut self, coords: &[V], scale: Option<V>) -> Vec<V> {
         let c = self.cur;
-        let lane = self.lane_index();
-        let top = self.s.m.i32(!3);
-        let base = self.s.m.bin(c, Bin::And, lane, top);
-        let lanes: Vec<V> = (1..3u32)
-            .map(|k| {
+        let indices = if self.flat_quads.is_some() {
+            [0, 1, 2].map(|k| self.s.m.i32(k))
+        } else {
+            let lane = self.lane_index();
+            let mask = self.s.m.i32(!3);
+            let base = self.s.m.bin(c, Bin::And, lane, mask);
+            let [right, down] = [1, 2].map(|k| {
                 let k = self.s.m.i32(k);
                 self.s.m.bin(c, Bin::Or, base, k)
-            })
-            .collect();
+            });
+            [base, right, down]
+        };
         let fu = self.s.m.undef(self.s.t.f32);
         let mut g = vec![fu; 6];
         for (k, &x) in coords.iter().enumerate().take(3) {
             let xi = self.as_int(x);
             let at = |l: &mut Self, lane: V| {
-                let r = l.read_lane(xi, lane);
+                let r = if l.flat_quads.is_some() {
+                    l.s.op(
+                        c,
+                        "quadReadLaneAt.i32",
+                        Attr::NoUnwind,
+                        l.s.t.i32,
+                        122,
+                        &[xi, lane],
+                    )
+                } else {
+                    l.read_lane(xi, lane)
+                };
                 l.as_float(r)
             };
-            let origin = at(self, base);
-            for (d, &lane) in lanes.iter().enumerate() {
+            let origin = at(self, indices[0]);
+            for (d, &lane) in indices[1..].iter().enumerate() {
                 let there = at(self, lane);
                 let mut diff = self.s.m.bin(c, Bin::Sub, there, origin);
                 if let Some(s) = scale {
@@ -2855,6 +2975,62 @@ impl<'a> Lower<'a> {
             };
             let reg = dst_reg.ok_or("a swizzle result")?;
             self.write(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
+        if name == "ds_bpermute_b32" {
+            self.cross_lane(false)?;
+            let address = self.vgprs(inst, addr.as_ref().ok_or("a lane gather index")?, 1)?[0];
+            let value = self.vgprs(inst, data.first().ok_or("a lane gather source")?, 1)?[0];
+            // RDNA 2 section 10.4.4: byte address plus offset0, within the
+            // reader's 32-lane half. Disabled sources contribute zero.
+            let me = self.lane_index();
+            let addend = self.s.m.i32(u32::from(*offset0));
+            let address = self.s.m.bin(c, Bin::Add, address, addend);
+            let two = self.s.m.i32(2);
+            let index = self.s.m.bin(c, Bin::LShr, address, two);
+            let mask = self.s.m.i32(31);
+            let local = self.s.m.bin(c, Bin::And, index, mask);
+            let enabled = guard.unwrap_or_else(|| self.s.m.bool(true));
+            let words = self
+                .s
+                .m
+                .named_struct("dx.types.fouri32", vec![self.s.t.i32; 4]);
+            let ballot = self.s.op(
+                c,
+                "waveActiveBallot",
+                Attr::NoUnwind,
+                words,
+                116,
+                &[enabled],
+            );
+            let low = self.s.m.extract(c, ballot, 0);
+            let (source, active) = if self.s.wave_size == Some(64) {
+                let upper_bit = self.s.m.i32(32);
+                let half = self.s.m.bin(c, Bin::And, me, upper_bit);
+                let upper = self.s.m.cmp(c, pred::EQ, half, upper_bit);
+                let high = self.s.m.extract(c, ballot, 1);
+                (
+                    self.s.m.bin(c, Bin::Or, half, local),
+                    self.s.m.select(c, upper, high, low),
+                )
+            } else {
+                (local, low)
+            };
+            let bits = self.s.m.bin(c, Bin::LShr, active, local);
+            let one = self.s.m.i32(1);
+            let bit = self.s.m.bin(c, Bin::And, bits, one);
+            let live = self.s.m.cmp(c, pred::EQ, bit, one);
+            // WaveReadLaneAt is undefined for an inactive host lane.
+            let safe = self.s.m.select(c, live, source, me);
+            let gathered = self.read_lane(value, safe);
+            let zero = self.s.m.i32(0);
+            let result = self.s.m.select(c, live, gathered, zero);
+            self.write(
+                inst,
+                Reg::V(dst_reg.ok_or("a lane gather result")?),
+                result,
+                guard,
+            );
             return Ok(());
         }
         if self.s.lds_dwords == 0 {
@@ -8270,6 +8446,7 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        let mut remaining = None;
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
@@ -8295,7 +8472,11 @@ impl<'a> Lower<'a> {
                 .flatten();
             match (index, selector) {
                 (Some(index), Some((slot, word))) => {
-                    let [alias, stride, bias] = self.selected_buffer(slot, word)?;
+                    let [packed, stride, length] = self.selected_buffer(slot, word)?;
+                    let four = self.s.m.i32(4);
+                    let low = self.s.m.i32(15);
+                    let alias = self.s.m.bin(c, Bin::LShr, packed, four);
+                    let bias = self.s.m.bin(c, Bin::And, packed, low);
                     let start = self.s.m.bin(c, Bin::Mul, index, stride);
                     let offset = self.s.m.bin(c, Bin::Add, start, off);
                     let byte = self.s.m.bin(c, Bin::Add, offset, bias);
@@ -8304,14 +8485,14 @@ impl<'a> Lower<'a> {
                     let zero = self.s.m.i32(0);
                     let product_wrapped = self.s.m.cmp(c, pred::NE, high, zero);
                     let offset_wrapped = self.s.m.cmp(c, pred::IULT, offset, start);
-                    let bias_wrapped = self.s.m.cmp(c, pred::IULT, byte, offset);
                     let wrapped = self.s.m.bin(c, Bin::Or, product_wrapped, offset_wrapped);
-                    let overflow = self.s.m.bin(c, Bin::Or, wrapped, bias_wrapped);
-                    // The host leaves this final block outside every alias. All
-                    // four component addresses still fit in a 32-bit offset.
+                    // The host leaves the final 16-byte block outside every alias.
+                    // Any offset within length still fits after adding the bias.
                     let invalid = self.s.m.i32(u32::MAX - 15);
-                    let in_last_block = self.s.m.cmp(c, pred::IUGE, byte, invalid);
-                    let invalid_address = self.s.m.bin(c, Bin::Or, overflow, in_last_block);
+                    let outside = self.s.m.cmp(c, pred::IUGE, offset, length);
+                    let invalid_address = self.s.m.bin(c, Bin::Or, wrapped, outside);
+                    let bytes = self.s.m.bin(c, Bin::Sub, length, offset);
+                    remaining = Some(self.s.m.select(c, invalid_address, zero, bytes));
                     let byte = self.s.m.select(c, invalid_address, invalid, byte);
                     let h = self.s.heap_handle(c, alias, false, false, (11, 0));
                     self.s.op(
@@ -8351,13 +8532,25 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = *data else {
             return Err("a buffer result");
         };
+        // A vector raw load may span the logical end of an aligned view.
+        let component = |this: &mut Self, k: u32| {
+            let value = this.s.m.extract(c, r, k);
+            if let Some(bytes) = remaining {
+                let needed = this.s.m.i32((k + 1) * 4);
+                let valid = this.s.m.cmp(c, pred::IUGE, bytes, needed);
+                let zero = this.s.m.f32(0);
+                this.s.m.select(c, valid, value, zero)
+            } else {
+                value
+            }
+        };
         if d16 {
             // Two f16 channels per VGPR (an odd last high half 0).
             let k16 = self.s.m.i32(16);
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
-                    let f = self.s.m.extract(c, r, ch);
+                    let f = component(self, ch);
                     let h = self.f16_nearest(f);
                     x = Some(match x {
                         Some(hi) => {
@@ -8372,7 +8565,7 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         for k in 0..count {
-            let x = self.s.m.extract(c, r, k);
+            let x = component(self, k);
             let x = self.as_int(x);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
@@ -11015,18 +11208,19 @@ mod wave_size_tests {
         threads: [u32; 3],
         rsrc2_extra: u32,
     ) -> (super::super::HostShader, (u32, u32)) {
-        compile_wave64_cs_mode(words, threads, rsrc2_extra, true)
+        compile_cs_mode(words, threads, rsrc2_extra, true, true)
     }
 
-    fn compile_wave64_cs_mode(
+    fn compile_cs_mode(
         words: &[u32],
         threads: [u32; 3],
         rsrc2_extra: u32,
+        wave64: bool,
         allow_wave32: bool,
     ) -> (super::super::HostShader, (u32, u32)) {
         let native = NativeProgram {
             stage: HwStage::Cs,
-            wave64: true,
+            wave64,
             vgprs: 8,
             layout: vec![RootParam {
                 root: RootType::Table,
@@ -11054,7 +11248,7 @@ mod wave_size_tests {
         };
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
-        let p = crate::ir::build(&native.code, true, native.vgprs).unwrap();
+        let p = crate::ir::build(&native.code, wave64, native.vgprs).unwrap();
         let st = crate::structure::structure(&p).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
         let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
@@ -11141,7 +11335,11 @@ mod wave_size_tests {
     }
 
     #[cfg(windows)]
-    fn run_cs_uav(shader: &super::super::HostShader, dwords: u32) -> Vec<(&'static str, Vec<u32>)> {
+    fn run_cs_uav(
+        shader: &super::super::HostShader,
+        dwords: u32,
+        wave: u32,
+    ) -> Vec<(&'static str, Vec<u32>)> {
         use super::super::host::{Dispatch, Host, Root, View};
         use windows::Win32::Graphics::Direct3D12::*;
         let _one = super::super::valu_tests::ONE_AT_A_TIME
@@ -11163,12 +11361,10 @@ mod wave_size_tests {
             }
             .is_ok()
                 && opts1.WaveOps.as_bool()
-                && (opts1.WaveLaneCountMin..=opts1.WaveLaneCountMax).contains(&32);
+                && (opts1.WaveLaneCountMin..=opts1.WaveLaneCountMax).contains(&wave);
             if !supported {
-                // WARP reports WaveLaneCountMin/Max = 4, so fixed WaveSize(32)
-                // pipelines are only executable on hardware Wave32 devices.
                 eprintln!(
-                    "{label}: skipped WaveSize(32) execution (device supports {}..{})",
+                    "{label}: skipped WaveSize({wave}) execution (device supports {}..{})",
                     opts1.WaveLaneCountMin, opts1.WaveLaneCountMax
                 );
                 continue;
@@ -11195,6 +11391,49 @@ mod wave_size_tests {
     }
 
     #[test]
+    fn lane_gather_wraps_in_its_half_and_honors_exec() {
+        for (wave, threads) in [(32, 32), (32, 19), (64, 64), (64, 45)] {
+            let wide = wave == 64;
+            let words = [
+                0xBE81_0380, // s_mov_b32 s1, 0
+                0xF408_0200,
+                0xFA00_0000,                                  // load raw UAV into s[8:11]
+                0x340C_0082,                                  // v6 = lane's byte address
+                0x4A02_0081,                                  // v1 = thread index + 1
+                0x7E08_02C1,                                  // v4 = -1 before disabling lane 11
+                0x7D8A_008B,                                  // v_cmp_ne_u32 vcc, 11, v0
+                if wide { 0xBE8C_246A } else { 0xBE8C_3C6A }, // save EXEC and mask it with VCC
+                0xDACC_0087,
+                0x0400_0106, // ds_bpermute_b32 v4, v6, v1 offset:135
+                if wide { 0xBEFE_040C } else { 0xBEFE_030C }, // restore saved EXEC
+                0xE070_1000,
+                0x8002_0406, // store v4 at byte address v6
+                S_ENDPGM,
+            ];
+            let (shader, bounds) = compile_cs_mode(&words, [threads, 1, 1], 0, wide, true);
+            assert_eq!(bounds, (wave, wave));
+            let _ = &shader;
+            #[cfg(windows)]
+            for (label, data) in run_cs_uav(&shader, threads, wave) {
+                let expected: Vec<_> = (0..threads)
+                    .map(|lane| {
+                        let source = (lane & !31) + ((lane + 1) & 31);
+                        if lane == 11 {
+                            u32::MAX
+                        } else if source == 11 || source >= threads {
+                            0
+                        } else {
+                            source + 1
+                        }
+                    })
+                    .collect();
+                assert_eq!(data, expected, "{label}, wave {wave}, {threads} threads");
+                eprintln!("{label}: matched {threads} gathered values on Wave{wave}");
+            }
+        }
+    }
+
+    #[test]
     fn small_wave64_whole_wave_reduction_emits_wave32_and_runs() {
         for (threads, setup_2d, rsrc2_extra, expected_sum) in [
             ([32, 1, 1], false, 0, 32 * 33 / 2),
@@ -11207,7 +11446,7 @@ mod wave_size_tests {
             #[cfg(windows)]
             {
                 let count = threads.iter().product::<u32>();
-                for (label, data) in run_cs_uav(&shader, count) {
+                for (label, data) in run_cs_uav(&shader, count, 32) {
                     assert_eq!(
                         data,
                         vec![expected_sum; count as usize],
@@ -11237,7 +11476,7 @@ mod wave_size_tests {
         let _ = &shader;
         assert_eq!(wave_bounds, (32, 32));
         #[cfg(windows)]
-        for (label, data) in run_cs_uav(&shader, 32) {
+        for (label, data) in run_cs_uav(&shader, 32, 32) {
             let want: Vec<u32> = (0..32).map(|i| if i < 8 { 36 } else { 0 }).collect();
             assert_eq!(data, want, "{label} divergent");
         }
@@ -11280,7 +11519,7 @@ mod wave_size_tests {
 
         // On adapters that only support 64-lane waves (`allow_wave32 = false`),
         // an otherwise eligible <=32-thread reduction keeps WaveSize(64).
-        let (_, bounds) = compile_wave64_cs_mode(&base, [32, 1, 1], 0, false);
+        let (_, bounds) = compile_cs_mode(&base, [32, 1, 1], 0, true, false);
         assert_eq!(bounds, (64, 64));
     }
 
@@ -11331,7 +11570,7 @@ mod wave_size_tests {
             "33-thread variant must stay out of the Wave32 reduction path"
         );
         #[cfg(windows)]
-        for (label, data) in run_cs_uav(&shader, 32) {
+        for (label, data) in run_cs_uav(&shader, 32, 32) {
             let expected: Vec<u32> = (0..32)
                 .map(|i| if i % 2 == 0 { 16.0f32.to_bits() } else { 0 })
                 .collect();

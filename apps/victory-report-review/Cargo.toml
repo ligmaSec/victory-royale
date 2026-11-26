@@ -1,0 +1,17 @@
+[package]
+name = "victory-report-review"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossterm = "0.29"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+ratatui-textarea = { version = "0.9.4", features = ["search"] }
+regex = "1"
+
+[lints]
+workspace = true
