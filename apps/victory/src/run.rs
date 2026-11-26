@@ -60,7 +60,7 @@ pub fn run(
     let original = std::fs::read(exe)
         .inspect_err(|error| IoOperation::ReadImage.failed(error, started))
         .with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let prepared = victory_loader::prepare_owned(original)?;
     let hash = prepared.original_hash.to_hex();
     let title_dir = exe.parent().unwrap_or(Path::new("."));
     match victory_game::identify(&hash) {
@@ -76,6 +76,7 @@ pub fn run(
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
+    drop(prepared);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     println!(

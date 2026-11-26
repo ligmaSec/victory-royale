@@ -47,7 +47,7 @@ pub use crash::save_on_crash;
 pub use crash::{
     locate, log_crash, log_crashes_to, note_title_output, report_crashes, report_unhandled,
 };
-pub use prepare::{PrepareError, PreparedImage, prepare};
+pub use prepare::{PrepareError, PreparedImage, prepare, prepare_owned};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};

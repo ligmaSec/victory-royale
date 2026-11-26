@@ -2,7 +2,7 @@
 //! is covered on every host. The unit tests in `src/prepare.rs` use the test
 //! binary itself, which is a PE image only on Windows.
 
-use victory_loader::prepare;
+use victory_loader::{prepare, prepare_owned};
 use victory_pe::ImageInfo;
 use victory_pe::layout::{self, dir, dll_flags, file_flags};
 
@@ -375,6 +375,19 @@ fn an_image_without_imports_or_tls_only_changes_its_headers() {
     // The section, relocations included, is untouched.
     assert_eq!(&prepared.bytes[SECTION_FILE..], &original[SECTION_FILE..]);
     assert!(ImageInfo::parse(&prepared.bytes).unwrap().is_dll());
+}
+
+#[test]
+fn preparing_an_owned_image_reuses_its_allocation_and_keeps_the_original_identity() {
+    let original = image();
+    let expected = prepare(&original).unwrap();
+    let address = original.as_ptr();
+    let prepared = prepare_owned(original).unwrap();
+    assert_eq!(prepared.bytes.as_ptr(), address);
+    assert_eq!(prepared.original_hash, expected.original_hash);
+    assert_eq!(prepared.bytes, expected.bytes);
+    assert_eq!(prepared.info.entry_rva, expected.info.entry_rva);
+    assert!(!prepared.info.is_dll());
 }
 
 #[test]
