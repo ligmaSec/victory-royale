@@ -127,7 +127,7 @@ fn lower_program<const PARTIAL: bool>(
     let mut bad = HashMap::new();
     let mut waves = waves;
     loop {
-        match Lower::new(parts, &bad, numeric_selects, waves, view_stride)
+        match Lower::new::<PARTIAL>(parts, &bad, numeric_selects, waves, view_stride)
             .run::<PARTIAL>(pixel_inputs)
         {
             Ok(l) => return Ok(l),
@@ -604,7 +604,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(
+    fn new<const PARTIAL: bool>(
         x: &'a Parts<'a>,
         bad: &'a HashMap<Value, Why>,
         numeric_selects: bool,
@@ -720,6 +720,11 @@ impl<'a> Lower<'a> {
                 matches!(i.name(), "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32")
                     && matches!(&i.fields, Fields::Valu(v) if v.dpp.is_none() && v.src.first() == Some(&Operand::Const(193)))
             };
+            let entry_exec = [EXEC, EXEC + 1].map(|reg| {
+                p.inputs
+                    .iter()
+                    .find_map(|&(input, value)| (input == Reg::S(reg)).then_some(value))
+            });
             group_exchange = waves.narrow_quads
                 && x.native.wave64
                 && threads == 64
@@ -731,7 +736,15 @@ impl<'a> Lower<'a> {
                     block.preds.iter().all(|&pred| pred < b)
                         && super::wave::sections(p, b).is_empty()
                         && block.insts.iter().enumerate().all(|(at, i)| {
-                            (exchange(i)
+                            // Lane zero is first only when the full guest wave
+                            // is active. Require both unchanged entry EXEC words.
+                            let entry_first_lane = !PARTIAL
+                                && b == 0
+                                && i.name() == "v_readfirstlane_b32"
+                                && matches!(entry_exec, [Some(lo), Some(hi)]
+                                    if i.read(Reg::S(EXEC)) == Some(lo)
+                                        && i.read(Reg::S(EXEC + 1)) == Some(hi));
+                            ((exchange(i) || entry_first_lane)
                                 && x.st.reach[b] == Bool::TRUE
                                 && x.st.guards[b][at].is_none())
                                 || lane_rank(i)
@@ -2809,8 +2822,7 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Mesh: the thread's index in the group, which is its vertex and
-    /// primitive index.
+    /// The thread's flat group index for mesh outputs and compute exchanges.
     fn flat_thread(&mut self) -> V {
         if let Some(f) = self.flat {
             return f;
@@ -5940,6 +5952,12 @@ impl<'a> Lower<'a> {
                 // A waterfall loop's read of a descriptor dword: the lane's own.
                 let a = s(self, 0)?;
                 int(self, a)
+            }
+            "v_readfirstlane_b32" if self.group_exchange => {
+                let a = s(self, 0)?;
+                let zero = self.s.m.i32(0);
+                let value = self.read_lane(a, zero);
+                int(self, value)
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;

@@ -1,6 +1,5 @@
-//! Hardware and WARP execution tests for sub-dword local-data-share (LDS)
-//! reads and writes: byte, halfword, dword-straddling halfword, and 16-bit
-//! destination (`_d16` / `_d16_hi`) forms.
+//! Local-data-share reads, writes and inter-thread exchanges, including execution
+//! on available D3D12 adapters and WARP.
 
 use super::{HostShader, lower};
 use crate::native::{
@@ -494,6 +493,12 @@ fn group_exchange_waits_for_reconvergence_after_a_masked_branch() {
         build_lds_program::<false>(&masked, true, [64, 1, 1], narrow, 0).unwrap();
     assert_eq!(wave_range(&other), [64, 64]);
     assert_eq!(barriers, 0);
+    // All lanes visit the block, but EXEC masks the exchange itself.
+    let guarded = [&prefix[..], &[add], &swap, &[restore], &store].concat();
+    let (other, barriers) =
+        build_lds_program::<false>(&guarded, true, [64, 1, 1], narrow, 0).unwrap();
+    assert_eq!(wave_range(&other), [64, 64]);
+    assert_eq!(barriers, 0);
     #[cfg(windows)]
     {
         let expected: Vec<_> = (0..64)
@@ -501,4 +506,64 @@ fn group_exchange_waits_for_reconvergence_after_a_masked_branch() {
             .collect();
         check_readback(shader, &expected);
     }
+}
+
+#[test]
+fn an_entry_first_lane_read_is_shared_across_the_full_group() {
+    let before = [
+        0x3402_0082, // v1 = thread ID * 4
+        0x4a0a_0089, // v5 = thread ID + 9
+    ];
+    let first = 0x7e04_0505; // s2 = v5 from the first active lane
+    let finish = [
+        0xd8d4_401f,
+        0x0600_0005, // v6 = v5 from lane XOR 16
+        0xbf8c_c07f, // wait for the swizzle
+        0x4a0c_0c02, // v6 += s2
+        0xe070_1000,
+        0x8002_0601, // store v6 at v1
+    ];
+    let waves = super::ComputeWaves {
+        wave32: true,
+        narrow_quads: true,
+    };
+    let joined = [&before[..], &[first], &finish].concat();
+    let (shader, barriers) =
+        build_lds_program::<false>(&joined, true, [64, 1, 1], waves, 0).unwrap();
+    assert_eq!(wave_range(&shader), [0, u32::MAX]);
+    assert!(barriers > 0);
+    let (partial, barriers) =
+        build_lds_program::<true>(&joined, true, [64, 1, 1], waves, 0).unwrap();
+    assert_eq!(wave_range(&partial), [64, 64]);
+    assert_eq!(barriers, 0);
+    // Mask out lane zero before the read, then restore full EXEC for the swizzle.
+    let narrowed = [
+        0xd4c1_0004,
+        0x0001_4100, // s[4:5] = thread ID < 32
+        0xbe86_047e, // save EXEC in s[6:7]
+        0x8afe_047e, // remove the low half from EXEC
+        first,
+        0xbefe_0406, // restore EXEC
+    ];
+    let masked = [&before[..], &narrowed, &finish].concat();
+    let (other, barriers) =
+        build_lds_program::<false>(&masked, true, [64, 1, 1], waves, 0).unwrap();
+    assert_eq!(wave_range(&other), [64, 64]);
+    assert_eq!(barriers, 0);
+    // A three-iteration loop contains the read. The native wave is retained.
+    let looped = [
+        &before[..],
+        &[0xbe83_0383, first, 0x8083_8103, 0xbf07_8003, 0xbf85_fffc],
+        &finish,
+    ]
+    .concat();
+    let (other, barriers) =
+        build_lds_program::<false>(&looped, true, [64, 1, 1], waves, 0).unwrap();
+    assert_eq!(wave_range(&other), [64, 64]);
+    assert_eq!(barriers, 0);
+    #[cfg(windows)]
+    check_readback(
+        shader,
+        &(0..64).map(|lane| 18 + (lane ^ 16)).collect::<Vec<_>>(),
+    );
 }
