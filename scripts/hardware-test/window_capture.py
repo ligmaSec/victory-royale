@@ -15,6 +15,21 @@ class Image(c.Structure):
     _fields_ += [(key, c.c_ulong) for key in ("red", "green", "blue")]
 
 
+class Visual(c.Structure):
+    _fields_ = [("extension", c.c_void_p), ("id", c.c_ulong), ("kind", c.c_int)]
+    _fields_ += [(key, c.c_ulong) for key in ("red", "green", "blue")]
+
+
+class Attributes(c.Structure):
+    _fields_ = [(key, c.c_int) for key in ("x", "y", "width", "height", "border", "depth")]
+    _fields_ += [("visual", c.POINTER(Visual)), ("root", c.c_ulong)]
+    _fields_ += [(key, c.c_int) for key in ("kind", "bit_gravity", "win_gravity", "backing_store")]
+    _fields_ += [("planes", c.c_ulong), ("pixel", c.c_ulong), ("under", c.c_int), ("colormap", c.c_ulong)]
+    _fields_ += [("installed", c.c_int), ("map_state", c.c_int)]
+    _fields_ += [(key, c.c_long) for key in ("events", "own_events", "blocked_events")]
+    _fields_ += [("override_redirect", c.c_int), ("screen", c.c_void_p)]
+
+
 def png(image):
     if (image.byte_order, image.bits, image.red, image.green, image.blue) != (0, 32, 0xff0000, 0xff00, 0xff):
         raise ValueError("unsupported X11 pixel format")
@@ -70,12 +85,12 @@ def capture(pids):
                      and c.cast(owner, c.POINTER(xid))[0] in pids)
             x.XFree(owner)
             if owned and w != root:
-                parent = xid()
-                fields = [num() for _ in range(6)]
-                if x.XGetGeometry(d, xid(w), c.byref(parent), *(c.byref(v) for v in fields)):
-                    width, height = fields[2].value, fields[3].value
+                attr = Attributes()
+                if x.XGetWindowAttributes(d, xid(w), c.byref(attr)) and attr.map_state == 2:
+                    width, height = attr.width, attr.height
                     if 64 <= width <= 8192 and 64 <= height <= 8192 and width * height <= 34000000:
-                        matches.append((width * height, w, width, height))
+                        visual = attr.visual.contents
+                        matches.append((width * height, w, width, height, visual.red, visual.green, visual.blue))
         children = c.POINTER(xid)()
         parent, root_id, n = xid(), xid(), c.c_uint()
         x.XQueryTree(d, xid(w), c.byref(root_id), c.byref(parent), c.byref(children), c.byref(n))
@@ -84,7 +99,7 @@ def capture(pids):
             x.XFree(children)
     if not matches:
         raise ValueError("game window unavailable")
-    _, window, width, height = max(matches)
+    _, window, width, height, red, green, blue = max(matches)
     composite.XCompositeRedirectWindow(d, xid(window), 0)
     composite.XCompositeNameWindowPixmap.restype = xid
     pixmap = composite.XCompositeNameWindowPixmap(d, xid(window))
@@ -92,12 +107,8 @@ def capture(pids):
     image = x.XGetImage(d, xid(pixmap), 0, 0, width, height, xid(-1), 2)
     if not image:
         raise ValueError("game window has no readable pixmap")
-    # Pixmaps do not carry a visual. Query the window's color masks without using
-    # its potentially obscured pixels for the screenshot.
-    sample = x.XGetImage(d, xid(window), 0, 0, 1, 1, xid(-1), 2)
-    if sample:
-        for channel in ("red", "green", "blue"):
-            setattr(image.contents, channel, getattr(sample.contents, channel))
+    # X11 pixmaps have no visual. The owning window supplies the color masks.
+    image.contents.red, image.contents.green, image.contents.blue = red, green, blue
     return png(image.contents)
 
 
