@@ -504,8 +504,21 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
+    pub(crate) fn uses_whole_wave(&self) -> bool {
+        self.funcs.iter().any(|f| f.name.starts_with("dx.op.wave"))
+    }
+
     pub(crate) fn has_dx_op(&self, name: &str, opcode: i64) -> bool {
-        self.insts.iter().any(|inst| match &inst.op {
+        self.dx_ops(name, opcode).next().is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dx_op_count(&self, name: &str, opcode: i64) -> usize {
+        self.dx_ops(name, opcode).count()
+    }
+
+    fn dx_ops(&self, name: &str, opcode: i64) -> impl Iterator<Item = &Inst> {
+        self.insts.iter().filter(move |inst| match &inst.op {
             Op::Call(fid, args) => {
                 self.funcs[*fid as usize].name == name
                     && matches!(

@@ -361,13 +361,9 @@ impl Shader {
             // This pipeline owns the finished variant. The shared shader
             // retains the source for any other pipeline that needs it.
             container: Vec::new(),
-            translated: Some(Translated {
-                host,
-                used: native.used,
-            })
-            .into(),
             #[cfg(feature = "diagnostics")]
             wave64: native.wave64.into(),
+            translated: Some(Translated::from_native(host, native)).into(),
         }))
     }
 }
@@ -671,7 +667,7 @@ impl HostPipeline {
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
-                compute_threads: bound[0].translated().host.compute_threads(),
+                compute_threads: bound[0].translated().compute_threads,
                 mesh: false,
                 pso,
                 root,

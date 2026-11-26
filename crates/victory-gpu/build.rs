@@ -17,7 +17,12 @@ fn main() {
     }
     println!("cargo:rerun-if-changed={}", compiler.display());
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    for name in ["argument_clamp", "rect_rewrite", "rect_expand"] {
+    for name in [
+        "argument_clamp",
+        "rect_rewrite",
+        "rect_expand",
+        "table_probe",
+    ] {
         let source = format!("shaders/{name}.hlsl");
         println!("cargo:rerun-if-changed={source}");
         let status = Command::new(&compiler)

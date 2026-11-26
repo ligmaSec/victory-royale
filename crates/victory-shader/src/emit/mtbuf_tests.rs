@@ -517,7 +517,13 @@ fn gpu_selected_buffer_with_buffer_output_keeps_the_stride_refusal() {
     let bytes = crate::dxbc::build(&[]);
     let container = Container::parse(&bytes).unwrap();
     assert!(matches!(
-        super::translate_native::<false>(&container, &native, true, None, None),
+        super::translate_native::<false>(
+            &container,
+            &native,
+            super::ComputeWaves::with_wave32(true),
+            None,
+            None
+        ),
         Err(crate::ShaderError::Unsupported {
             what: super::UNKNOWN_STRUCTURED_STRIDE,
             ..
@@ -530,8 +536,22 @@ fn partial_dispatch_keeps_bounds_after_retrying_with_a_buffer_table() {
     let native = selected_buffer_program(true);
     let bytes = crate::dxbc::build(&[]);
     let c = Container::parse(&bytes).unwrap();
-    let full = super::translate_native::<false>(&c, &native, true, None, None).unwrap();
-    let partial = super::translate_native::<true>(&c, &native, true, None, None).unwrap();
+    let full = super::translate_native::<false>(
+        &c,
+        &native,
+        super::ComputeWaves::with_wave32(true),
+        None,
+        None,
+    )
+    .unwrap();
+    let partial = super::translate_native::<true>(
+        &c,
+        &native,
+        super::ComputeWaves::with_wave32(true),
+        None,
+        None,
+    )
+    .unwrap();
     assert!(full.buffer_table && partial.buffer_table);
     assert!(
         full.user_data

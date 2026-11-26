@@ -3223,12 +3223,9 @@ mod depth_tests {
 #[cfg(test)]
 mod table_tests {
     use super::*;
-    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-    use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::Win32::Graphics::Dxgi::Common::{
         DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_FLOAT, DXGI_SAMPLE_DESC,
     };
-    use windows::core::s;
 
     struct TitleObject(This);
 
@@ -3343,47 +3340,16 @@ mod table_tests {
         sampler_slot: u32,
         uv: [f32; 2],
     ) -> [f32; 4] {
-        const SOURCE: &str = r#"
-            #define RS "RootConstants(num32BitConstants=2, b0), DescriptorTable(SRV(t0, numDescriptors=1)), DescriptorTable(Sampler(s0, numDescriptors=1)), UAV(u0)"
-            cbuffer Coords : register(b0) { float2 uv; };
-            Texture2D<float4> tex : register(t0);
-            SamplerState samp : register(s0);
-            RWByteAddressBuffer out_buf : register(u0);
-            [RootSignature(RS)]
-            [numthreads(1, 1, 1)]
-            void main() {
-                float4 c = tex.SampleLevel(samp, uv, 0);
-                out_buf.Store4(0, asuint(c));
-            }
-        "#;
-        let mut blob: Option<ID3DBlob> = None;
-        // SAFETY: source and entry/target names are live; `blob` is our output.
-        unsafe {
-            D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
-                s!("table-probe"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut blob,
-                None,
-            )
-            .expect("compile probe compute shader");
-        }
-        let blob = blob.expect("compiled shader blob");
-        // SAFETY: `blob` owns its bytecode buffer.
-        let code = unsafe {
-            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
-        };
+        let code = crate::hlsl::compile_compute(
+            "table probe",
+            include_str!("../shaders/table_probe.hlsl"),
+        )
+        .expect("compile sampler readback shader");
         // SAFETY: root signature and compute PSO creation on live device.
         let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
             let root: ID3D12RootSignature = host
                 .device
-                .CreateRootSignature(0, code)
+                .CreateRootSignature(0, &code)
                 .expect("compute root signature");
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
@@ -3586,6 +3552,7 @@ mod table_tests {
             [1.25, 0.5],
         );
         assert_eq!(padded, [0.0, 1.0, 0.0, 1.0]);
+        eprintln!("sampler readback matched at slots 0 and {last}");
     }
 
     #[test]

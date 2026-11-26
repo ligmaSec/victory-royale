@@ -188,10 +188,14 @@ def hardware_requests(number):
         return {}
     # The workflow retains kits for seven days. Trust successful dispatches on main.
     since = (datetime.now(timezone.utc) - timedelta(days=8)).date().isoformat()
+    # A fresh publication can appear in the run list before GitHub's status
+    # filter finds it. Check the conclusion on each returned run directly.
     runs = github_rows("actions/workflows/hardware-request.yml/runs?branch=main&event=workflow_dispatch"
-                       f"&status=success&created=>={since}&per_page=100", ".workflow_runs[] | .id")
+                       f"&created=>={since}&per_page=100", ".workflow_runs[] | {id, status, conclusion}")
+    published = (run["id"] for run in runs
+                 if run["status"] == "completed" and run["conclusion"] == "success")
     available = {}
-    for run_id in sorted(runs, reverse=True):
+    for run_id in sorted(published, reverse=True):
         artifacts = github_rows(f"actions/runs/{run_id}/artifacts?per_page=100",
                                 '.artifacts[] | select(.expired == false) | {name}')
         for artifact in artifacts:

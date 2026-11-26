@@ -1,8 +1,9 @@
 //! DXIL emission (decision 0003, step 3): a console vertex, pixel, compute
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
-//! Compute shaders keep the console's thread-group size; one that depends
-//! on the lane layout (cross-lane operations) declares the console's wave
-//! size (`WaveSize`), so the host device must support it.
+//! Compute shaders normally keep the console group dimensions and declare the
+//! wave size when lane order matters. On narrower adapters, a 64-thread group
+//! that only needs quad neighbors for sampling can use a flat host group with
+//! the original per-thread coordinates reconstructed from the group index.
 //!
 //! What the host binds for a translated shader ([`HostShader`]):
 //!
@@ -311,6 +312,25 @@ pub const BUFFER_TABLE_SRV: u8 = u8::MAX;
 
 const UNKNOWN_STRUCTURED_STRIDE: &str = "a structured buffer of unknown stride";
 
+/// Adapter-specific lowering choices for console compute waves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComputeWaves {
+    /// May issue a fixed 32-lane reduction.
+    pub wave32: bool,
+    /// The host has quad operations but cannot run a native 64-lane wave.
+    pub narrow_quads: bool,
+}
+
+impl ComputeWaves {
+    /// Preserve native Wave64 code when the adapter's maximum width is unknown.
+    fn with_wave32(wave32: bool) -> Self {
+        Self {
+            wave32,
+            narrow_quads: false,
+        }
+    }
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container, lowering eligible <=32-thread Wave64 reductions to
 /// `WaveSize(32)`.
@@ -325,7 +345,8 @@ pub fn translate_with_wave32(
     container: &[u8],
     allow_wave32: bool,
 ) -> Result<HostShader, ShaderError> {
-    translate_program::<false>(container, allow_wave32, None).map(|(shader, _)| shader)
+    translate_for_adapter::<false>(container, ComputeWaves::with_wave32(allow_wave32), None)
+        .map(|(shader, _)| shader)
 }
 
 /// Translates using matching structured views for statically addressed table
@@ -337,7 +358,12 @@ pub fn translate_with_view_strides(
     allow_wave32: bool,
     view_stride: ViewStride<'_>,
 ) -> Result<(HostShader, Vec<crate::UsedResource>), ShaderError> {
-    translate_program::<false>(container, allow_wave32, Some(view_stride))
+    translate_for_adapter::<false>(
+        container,
+        ComputeWaves::with_wave32(allow_wave32),
+        Some(view_stride),
+    )
+    .map(|(shader, native)| (shader, native.used))
 }
 
 /// A host-supplied extent in threads for a partial compute group.
@@ -350,7 +376,12 @@ pub fn translate_partial_dispatch(
     allow_wave32: bool,
     view_stride: ViewStride<'_>,
 ) -> Result<(HostShader, Vec<crate::UsedResource>), ShaderError> {
-    translate_program::<true>(container, allow_wave32, Some(view_stride))
+    translate_for_adapter::<true>(
+        container,
+        ComputeWaves::with_wave32(allow_wave32),
+        Some(view_stride),
+    )
+    .map(|(shader, native)| (shader, native.used))
 }
 
 /// A precompiled compute module (`FSPX`): only GFX10 code, no DXIL to start from.
@@ -359,11 +390,13 @@ const FSPX_UNSUPPORTED: ShaderError = ShaderError::Unsupported {
     what: "FSPX compute module",
 };
 
-fn translate_program<const PARTIAL: bool>(
+/// Translate for the adapter's actual wave widths, optionally resolving view
+/// strides at bind time. Offline callers can keep using [`translate`].
+pub fn translate_for_adapter<const PARTIAL: bool>(
     container: &[u8],
-    allow_wave32: bool,
+    waves: ComputeWaves,
     view_stride: Option<ViewStride<'_>>,
-) -> Result<(HostShader, Vec<crate::UsedResource>), ShaderError> {
+) -> Result<(HostShader, NativeProgram), ShaderError> {
     if container.starts_with(crate::dxbc::Fspx::MAGIC) {
         return Err(FSPX_UNSUPPORTED);
     }
@@ -387,8 +420,8 @@ fn translate_program<const PARTIAL: bool>(
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
-    let shader = translate_native::<PARTIAL>(&c, &native, allow_wave32, None, view_stride)?;
-    Ok((shader, native.used))
+    let shader = translate_native::<PARTIAL>(&c, &native, waves, None, view_stride)?;
+    Ok((shader, native))
 }
 
 /// Emits an oversized mesh shader with only the varyings its pipeline's
@@ -415,13 +448,20 @@ pub fn translate_mesh_for_pixel(
     if let Some(dxil) = pixel_dxil {
         pixel_inputs = signature_part(&Container::parse(dxil)?, FourCC::ISG1)?;
     }
-    translate_native::<false>(c, native, true, Some(&pixel_inputs), None).map(Some)
+    translate_native::<false>(
+        c,
+        native,
+        ComputeWaves::with_wave32(true),
+        Some(&pixel_inputs),
+        None,
+    )
+    .map(Some)
 }
 
 fn translate_native<const PARTIAL: bool>(
     c: &Container<'_>,
     native: &NativeProgram,
-    allow_wave32: bool,
+    waves: ComputeWaves,
     pixel_inputs: Option<&[container::SigElement]>,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<HostShader, ShaderError> {
@@ -447,7 +487,7 @@ fn translate_native<const PARTIAL: bool>(
         io: &io,
         res: &res,
     };
-    emit_with_options::<PARTIAL>(parts, allow_wave32, pixel_inputs, view_stride)
+    emit_with_options::<PARTIAL>(parts, waves, pixel_inputs, view_stride)
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -481,7 +521,7 @@ pub fn emit_with_wave32(
         io,
         res,
     };
-    emit_with_options::<false>(parts, allow_wave32, None, None)
+    emit_with_options::<false>(parts, ComputeWaves::with_wave32(allow_wave32), None, None)
 }
 
 #[derive(Clone, Copy)]
@@ -500,19 +540,23 @@ fn emit_with_view_strides(
     allow_wave32: bool,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<HostShader, ShaderError> {
-    emit_with_options::<false>(parts, allow_wave32, None, view_stride)
+    emit_with_options::<false>(
+        parts,
+        ComputeWaves::with_wave32(allow_wave32),
+        None,
+        view_stride,
+    )
 }
 
 fn emit_with_options<const PARTIAL: bool>(
     parts: Emission<'_>,
-    allow_wave32: bool,
+    waves: ComputeWaves,
     pixel_inputs: Option<&[container::SigElement]>,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<HostShader, ShaderError> {
     // Existing shaders keep their bindings even if an indexed load could
     // also be expressed using the host's buffer metadata.
-    let result =
-        emit_with_threading::<PARTIAL>(parts, allow_wave32, pixel_inputs, view_stride, false);
+    let result = emit_with_threading::<PARTIAL>(parts, waves, pixel_inputs, view_stride, false);
     if matches!(
         result,
         Err(ShaderError::Unsupported {
@@ -538,7 +582,7 @@ fn emit_with_options<const PARTIAL: bool>(
             !name.starts_with("image_") && (name.contains("store") || name.contains("atomic"))
         })
         && let Ok(shader) =
-            emit_with_threading::<PARTIAL>(parts, allow_wave32, pixel_inputs, view_stride, true)
+            emit_with_threading::<PARTIAL>(parts, waves, pixel_inputs, view_stride, true)
     {
         return Ok(shader);
     }
@@ -547,7 +591,7 @@ fn emit_with_options<const PARTIAL: bool>(
 
 fn emit_with_threading<const PARTIAL: bool>(
     parts: Emission<'_>,
-    allow_wave32: bool,
+    waves: ComputeWaves,
     pixel_inputs: Option<&[container::SigElement]>,
     view_stride: Option<ViewStride<'_>>,
     buffer_table: bool,
@@ -555,8 +599,7 @@ fn emit_with_threading<const PARTIAL: bool>(
     let Emission {
         c, native, p, st, ..
     } = parts;
-    let original =
-        emit_program::<PARTIAL>(parts, allow_wave32, pixel_inputs, view_stride, buffer_table);
+    let original = emit_program::<PARTIAL>(parts, waves, pixel_inputs, view_stride, buffer_table);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -579,7 +622,7 @@ fn emit_with_threading<const PARTIAL: bool>(
             io: &io,
             res: &res,
         },
-        allow_wave32,
+        waves,
         pixel_inputs,
         view_stride,
         buffer_table,
@@ -588,7 +631,7 @@ fn emit_with_threading<const PARTIAL: bool>(
 
 fn emit_program<const PARTIAL: bool>(
     parts: Emission<'_>,
-    allow_wave32: bool,
+    waves: ComputeWaves,
     pixel_inputs: Option<&[container::SigElement]>,
     view_stride: Option<ViewStride<'_>>,
     buffer_table: bool,
@@ -680,7 +723,7 @@ fn emit_program<const PARTIAL: bool>(
         }
         _ => 0,
     };
-    let l = lower::lower_with_wave32::<PARTIAL>(
+    let l = lower::lower_with_waves::<PARTIAL>(
         &lower::Parts {
             native,
             p,
@@ -692,7 +735,7 @@ fn emit_program<const PARTIAL: bool>(
             prims,
             mesh_stride,
         },
-        allow_wave32,
+        waves,
         pixel_inputs,
         view_stride,
         buffer_table,
@@ -966,7 +1009,9 @@ mod tests {
             },
             code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
         };
-        let host = translate_native::<false>(&c, &native, true, None, None).unwrap();
+        let host =
+            translate_native::<false>(&c, &native, ComputeWaves::with_wave32(true), None, None)
+                .unwrap();
         let c = Container::parse(&host.dxil).unwrap();
         let inputs = signature_part(&c, FourCC::ISG1).unwrap();
         let outputs = signature_part(&c, FourCC::OSG1).unwrap();
@@ -1010,7 +1055,9 @@ mod tests {
             },
             code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
         };
-        let host = translate_native::<false>(&c, &native, true, None, None).unwrap();
+        let host =
+            translate_native::<false>(&c, &native, ComputeWaves::with_wave32(true), None, None)
+                .unwrap();
         let c = Container::parse(&host.dxil).unwrap();
         let inputs = signature_part(&c, FourCC::ISG1).unwrap();
         assert!(inputs.iter().all(|e| e.kind != 14), "{inputs:?}");
@@ -1065,7 +1112,7 @@ mod tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         assert!(matches!(
-            translate_native::<false>(&c, &native, true, None, None),
+            translate_native::<false>(&c, &native, ComputeWaves::with_wave32(true), None, None),
             Err(ShaderError::Unsupported {
                 what: "a mesh output signature beyond the host's size limit",
                 ..
@@ -1116,7 +1163,7 @@ mod tests {
         let ps = translate_native::<false>(
             &Container::parse(&pixel_bytes).unwrap(),
             &pixel,
-            true,
+            ComputeWaves::with_wave32(true),
             None,
             None,
         )
@@ -1155,7 +1202,14 @@ mod tests {
             .chain(words.last())
             .flat_map(|w| w.to_le_bytes())
             .collect();
-        let standalone = translate_native::<false>(&c, &position_only, true, None, None).unwrap();
+        let standalone = translate_native::<false>(
+            &c,
+            &position_only,
+            ComputeWaves::with_wave32(true),
+            None,
+            None,
+        )
+        .unwrap();
         let host = Container::parse(&standalone.dxil).unwrap();
         assert_eq!(signature_part(&host, FourCC::OSG1).unwrap().len(), 1);
         assert!(signature_part(&host, FourCC::PSG1).unwrap().is_empty());
