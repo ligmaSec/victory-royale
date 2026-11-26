@@ -35,7 +35,11 @@ jobs:
             exit 1
           fi
           pr=${BASH_REMATCH[1]}
-          python3 scripts/hardware-test/run-test.py "$pr" --plan
+          kit="$RUNNER_TEMP/published-kit"
+          gh run download "$KIT_RUN" -R "$GITHUB_REPOSITORY" -n "$artifact" -D "$kit"
+          test -s "$kit/.victoryconfig.example"
+          test ! -e "$kit/.victoryconfig"
+          python3 scripts/hardware-test/run-test.py "$pr" --plan --config "$kit/.victoryconfig.example"
           echo "pr=$pr" >> "$GITHUB_OUTPUT"
 
   label:
