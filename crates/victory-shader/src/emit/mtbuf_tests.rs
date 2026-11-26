@@ -242,7 +242,7 @@ fn raw_halfword_stores_preserve_neighbors_and_drop_incomplete_writes() {
                     2 * lane
                 } else {
                     let start = lane as usize * 16;
-                    for row in expected[start..start + 16].chunks_exact_mut(8) {
+                    for row in expected[start..start + 16].as_chunks_mut::<8>().0 {
                         row.copy_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
                     }
                     match lane {
