@@ -155,20 +155,28 @@ def default_save():
 def copy_save(source, destination):
     # Only persistent player data belongs in the test. In particular, a title's
     # temp directory may contain unrelated files or logs from an earlier run.
-    def check_entries(folder, names):
-        for name in names:
-            path = Path(folder) / name
-            info = path.lstat()
-            if (not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode))
-                    or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
-                raise ValueError(f"Use a self-contained save. Unsupported entry in {path}.")
-        return []
+    def copy_entry(path, target):
+        info = path.lstat()
+        directory = stat.S_ISDIR(info.st_mode)
+        if (not (directory or stat.S_ISREG(info.st_mode))
+                or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+            raise ValueError(f"Use a self-contained save. Unsupported entry in {path}.")
+        if directory:
+            target.mkdir(parents=True)
+            for entry in path.iterdir():
+                copy_entry(entry, target / entry.name)
+            shutil.copystat(path, target)
+        else:
+            shutil.copy2(path, target)
+        # Keep the original timestamps, including for read-only source media.
+        # Each private slot must be readable and writable by its new owner.
+        mode = stat.S_IMODE(info.st_mode) | stat.S_IRUSR | stat.S_IWUSR
+        target.chmod(mode | stat.S_IXUSR if directory else mode)
 
     for name in ("saves", "storage"):
         path = source / name
         if name == "saves" or path.exists():
-            check_entries(source, [name])
-            shutil.copytree(path, destination / name, ignore=check_entries)
+            copy_entry(path, destination / name)
 
 
 def launch(side, folder, title, results, windows, console="series-x"):
@@ -340,6 +348,12 @@ def run():
     options = parser.parse_args()
     if options.list and options.request:
         parser.error("--list takes no request")
+    options.save_dir = (options.save_dir or default_save()).expanduser().resolve()
+    temp = Path(tempfile.gettempdir()).resolve()
+    output = (options.output_dir or temp).expanduser().resolve()
+    for directory in (temp, output):
+        if directory.is_relative_to(options.save_dir):
+            raise ValueError("Choose temporary and report directories outside the source save.")
     with tempfile.TemporaryDirectory(prefix="victory-request-") as temporary:
         folder = Path(temporary)
         options.trusted_digest = PUBLISHED_SHA256
@@ -914,6 +928,8 @@ def run_request(manifest, options):
         if not shutil.which(binary):
             raise ValueError(f"Missing {binary}. See the requirements in README.txt.")
     title = (options.title or choose_title()).expanduser().resolve()
+    if title.parent.is_relative_to(source):
+        raise ValueError("Select a game executable outside the source save folder.")
     if not title.is_file() or title.suffix.lower() != ".exe":
         raise ValueError("Select the game's .exe file.")
     temp = Path(tempfile.gettempdir()).resolve()

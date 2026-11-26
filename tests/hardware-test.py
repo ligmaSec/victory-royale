@@ -671,6 +671,40 @@ class HardwareRequest(unittest.TestCase):
             for forbidden in (shader, "2026-", "0xabc", "private"):
                 self.assertNotIn(forbidden, text + body)
 
+    def test_read_only_standard_save_gives_each_build_writable_progress(self):
+        progress = self.save / "saves" / "progress"
+        progress.chmod(0o444)
+        progress.parent.chmod(0o555)
+        self.addCleanup(progress.chmod, 0o644)
+        self.addCleanup(progress.parent.chmod, 0o755)
+
+        def write_progress(side, folder, title, results, windows, console):
+            slot = folder / "data" / runner.TITLE_ID / "saves" / "progress"
+            self.assertTrue(slot.stat().st_mode & 0o200)
+            self.assertTrue(slot.parent.stat().st_mode & 0o200)
+            self.assertEqual(slot.read_text(), "starting point")
+            slot.write_text(side)
+            (slot.parent / "next-slot").write_text(side)
+            (results / (side + ".log")).write_text(side)
+
+        self.run_pair(write_progress)
+        self.assertEqual(progress.read_text(), "starting point")
+        self.assertFalse(progress.stat().st_mode & 0o200)
+        self.assertFalse((progress.parent / "next-slot").exists())
+
+    def test_staging_and_reports_cannot_write_into_the_source_save(self):
+        inside = self.save / "saves" / "output"
+        args = ["runner", str(self.manifest), "--save-dir", str(self.save), "--title", str(self.title)]
+        with mock.patch.object(sys, "argv", args + ["--output-dir", str(inside)]), \
+                self.assertRaisesRegex(ValueError, "outside the source save"):
+            runner.run()
+        self.assertFalse(inside.exists())
+        with mock.patch.object(sys, "argv", args), mock.patch.object(tempfile, "tempdir", str(self.save / "saves")), \
+                mock.patch.object(tempfile, "TemporaryDirectory") as create, \
+                self.assertRaisesRegex(ValueError, "outside the source save"):
+            runner.run()
+        create.assert_not_called()
+
     def test_missing_standard_save_warns_in_preview_and_stops_before_launch(self):
         args = ["runner", str(self.manifest), "--save-dir", str(self.root / "missing" / runner.TITLE_ID)]
         with mock.patch.object(sys, "argv", args + ["--plan"]), contextlib.redirect_stderr(io.StringIO()) as warning:
