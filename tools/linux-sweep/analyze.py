@@ -42,7 +42,7 @@ def analyse(log: Path, captures: Path) -> int:
     lines = text.splitlines()
 
     shader_drops: list[tuple[str, str, str]] = []
-    black_frames: list[tuple[int, str, int]] = []
+    black_frames: list[tuple[int, str, int, int]] = []
     world: tuple[int, int, int] | None = None
     presents: list[dict[str, float]] = []
     faults = 0
@@ -55,7 +55,8 @@ def analyse(log: Path, captures: Path) -> int:
         if m := SHADER_DROP.search(clean):
             shader_drops.append((m["stage"], m["hash"], m["error"]))
         if m := BLACK_FRAME.search(clean):
-            black_frames.append((int(m["frame"]), m["resource"], int(m["count"])))
+            black_frames.append((int(m["frame"]), m["resource"], int(m["count"]),
+                                 int(m["draws"])))
         if m := WORLD_MARKER.search(clean):
             world = (int(m["qualifying"]), int(m["first"]), int(m["second"]))
         if m := PRESENT.search(clean):
@@ -78,6 +79,15 @@ def analyse(log: Path, captures: Path) -> int:
             indirect += 1
         if DEPTH_FAIL.search(clean):
             depth += 1
+
+    # A one-off black frame during startup/menu is not a rendering failure in
+    # the world. Keep warnings in or after the world, or from a scene already
+    # drawing enough geometry to be the world.
+    world_start = world[0] if world else None
+    black_frames = [
+        bf for bf in black_frames
+        if (world_start is not None and bf[0] >= world_start) or bf[3] >= 100
+    ]
 
     pngs = sorted(captures.glob("*.png")) if captures.exists() else []
     big = [p for p in pngs if p.stat().st_size > 500_000]
@@ -131,7 +141,8 @@ def analyse(log: Path, captures: Path) -> int:
     print(f"log_lines={len(lines)} captures={len(pngs)} nonblank={len(big)}")
     print(f"world_marker={world or 'NONE'}")
     print(f"faults={faults} crashes={crashes} indirect_drops={indirect} depth_plane_drops={depth}")
-    print(f"black_frame_warnings={len(black_frames)} last={black_frames[-1] if black_frames else None}")
+    last_black = black_frames[-1][:3] if black_frames else None
+    print(f"black_frame_warnings={len(black_frames)} last={last_black}")
     print(f"shader_translation_drops={len(shader_drops)}")
     for (stage, h, err), count in Counter(shader_drops).most_common(12):
         print(f"  drop stage={stage} hash={h} count={count} err={err}")
@@ -149,8 +160,12 @@ def analyse(log: Path, captures: Path) -> int:
     dark_screen = bool(brightness) and all(
         m < 80 and f < 0.05 for (_, m), f in zip(brightness, bright_fraction)
     )
+    # Warm night lighting also suppresses blue, but the whole image stays
+    # dim. Only flag a collapsed blue channel when the capture is bright;
+    # otherwise a valid night scene would fail the sweep.
     color_cast = bool(tint) and all(
-        max(r, g) / max(b, 1.0) > 1.6 for _, r, g, b, _ in tint
+        max(r, g) >= 60 and max(r, g) / max(b, 1.0) > 1.6
+        for _, r, g, b, _ in tint
     )
     blown = bool(tint) and max(x[4] for x in tint) > 0.25
     ok = (bool(world) and not faults and not crashes and not shader_drops
