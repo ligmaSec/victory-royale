@@ -1336,7 +1336,7 @@ impl State {
                 len
             };
             if writes && (!builder || back != 0) {
-                s.gpu_writes(list, a, back);
+                s.gpu_writes(list, a, back, builder);
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
@@ -3757,7 +3757,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
-                shadow.gpu_writes(list, address, len);
+                shadow.gpu_writes(list, address, len, false);
             } else {
                 #[cfg(feature = "diagnostics")]
                 {

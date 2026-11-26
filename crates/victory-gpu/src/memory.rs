@@ -294,7 +294,7 @@ pub(crate) fn ready(
     }
     for shadow in &m.copies[written] {
         let (start, len) = shadow.span();
-        shadow.gpu_writes(list, start, len);
+        shadow.gpu_writes(list, start, len, false);
     }
     if list.first_use(READ) {
         list.keep(&m.directory.0);

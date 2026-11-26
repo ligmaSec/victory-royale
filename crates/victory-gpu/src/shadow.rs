@@ -76,6 +76,9 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// A structure builder stage once wrote through this copy. Diagnostic
+    /// only: `VICTORY_BVH_BACK_DIAG=1` logs the first 512 builder copy-backs.
+    builder: std::sync::atomic::AtomicBool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -2051,6 +2054,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            builder: std::sync::atomic::AtomicBool::new(false),
             place: None,
         }
     }
@@ -2071,7 +2075,16 @@ impl Shadow {
     /// shortcut: what shaders wrote is found by keeping the range's bytes
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
-    pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+    pub(crate) fn gpu_writes(
+        self: &Arc<Self>,
+        list: &HostList,
+        address: u64,
+        len: u64,
+        builder: bool,
+    ) {
+        if builder {
+            self.builder.store(true, Ordering::Relaxed);
+        }
         // Before the in-place return: a record shaders write in place is
         // still not one to draw unclamped (`crate::raw_indirect`).
         crate::raw_indirect::card_writes(address, len);
@@ -2241,6 +2254,9 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
+        #[cfg(feature = "diagnostics")]
+        let builder = self.builder.load(Ordering::Relaxed)
+            && std::env::var_os("VICTORY_BVH_BACK_DIAG").is_some_and(|v| v != "0");
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
@@ -2295,6 +2311,13 @@ impl Shadow {
                     self.changed(at, at + n);
                     continue;
                 }
+                #[cfg(feature = "diagnostics")]
+                let (mut old_word, mut new_word) = ([0u8; 8], [0u8; 8]);
+                #[cfg(feature = "diagnostics")]
+                if builder {
+                    let take = n.min(8);
+                    old_word[..take].copy_from_slice(&title[..take]);
+                }
                 // Title memory with the GPU's bytes put in; the copy takes
                 // the title's bytes in turn.
                 // Without a branch, so the loop runs many bytes at a time:
@@ -2309,6 +2332,23 @@ impl Shadow {
                     *t = merged;
                     *h = merged;
                     *o = merged;
+                }
+                #[cfg(feature = "diagnostics")]
+                if builder {
+                    static SHOWN: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    if SHOWN.fetch_add(1, Ordering::Relaxed) < 512 {
+                        let take = n.min(8);
+                        new_word[..take].copy_from_slice(&title[..take]);
+                        tracing::info!(
+                            target: "victory_gpu::builder",
+                            "copy back address={:#x} len={} old={:#x} new={:#x}",
+                            start + at,
+                            n,
+                            u64::from_le_bytes(old_word),
+                            u64::from_le_bytes(new_word),
+                        );
+                    }
                 }
                 if differs != 0 {
                     crate::watch::writing(start + at, n);
