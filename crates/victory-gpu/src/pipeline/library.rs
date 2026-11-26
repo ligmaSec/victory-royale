@@ -31,7 +31,7 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Keeps the pipeline library and the early list in `dir` from now on.
+/// Stores the early list in `dir` and compiled libraries in `dir/adapters/<key>/`.
 pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
@@ -504,6 +504,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "creates D3D12 devices on every available DXGI adapter"]
     fn each_d3d12_device_uses_its_own_dxgi_adapter() {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 
