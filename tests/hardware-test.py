@@ -9,6 +9,9 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import struct
+import time
+import zlib
 import tarfile
 import tempfile
 import unittest
@@ -406,6 +409,45 @@ sys.exit(90)
                 runner.session.stopping("device-ready", 0, 30), self.root / "close.request")
         self.assertEqual((reason, forced), ("condition reached", False))
 
+    @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("Xvfb"), "requires Xvfb")
+    def test_capture_obscured_x11_game_excludes_covering_window(self):
+        server = subprocess.Popen(["Xvfb", "-displayfd", "1", "-screen", "0", "400x300x24", "-nolisten", "tcp"],
+                                  stdout=subprocess.PIPE)
+        children = []
+        try:
+            display = server.stdout.readline().decode().strip()
+            self.assertTrue(display.isdecimal())
+            env = dict(os.environ, DISPLAY=":" + display)
+            for number, color in enumerate(("25c876", "e73312")):
+                ready = self.root / str(number)
+                child = subprocess.Popen([sys.executable, str(Path(__file__).with_name("hardware-x11-window.py")),
+                                          color, str(ready)], env=env)
+                children.append(child)
+                for _ in range(100):
+                    if ready.exists():
+                        break
+                    time.sleep(.05)
+                self.assertTrue(ready.exists())
+            destination = self.root / "main-screenshot.png"
+            subprocess.run([sys.executable, str(SCRIPTS / "window_capture.py"), str(destination),
+                            str(children[0].pid)], env=env, check=True, timeout=5)
+            data = destination.read_bytes()
+            width, height = struct.unpack(">II", data[16:24])
+            self.assertEqual((width, height), (160, 120))
+            start = data.index(b"IDAT")
+            size = int.from_bytes(data[start - 4:start], "big")
+            rows = zlib.decompress(data[start + 4:start + 4 + size])
+            self.assertEqual(rows, (bytes([0]) + bytes.fromhex("25c876") * width) * height)
+            with zipfile.ZipFile(self.root / "outgoing.zip", "w") as outgoing:
+                self.assertFalse(runner.observations.read_draft(outgoing)["main"]["image"])
+                self.assertTrue(runner.observations.read_draft(outgoing, self.root)["main"]["image"])
+                self.assertEqual(outgoing.namelist(), [])
+        finally:
+            for child in [*children, server]:
+                child.terminate()
+                child.wait()
+            server.stdout.close()
+
     @unittest.skipUnless(sys.platform == "win32", "uses a native Windows Forms window")
     def test_capture_owned_windows_client(self):
         ready = self.root / "shown"
@@ -417,7 +459,6 @@ sys.exit(90)
                   "[Windows.Forms.Application]::Run($f)")
         child = subprocess.Popen(["powershell.exe", "-NoProfile", "-Command", script], env=env)
         try:
-            import time
             for _ in range(150):
                 if ready.exists():
                     break
