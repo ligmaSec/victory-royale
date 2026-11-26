@@ -1354,14 +1354,33 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// Host group counts and whether any last group is incomplete. D3D12
+/// accepts at most 65,535 groups along each axis.
+#[cfg(any(windows, test))]
+pub(crate) fn thread_groups(threads: [u32; 3], size: [u32; 3]) -> Option<([u32; 3], bool)> {
+    if size.contains(&0) || threads.contains(&0) {
+        return None;
+    }
+    let groups: [u32; 3] = std::array::from_fn(|i| threads[i].div_ceil(size[i]));
+    let partial = (0..3).any(|i| !threads[i].is_multiple_of(size[i]));
+    groups
+        .iter()
+        .all(|&g| g <= 65_535)
+        .then_some((groups, partial))
+}
+
+/// Direct compute dispatch with console dispatch-initiator flags.
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+    // COMPUTE_DISPATCH_INITIATOR.USE_THREAD_DIMENSIONS
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    if flags & 0x20 != 0 {
+        state::dispatch_mode::<true>(this, x, y, z);
+    } else {
+        state::dispatch(this, x, y, z);
+    }
     #[cfg(not(windows))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, flags);
         count_dispatch();
     }
 }
@@ -1622,9 +1641,12 @@ mod state {
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
+        dispatch_mode::<false>(this, x, y, z);
+    }
+    pub(super) fn dispatch_mode<const THREADS: bool>(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
         super::mark_work(this);
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_state(this, |list, s| s.dispatch_mode::<THREADS>(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -3137,3 +3159,6 @@ mod tests {
         assert_eq!(release(allocator), 0);
     }
 }
+
+#[cfg(test)]
+mod dispatch_tests;

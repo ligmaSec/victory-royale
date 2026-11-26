@@ -803,8 +803,8 @@ mod library;
 #[cfg(windows)]
 mod make;
 
-/// Keeps compiled host pipelines, and the list of title pipelines to start
-/// early, in `dir` (a folder of the cache) across runs.
+/// Keeps compiled host pipelines in `dir/adapters/<key>/` across runs.
+/// Adapters share the list of title pipelines to start early in `dir`.
 #[cfg(windows)]
 pub fn use_pipeline_cache(dir: std::path::PathBuf) {
     library::use_pipeline_cache(dir);

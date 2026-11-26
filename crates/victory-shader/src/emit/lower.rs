@@ -94,17 +94,17 @@ const UNTRACKED_SELECT: Why = "a select on an untracked mask";
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_with_wave32(parts, true, None, None, false)
+    lower_with_wave32::<false>(parts, true, None, None, false)
 }
 
-pub(crate) fn lower_with_wave32(
+pub(crate) fn lower_with_wave32<const PARTIAL: bool>(
     parts: &Parts,
     allow_wave32: bool,
     pixel_inputs: Option<&[SigElement]>,
     view_stride: Option<ViewStride<'_>>,
     buffer_table: bool,
 ) -> Result<Lowered, ShaderError> {
-    match lower_program(
+    match lower_program::<PARTIAL>(
         parts,
         false,
         allow_wave32,
@@ -115,7 +115,7 @@ pub(crate) fn lower_with_wave32(
         Err(ShaderError::Unsupported {
             what: UNTRACKED_SELECT,
             ..
-        }) if parts.native.stage == HwStage::Cs => lower_program(
+        }) if parts.native.stage == HwStage::Cs => lower_program::<PARTIAL>(
             parts,
             true,
             allow_wave32,
@@ -127,7 +127,7 @@ pub(crate) fn lower_with_wave32(
     }
 }
 
-fn lower_program(
+fn lower_program<const PARTIAL: bool>(
     parts: &Parts,
     numeric_selects: bool,
     allow_wave32: bool,
@@ -145,7 +145,7 @@ fn lower_program(
             view_stride,
             buffer_table,
         )
-        .run(pixel_inputs)
+        .run::<PARTIAL>(pixel_inputs)
         {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
@@ -1146,7 +1146,17 @@ impl<'a> Lower<'a> {
         acc
     }
 
-    fn run(mut self, pixel_inputs: Option<&[SigElement]>) -> Result<Lowered, Stop> {
+    fn run<const PARTIAL: bool>(
+        mut self,
+        pixel_inputs: Option<&[SigElement]>,
+    ) -> Result<Lowered, Stop> {
+        let entry = self.s.entry;
+        if PARTIAL {
+            if self.x.native.stage != HwStage::Cs {
+                return Err(unsupported(0, "thread dimensions outside compute"));
+            }
+            self.s.entry = self.s.m.new_block();
+        }
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -1230,6 +1240,14 @@ impl<'a> Lower<'a> {
             }));
         }
         self.fill_phis()?;
+        if PARTIAL {
+            // A group barrier inside a partial group can deadlock. Inspect
+            // the emitted operations so generated barriers are covered too.
+            if self.s.m.has_dx_op("dx.op.barrier", 80) {
+                return Err(unsupported(0, "a partial dispatch with a group barrier"));
+            }
+            self.dispatch_guard(entry)?;
+        }
         self.s.prune_pixel_inputs();
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
@@ -1283,6 +1301,52 @@ impl<'a> Lower<'a> {
     fn has_done_export(&self, b: usize) -> bool {
         (0..self.x.p.blocks[b].insts.len())
             .any(|i| self.exports.get(&(b, i)).is_some_and(|e| e.done))
+    }
+
+    /// Branch before any guest code. Compute the cutoff in the same lane
+    /// order as guest thread IDs on hosts where wave lanes are relabelled.
+    fn dispatch_guard(&mut self, entry: usize) -> Result<(), Stop> {
+        let body = std::mem::replace(&mut self.s.entry, entry);
+        self.cur = entry;
+        self.user_data = None;
+        let mut active = self.s.m.bool(true);
+        for (axis, width) in self.s.threads.expect("compute").into_iter().enumerate() {
+            if width == 1 {
+                continue;
+            }
+            let index = self.s.user_data;
+            if index >= 64 {
+                return Err(unsupported(
+                    0,
+                    "partial dispatch beyond the root constant budget",
+                ));
+            }
+            self.user_reads.insert(
+                index,
+                UserData {
+                    indexed_buffer: false,
+                    index,
+                    slot: 0,
+                    root: super::DISPATCH_THREADS,
+                    dword: axis as u32,
+                },
+            );
+            let limit = self.user_word(index);
+            let Val::I32(group) = self.compute_id("groupId.i32", 94, axis as u8) else {
+                unreachable!()
+            };
+            let Val::I32(local) = self.thread_id(axis as u8) else {
+                unreachable!()
+            };
+            let width = self.s.m.i32(width);
+            let base = self.s.m.bin(entry, Bin::Mul, group, width);
+            let global = self.s.m.bin(entry, Bin::Add, base, local);
+            let inside = self.s.m.cmp(entry, pred::IULT, global, limit);
+            active = self.s.m.bin(entry, Bin::And, active, inside);
+        }
+        let done = self.abort_block();
+        self.s.m.terminate(entry, Term::CondBr(active, body, done));
+        Ok(())
     }
 
     /// Values of the program's input registers.

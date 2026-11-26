@@ -370,8 +370,8 @@ impl Shader {
     /// [`super::SAMPLER_HEAP_LIMIT`] (garbage or negative values from
     /// dropped passes) are clamped to slot 0, so `ResourceDescriptorHeap` /
     /// `SamplerDescriptorHeap` reads never go far past any heap. The bound
-    /// is the largest heap, not the one bound: an index just past a smaller
-    /// heap's end still reads past it.
+    /// covers every physical sampler heap. An index below the view limit
+    /// can still exceed the size of a smaller bound view heap.
     pub fn heap_handle(
         &mut self,
         block: usize,

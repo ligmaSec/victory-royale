@@ -444,10 +444,8 @@ fn indexed_store_and_atomic_use_the_structured_uav_view_stride() {
     }
 }
 
-/// A writable buffer could alias the selected read within this dispatch.
-#[test]
-fn gpu_selected_buffer_with_buffer_output_keeps_the_stride_refusal() {
-    let words: &[u32] = &[
+fn selected_buffer_program(image_output: bool) -> NativeProgram {
+    let mut words: Vec<u32> = vec![
         0x8f04_8502, // s_lshl_b32 s4, s2, 5
         0xbe86_0300, // s_mov_b32 s6, s0
         0xbe87_0380, // s_mov_b32 s7, 0
@@ -455,8 +453,12 @@ fn gpu_selected_buffer_with_buffer_output_keeps_the_stride_refusal() {
         0x0800_0000, // s_load_dwordx4 s[8:11], s[6:7], s4
         0xbe8c_0301, // s_mov_b32 s12, s1
         0xbe8d_0380, // s_mov_b32 s13, 0
-        0xf408_0406,
-        0xfa00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+        if image_output {
+            0xf40c_0406
+        } else {
+            0xf408_0406
+        }, // load 8 image or 4 buffer descriptor dwords
+        0xfa00_0000,
         0xbf8c_c07f, // s_waitcnt lgkmcnt(0)
         0xe030_2004,
         0x8002_0400, // buffer_load_dword v4, v0, s[8:11], 0 idxen offset:4
@@ -465,10 +467,18 @@ fn gpu_selected_buffer_with_buffer_output_keeps_the_stride_refusal() {
         0x4a02_0003, // v_add_nc_u32_e32 v1, s3, v0
         0x3402_0283, // v_lshlrev_b32_e32 v1, 3, v1
         0xbf8c_3f70, // s_waitcnt vmcnt(0)
-        0xe074_1000,
-        0x8004_0401, // buffer_store_dwordx2 v[4:5], v1, s[16:19], 0 offen
-        0xbf81_0000, // s_endpgm
     ];
+    if image_output {
+        words.extend([
+            0x7e0c_0280,
+            0x7e0e_0280, // v6 = v7 = 0
+            0xf020_0f08,
+            0x0004_0400, // image_store v[4:7], v[0:1], s[16:23]
+        ]);
+    } else {
+        words.extend([0xe074_1000, 0x8004_0401]); // buffer_store_dwordx2 v[4:5], v1
+    }
+    words.push(0xbf81_0000); // s_endpgm
     let param = |root, slot| RootParam {
         root,
         slot,
@@ -477,7 +487,7 @@ fn gpu_selected_buffer_with_buffer_output_keeps_the_stride_refusal() {
         sgprs: 1,
         base_register: 0,
     };
-    let native = NativeProgram {
+    NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 8,
@@ -488,7 +498,7 @@ fn gpu_selected_buffer_with_buffer_output_keeps_the_stride_refusal() {
             table_offset_dwords: 0,
             lower_bound: 0,
             stride: 0,
-            dwords: 4,
+            dwords: if image_output { 8 } else { 4 },
             user_data: 1,
             slot: 1,
         }],
@@ -497,18 +507,42 @@ fn gpu_selected_buffer_with_buffer_output_keeps_the_stride_refusal() {
             threads: [32, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-    };
-    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-    let st = structure::structure(&p).unwrap();
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-    let io = io::raise(&p, &native).unwrap();
+    }
+}
+
+/// A writable buffer could alias the selected read within this dispatch.
+#[test]
+fn gpu_selected_buffer_with_buffer_output_keeps_the_stride_refusal() {
+    let native = selected_buffer_program(false);
     let bytes = crate::dxbc::build(&[]);
     let container = Container::parse(&bytes).unwrap();
     assert!(matches!(
-        super::emit(&container, &native, &p, &st, &io, &res),
+        super::translate_native::<false>(&container, &native, true, None, None),
         Err(crate::ShaderError::Unsupported {
             what: super::UNKNOWN_STRUCTURED_STRIDE,
             ..
         })
     ));
+}
+
+#[test]
+fn partial_dispatch_keeps_bounds_after_retrying_with_a_buffer_table() {
+    let native = selected_buffer_program(true);
+    let bytes = crate::dxbc::build(&[]);
+    let c = Container::parse(&bytes).unwrap();
+    let full = super::translate_native::<false>(&c, &native, true, None, None).unwrap();
+    let partial = super::translate_native::<true>(&c, &native, true, None, None).unwrap();
+    assert!(full.buffer_table && partial.buffer_table);
+    assert!(
+        full.user_data
+            .iter()
+            .all(|u| u.root != super::DISPATCH_THREADS)
+    );
+    let axes: Vec<_> = partial
+        .user_data
+        .iter()
+        .filter(|u| u.root == super::DISPATCH_THREADS)
+        .map(|u| u.dword)
+        .collect();
+    assert_eq!(axes, [0]);
 }
