@@ -487,6 +487,82 @@ impl Module {
         self.blocks[block].term = Some(t);
     }
 
+    /// Visit forward predecessors before their successors, matching the DXIL block layout.
+    fn reverse_postorder(&self) -> Vec<usize> {
+        let succs = |b: usize| successors(self.blocks[b].term);
+        let mut seen = vec![false; self.blocks.len()];
+        let mut post = Vec::new();
+        let mut stack = vec![(0usize, 0usize)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            top.1 += 1;
+            match succs(b).get(k) {
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        post
+    }
+
+    /// DXIL consumed by vkd3d-proton needs a single back edge per loop.
+    /// Join the back edges and their loop-carried values before serializing.
+    fn single_latches(&mut self, post: &[usize]) {
+        let n = self.blocks.len();
+        let mut pos = vec![usize::MAX; n];
+        for (i, &b) in post.iter().enumerate() {
+            pos[b] = i;
+        }
+        // Each header's back-edge sources, in layout order.
+        let mut back: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+        for &b in post {
+            for &s in successors(self.blocks[b].term).iter() {
+                if pos[s] <= pos[b] && !back.get(&s).is_some_and(|v| v.last() == Some(&b)) {
+                    back.entry(s).or_default().push(b);
+                }
+            }
+        }
+        for (header, sources) in back {
+            if sources.len() < 2 {
+                continue;
+            }
+            let latch = self.new_block();
+            for &src in &sources {
+                let swap = |t: usize| if t == header { latch } else { t };
+                self.blocks[src].term = match self.blocks[src].term {
+                    Some(Term::Br(t)) => Some(Term::Br(swap(t))),
+                    Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(c, swap(t), swap(f))),
+                    other => other,
+                };
+            }
+            for phi in self.blocks[header].phis.clone() {
+                let ty = self.insts[phi as usize].ty;
+                let Op::Phi(incoming) = self.insts[phi as usize].op.clone() else {
+                    continue;
+                };
+                let (from_back, mut kept): (Vec<_>, Vec<_>) = incoming
+                    .into_iter()
+                    .partition(|&(_, b)| sources.contains(&b));
+                if from_back.is_empty() {
+                    continue;
+                }
+                let joined = self.phi(latch, ty);
+                self.set_phi(joined, from_back);
+                kept.push((joined, latch));
+                self.insts[phi as usize].op = Op::Phi(kept);
+            }
+            self.blocks[latch].term = Some(Term::Br(header));
+        }
+    }
+
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)
@@ -585,7 +661,13 @@ impl Module {
         live
     }
 
-    pub fn write(&self, omit_unused_math: bool) -> Vec<u8> {
+    pub fn write(&mut self, omit_unused_math: bool) -> Vec<u8> {
+        let mut post = self.reverse_postorder();
+        let original_blocks = self.blocks.len();
+        self.single_latches(&post);
+        if self.blocks.len() != original_blocks {
+            post = self.reverse_postorder();
+        }
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
         w.enter(MODULE_BLOCK, 3);
@@ -720,30 +802,7 @@ impl Module {
         let live = self.live(omit_unused_math);
         let is_live = |i: &&u32| live[**i as usize];
 
-        // Blocks are laid out in reverse postorder, so every block follows
-        // its forward predecessors (drivers take a branch to an earlier
-        // block for a loop's back edge).
         let succs = |b: usize| successors(self.blocks[b].term);
-        let mut seen = vec![false; self.blocks.len()];
-        let mut post = Vec::new();
-        let mut stack = vec![(0usize, 0usize)];
-        seen[0] = true;
-        while let Some(top) = stack.last_mut() {
-            let (b, k) = *top;
-            top.1 += 1;
-            match succs(b).get(k) {
-                Some(&s) if !seen[s] => {
-                    seen[s] = true;
-                    stack.push((s, 0));
-                }
-                Some(_) => {}
-                None => {
-                    post.push(b);
-                    stack.pop();
-                }
-            }
-        }
-        post.reverse();
         let mut pos = vec![u64::MAX; self.blocks.len()];
         for (n, &b) in post.iter().enumerate() {
             pos[b] = n as u64;
@@ -1100,6 +1159,42 @@ mod tests {
         assert_eq!(signed(2), 4);
     }
 
+    #[test]
+    fn two_loop_tails_join_their_values_before_returning_to_the_header() {
+        let mut m = Module::default();
+        let [entry, header, left, right, exit] = std::array::from_fn(|_| m.new_block());
+        let ty = m.int(32);
+        let [initial, a, b] = [0, 1, 2].map(|n| m.i32(n));
+        let p = m.phi(header, ty);
+        m.set_phi(p, vec![(initial, entry), (a, left), (b, right)]);
+        let condition = m.cmp(header, pred::EQ, p, initial);
+        m.terminate(entry, Term::Br(header));
+        m.terminate(header, Term::CondBr(condition, left, right));
+        m.terminate(left, Term::CondBr(condition, header, exit));
+        m.terminate(right, Term::Br(header));
+        m.terminate(exit, Term::Ret);
+
+        m.write(false);
+        let latch = exit + 1;
+        assert_eq!(m.blocks.len(), latch + 1);
+        assert_eq!(&*successors(m.blocks[left].term), &[latch, exit]);
+        assert_eq!(&*successors(m.blocks[right].term), &[latch]);
+        assert_eq!(&*successors(m.blocks[latch].term), &[header]);
+        let &[joined] = m.blocks[latch].phis.as_slice() else {
+            panic!("one latch phi")
+        };
+        let V::Inst(p) = p else { unreachable!() };
+        assert!(
+            matches!(&m.insts[p as usize].op, Op::Phi(v) if v == &[(initial, entry), (V::Inst(joined), latch)])
+        );
+        assert!(
+            matches!(&m.insts[joined as usize].op, Op::Phi(v) if v == &[(a, left), (b, right)])
+        );
+        let once = m.write(false);
+        assert_eq!(m.blocks.len(), latch + 1);
+        assert_eq!(m.write(false), once);
+    }
+
     /// A structured shader's shape: `stages` if/else diamonds in a row, each
     /// merge with one phi per register (as the lowering makes them), then a
     /// loop, and a tail that reads only the first `read` registers.
@@ -1259,7 +1354,7 @@ mod tests {
 
     #[test]
     fn unused_arithmetic_can_release_a_loop_carried_phi() {
-        let m = synthetic(64, 64, 8);
+        let mut m = synthetic(64, 64, 8);
         let all = m.live(false);
         let needed = m.live(true);
         let removed_phis = m
@@ -1297,7 +1392,7 @@ mod tests {
     #[ignore = "benchmark: cargo test --release -p victory-shader bitcode -- --ignored --nocapture"]
     fn bench_write() {
         for (regs, stages, read) in [(64, 64, 64), (128, 256, 32), (256, 512, 256)] {
-            let m = synthetic(regs, stages, read);
+            let mut m = synthetic(regs, stages, read);
             let bytes = m.write(false);
             let runs = 5;
             let t = std::time::Instant::now();
