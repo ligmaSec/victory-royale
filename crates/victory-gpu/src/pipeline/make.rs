@@ -36,6 +36,7 @@ pub(crate) struct Pending {
     made: OnceLock<Option<Arc<HostPipeline>>>,
     bindings: OnceLock<Vec<StructuredBinding>>,
     strides: Strides,
+    partial: bool,
     variants: Mutex<VecDeque<Arc<Pending>>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
@@ -70,6 +71,7 @@ impl Pending {
             made: OnceLock::new(),
             bindings: OnceLock::new(),
             strides: Vec::new(),
+            partial: false,
             variants: Mutex::new(VecDeque::new()),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
@@ -84,7 +86,7 @@ impl Pending {
                 let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
                 tracing::info!(tid = format_args!("{tid:04x}"), shaders = ?self.shaders, "starting host pipeline");
             }
-            if self.strides.is_empty() {
+            if self.strides.is_empty() && !self.partial {
                 let made = HostPipeline::new(&self.shaders, self.graphics.as_deref(), &[]);
                 if made.is_none()
                     && let Some(bindings) = self.find_stride_bindings()
@@ -109,7 +111,7 @@ impl Pending {
             if shader.translated().is_none() {
                 // Probe lowering with a valid annotation. Only the binding
                 // locations survive the probe; its DXIL never reaches D3D12.
-                translate_for_adapter(
+                translate_for_adapter::<false>(
                     &shader.container,
                     host.wave_widths(),
                     Some(&|binding, required| {
@@ -130,11 +132,16 @@ impl Pending {
         self.shaders
             .iter()
             .map(|shader| {
-                if shader.translated.get().is_some_and(Option::is_some) {
+                if !self.partial && shader.translated.get().is_some_and(Option::is_some) {
                     return Some(shader.clone());
                 }
                 let accessed = std::cell::RefCell::new(BTreeSet::new());
-                let (host, mut used) = translate_for_adapter(
+                let translate = if self.partial {
+                    translate_for_adapter::<true>
+                } else {
+                    translate_for_adapter::<false>
+                };
+                let (host, mut native) = translate(
                     &shader.container,
                     host.wave_widths(),
                     Some(&|binding, _| {
@@ -148,7 +155,7 @@ impl Pending {
                     }),
                 )
                 .map_err(|error| {
-                    tracing::warn!(?shader, %error, "shader with bound structured views refused");
+                    tracing::warn!(?shader, %error, partial_dispatch = self.partial, "specialized shader refused");
                 })
                 .ok()?;
                 // Include exact slots absent from the console metadata so draw
@@ -159,7 +166,7 @@ impl Pending {
                     } else {
                         ResourceType::Srv
                     };
-                    if let Some(entry) = used.iter_mut().find(|u| {
+                    if let Some(entry) = native.used.iter_mut().find(|u| {
                         u.root == RootType::Table
                             && u.slot == binding.slot
                             && u.table_offset_dwords == binding.offset_dwords
@@ -172,7 +179,7 @@ impl Pending {
                             .iter()
                             .find(|u| u.root == RootType::Table && u.slot == binding.slot)?
                             .index;
-                        used.push(UsedResource {
+                        native.used.push(UsedResource {
                             kind,
                             root: RootType::Table,
                             table_offset_dwords: binding.offset_dwords,
@@ -188,7 +195,7 @@ impl Pending {
                     stage: shader.stage,
                     hash: shader.hash.clone(),
                     container: Vec::new(),
-                    translated: OnceLock::from(Some(Translated { host, used })),
+                    translated: OnceLock::from(Some(Translated::from_native(host, native))),
                     #[cfg(feature = "diagnostics")]
                     wave64: OnceLock::new(),
                 }))
@@ -273,11 +280,21 @@ pub(super) fn ready_with_strides(
         });
         return None;
     };
+    ready_variant(p, &strides, false)
+}
+
+/// Compilation uses the same frame wait budget and bounded variant cache as
+/// pipelines specialized for the currently bound structured-buffer strides.
+pub(super) fn ready_variant(
+    p: &Arc<Pending>,
+    strides: &[(StructuredBinding, u32)],
+    partial: bool,
+) -> Option<Arc<HostPipeline>> {
     let variant = {
         let mut variants = p.variants.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(i) = variants
             .iter()
-            .position(|variant| variant.strides == strides)
+            .position(|variant| variant.partial == partial && variant.strides == strides)
         {
             let variant = variants.remove(i).expect("a variant at this index");
             variants.push_back(variant.clone());
@@ -290,7 +307,8 @@ pub(super) fn ready_with_strides(
                 queue_state: AtomicU8::new(NOT_QUEUED),
                 made: OnceLock::new(),
                 bindings: OnceLock::new(),
-                strides,
+                strides: strides.to_vec(),
+                partial,
                 variants: Mutex::new(VecDeque::new()),
                 key: p.key.clone(),
                 used: AtomicBool::new(false),
@@ -477,6 +495,71 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indirect_draws_without_a_pipeline_leave_budget_for_a_later_record() {
+        use crate::object::{self, S_OK};
+        use crate::pipeline::{PIPELINE_IIDS, Pipeline, hand_out};
+        use victory_shader::native::{ComputeIo, StageIo};
+        use victory_shader::{HwStage, NativeProgram};
+
+        let _scope = crate::host::isolated_retire_scope();
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let create = |shaders| {
+            let mut pipeline = std::ptr::null();
+            assert_eq!(
+                hand_out(shaders, None, &PIPELINE_IIDS[0], &mut pipeline),
+                S_OK
+            );
+            // Resolve the synthetic PSOs before recording so this budget test
+            // is independent of the async compiler's frame deadline.
+            crate::pipeline::pipeline(pipeline).host.make();
+            pipeline
+        };
+        let missing = create(vec![]); // no vertex or mesh stage
+        let compute = create(vec![Shader::test_compute(NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 1,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code: 0xBF81_0000u32.to_le_bytes().to_vec(), // s_endpgm
+        })]);
+        let list = host.new_list().unwrap();
+        // Two skipped draws could consume the whole list budget. The last
+        // record dispatches three groups through a working host pipeline.
+        let records = [[1u32 << 24, 4, 0, 0], [1 << 24, 4, 0, 0], [3, 1, 1, 0]];
+        let start = records.as_ptr() as u64;
+        crate::shadow::register(start as usize, start, size_of_val(&records) as u64);
+        let mut state = crate::draw::State::default();
+        state.set_pipeline(missing);
+        let mut dropped = "";
+        let ran_draw = state.execute_indirect(&list, (0, 16, 2), start, None, &mut dropped);
+        state.set_pipeline(compute);
+        let dispatch = start + 32;
+        let mut reason = "";
+        let ran_dispatch = state.execute_indirect(&list, (2, 16, 1), dispatch, None, &mut reason);
+        list.close();
+        host.execute(&[&list]);
+        let copy = crate::shadow::find(dispatch, 4).unwrap();
+        let groups = u32::from_le_bytes(copy.bytes(dispatch, 4).unwrap().try_into().unwrap());
+        crate::shadow::unregister(start as usize, start);
+        object::release_boxed::<Pipeline>(missing);
+        object::release_boxed::<Pipeline>(compute);
+        assert!(!ran_draw);
+        assert_eq!(dropped, "no host pipeline");
+        assert!(ran_dispatch, "{reason}");
+        assert_eq!(
+            groups, 3,
+            "skipped draws exhausted the following dispatch budget"
+        );
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).

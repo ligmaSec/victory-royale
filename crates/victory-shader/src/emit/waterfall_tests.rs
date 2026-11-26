@@ -30,7 +30,7 @@ fn build_any(words: &[u32], buffers: bool) -> (HostShader, lower::Lowered) {
 }
 
 fn build_with_view(words: &[u32], buffer_stride: Option<u32>) -> (HostShader, lower::Lowered) {
-    build_compute(
+    build_compute::<false>(
         words,
         buffer_stride,
         false,
@@ -42,7 +42,7 @@ fn build_with_view(words: &[u32], buffer_stride: Option<u32>) -> (HostShader, lo
     )
 }
 
-fn build_compute(
+fn build_compute<const PARTIAL: bool>(
     words: &[u32],
     buffer_stride: Option<u32>,
     wave64: bool,
@@ -89,7 +89,7 @@ fn build_compute(
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower_with_waves(
+    let lowered = lower::lower_with_waves::<PARTIAL>(
         &lower::Parts {
             native: &native,
             p: &p,
@@ -130,6 +130,14 @@ fn build_compute(
 /// per one that ran, the UAV's 32 dwords. Empty when no SM 6.6 device is
 /// available: callers return early (`docs/code-standards.md`).
 fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
+    run_with_limits(shader, views, None)
+}
+
+fn run_with_limits(
+    shader: &HostShader,
+    views: &[View],
+    limits: Option<[u32; 3]>,
+) -> Vec<(&'static str, Vec<u32>)> {
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -159,8 +167,13 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
         // Both tables start at heap index 0.
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
-            assert_eq!(u.root, RootType::Table, "{u:?}");
-            ud[u.index as usize] = 0;
+            ud[u.index as usize] = match u.root {
+                RootType::Table => 0,
+                super::DISPATCH_THREADS => {
+                    limits.expect("partial dispatch extent")[u.dword as usize]
+                }
+                _ => panic!("unexpected root {u:?}"),
+            };
         }
         let words = host
             .dispatch(
@@ -665,7 +678,7 @@ fn wave64_implicit_sample_preserves_guest_coordinates_and_mips() {
         assert_eq!([word(40), word(44), word(48)], threads);
         assert_eq!([word(20), word(24)], wave.map_or([0, u32::MAX], |w| [w; 2]));
     };
-    let (original, lowered) = build_compute(&words, None, true, native, io);
+    let (original, lowered) = build_compute::<false>(&words, None, true, native, io);
     assert!(!lowered.has_quad_read);
     check_layout(&original, io.threads, Some(64));
 
@@ -673,7 +686,7 @@ fn wave64_implicit_sample_preserves_guest_coordinates_and_mips() {
     // be hidden by the absence of any declared group-shared memory.
     let mut barrier = words.to_vec();
     barrier.insert(words.len() - 1, 0xbf8a_0000); // s_barrier
-    let (guarded, _) = build_compute(&barrier, None, true, narrow, io);
+    let (guarded, _) = build_compute::<false>(&barrier, None, true, narrow, io);
     check_layout(&guarded, io.threads, Some(64));
 
     let mut texels = Vec::new();
@@ -699,8 +712,28 @@ fn wave64_implicit_sample_preserves_guest_coordinates_and_mips() {
             0x3604_0481, // v_and_b32_e32 v2, 1, v2
         ],
     );
+    // Cut both guest axes on complete quads. Each in-bounds lane still has
+    // all of its derivative inputs and the other output slots stay zero.
+    let (partial, _) = build_compute::<true>(&words, None, true, narrow, io);
+    check_layout(&partial, [64, 1, 1], None);
+    let axes: Vec<_> = partial
+        .user_data
+        .iter()
+        .filter(|u| u.root == super::DISPATCH_THREADS)
+        .map(|u| u.dword)
+        .collect();
+    assert_eq!(axes, [0, 1]);
+    let clipped: Vec<_> = expected
+        .iter()
+        .enumerate()
+        .map(|(i, &value)| if i % 8 < 4 && i / 8 < 4 { value } else { 0 })
+        .collect();
+    for (label, got) in run_with_limits(&partial, &views, Some([4, 4, 1])) {
+        assert_eq!(got, clipped, "{label}: partial 8x8 guest group");
+        eprintln!("{label}: verified 16 sampled texels and 48 untouched slots");
+    }
     for program in [&words[..], &vertical] {
-        let (shader, lowered) = build_compute(program, None, true, narrow, io);
+        let (shader, lowered) = build_compute::<false>(program, None, true, narrow, io);
         assert!(lowered.has_quad_read);
         check_layout(&shader, [64, 1, 1], None);
         for (label, got) in run(&shader, &views) {

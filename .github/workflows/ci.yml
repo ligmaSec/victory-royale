@@ -11,7 +11,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # Every integrated revision gets a result and a package, even across back-to-back merges.
+  # A newer commit on the same PR can still supersede its previous CI run.
+  group: ci-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -70,6 +72,14 @@ jobs:
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Hardware test kit (synthetic)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VICTORY_TEST_AGE: "1"
+        run: |
+          python -B tests/hardware-test.py
+          python -B tests/hardware-delivery.py
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
@@ -111,6 +121,15 @@ jobs:
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Hardware test kit (synthetic)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VICTORY_TEST_AGE: "1"
+        # Exercise the contributor's terminal entry point without keyboard input.
+        run: |
+          timeout 60s script -qec 'python3 -B tests/hardware-test.py' /dev/null </dev/null
+          python3 -B tests/hardware-delivery.py
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
@@ -143,7 +162,10 @@ jobs:
           python3 - <<'PYTHON'
           import json, os
           jobs = json.loads(os.environ["RESULTS"])
-          route = jobs["fmt-policy"]["outputs"].get("route")
+          policy = jobs["fmt-policy"]
+          if policy["result"] != "success":
+              raise SystemExit(f"fmt-policy ended with {policy['result']} before the CI route could be verified")
+          route = policy["outputs"].get("route")
           if route not in {"docs", "code", "verified-msrv"}:
               raise SystemExit(f"Unknown CI route: {route}")
           for name in ("fmt-policy", "check", "linux", "msrv", "proton"):

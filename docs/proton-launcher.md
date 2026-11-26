@@ -52,6 +52,23 @@ prefix is `${XDG_DATA_HOME:-$HOME/.local/share}/victory/proton`, and the
 default `GAMEID` is `umu-victory`. Set `WINEPREFIX`, `GAMEID` or `PROTONPATH`
 to override them. Use Windows paths in `victory.toml`.
 
+The launcher searches `$XDG_DATA_HOME/Steam`, `$HOME/.steam/steam` and
+`$HOME/.local/share/Steam` for Proton Experimental. It uses the first install
+with an executable `steamapps/common/Proton - Experimental/proton`. An explicit
+`PROTONPATH` takes precedence. The launcher recognises Experimental at that path
+when its `version` file contains `experimental-` and it uses a `steamapps/common`
+layout. It gives UMU Unix paths and sets `STEAM_COMPAT_LIBRARY_PATHS` to the
+Steam library. Each VIctory package directory gets its own install symlink under
+that library, so two builds can run at the same time. A caller-supplied
+`STEAM_COMPAT_INSTALL_PATH` is used as-is: the default symlink is neither
+created nor checked in that case. When the launcher discovers Experimental on
+its own and cannot set up that symlink (for example a read-only Steam library),
+it warns, leaves `STEAM_COMPAT_INSTALL_PATH` for UMU to choose, and still runs
+that Experimental runtime through `umu-run` with Unix paths. An explicitly set
+`PROTONPATH` instead reports the failure. This is the configuration used to
+reach the first world frame on Linux. Other layouts keep the `Z:` path
+behaviour; a non-experimental `PROTONPATH` also keeps it.
+
 The launcher creates shader-cache directories at
 `${XDG_CACHE_HOME:-$HOME/.cache}/victory/vkd3d` and
 `${XDG_CACHE_HOME:-$HOME/.cache}/victory/dxvk`, keeping generated caches out
@@ -61,6 +78,8 @@ without creating a directory. Empty or relative XDG base directories fall back
 to the standard directories under `$HOME`.
 
 ## Capture a workstation run
+
+For a requested PR comparison, follow the [interactive Series X test](testing.md#run-a-series-x-hardware-test). It runs both builds and bundles their logs. To capture a single launch, use the command below.
 
 ```sh
 ./scripts/victory-proton.sh --report "/path/to/game/title.exe"

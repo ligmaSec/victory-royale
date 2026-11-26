@@ -89,7 +89,7 @@ fn build(waves: ComputeWaves) -> &'static [u8; 32] {
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let waves = wave_widths();
     let translate = |c: &[u8]| {
-        victory_shader::emit::translate_for_adapter(c, waves, None)
+        victory_shader::emit::translate_for_adapter::<false>(c, waves, None)
             .map(|(shader, _)| shader)
             .map_err(|e| e.to_string())
     };

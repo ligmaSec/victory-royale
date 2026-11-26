@@ -38,24 +38,25 @@ fn store_uav(vdata: u32, dword_index: u32) -> [u32; 2] {
 /// on every available SM 6.6 backend (hardware GPU and WARP). Using >32 threads
 /// avoids emitting `WaveSize(32)`, so WARP (4 lanes) executes it too.
 fn run_lds_program(body: &[u32], expected: &[u32]) {
-    let shader = build_lds_program(
+    let (shader, _) = build_lds_program::<false>(
         body,
         false,
         [64, 1, 1],
         super::ComputeWaves::with_wave32(true),
-    );
+    )
+    .unwrap();
     #[cfg(windows)]
     check_readback(shader, expected);
     #[cfg(not(windows))]
     let _ = (shader, expected);
 }
 
-fn build_lds_program(
+fn build_lds_program<const PARTIAL: bool>(
     body: &[u32],
     guest_wave64: bool,
     threads: [u32; 3],
     waves: super::ComputeWaves,
-) -> HostShader {
+) -> Result<(HostShader, usize), crate::ShaderError> {
     let slot = 3;
     let mut words = vec![
         0xF404_0200, // s_load_dwordx2 s[8:9], s[0:1], 0
@@ -105,7 +106,7 @@ fn build_lds_program(
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower_with_waves(
+    let lowered = lower::lower_with_waves::<PARTIAL>(
         &lower::Parts {
             native: &native,
             p: &p,
@@ -120,19 +121,21 @@ fn build_lds_program(
         waves,
         None,
         None,
-    )
-    .expect("lower");
+    )?;
 
-    HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        samplers: lowered.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
-        root_uavs: lowered.root_uavs,
-    }
+    Ok((
+        HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+        },
+        lowered.barriers,
+    ))
 }
 
 #[cfg(windows)]
@@ -180,6 +183,7 @@ fn check_readback(mut shader: HostShader, expected: &[u32]) {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         assert_eq!(out[1], expected, "{label}");
+        eprintln!("{label}: all {n} LDS values matched");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
@@ -338,25 +342,39 @@ fn lds_max_across_a_split_wave64() {
         narrow_quads: true,
     };
     let native = super::ComputeWaves::with_wave32(true);
-    let build = |body: &[u32], waves| build_lds_program(body, true, [8, 8, 1], waves);
+    let build = |body: &[u32], waves, expected_barriers| {
+        let (shader, barriers) = build_lds_program::<false>(body, true, [8, 8, 1], waves).unwrap();
+        assert_eq!(barriers, expected_barriers, "group syncs in lowered shader");
+        shader
+    };
     let wave_range = |shader: &HostShader| {
         let container = crate::Container::parse(&shader.dxil).unwrap();
         let psv = container.part(crate::FourCC::PSV0).unwrap().data;
         let word = |i| u32::from_le_bytes(psv[i..i + 4].try_into().unwrap());
         [word(20), word(24)]
     };
-    assert_eq!(wave_range(&build(&body, native)), [64, 64]);
-    let shader = build(&body, narrow);
+    assert_eq!(wave_range(&build(&body, native, 0)), [64, 64]);
+    let shader = build(&body, narrow, 2);
     assert_eq!(wave_range(&shader), [0, u32::MAX]);
+
+    // A thread-count dispatch that ends inside a group cannot run the two
+    // generated group barriers after the inactive threads have returned.
+    assert!(matches!(
+        build_lds_program::<true>(&body, true, [8, 8, 1], narrow),
+        Err(crate::ShaderError::Unsupported {
+            what: "a partial dispatch with a group barrier",
+            ..
+        })
+    ));
 
     // An extra LDS mutation after the maximum needs its own synchronization.
     let mut second_write = body.to_vec();
     second_write.splice(8..8, body[4..6].iter().copied());
-    assert_eq!(wave_range(&build(&second_write, narrow)), [64, 64]);
+    assert_eq!(wave_range(&build(&second_write, narrow, 0)), [64, 64]);
     // A per-lane seed can make colliding writes sensitive to lane order.
     let mut lane_seed = body;
     lane_seed[5] = 0x0000_0001; // ds_write_b32 v1, v0
-    assert_eq!(wave_range(&build(&lane_seed, narrow)), [64, 64]);
+    assert_eq!(wave_range(&build(&lane_seed, narrow, 0)), [64, 64]);
 
     // Only the first 24 threads contribute. All 64 must reach both barriers
     // and read the same maximum after EXEC is restored.
@@ -370,7 +388,7 @@ fn lds_max_across_a_split_wave64() {
             0xbe84_2406, // s_and_saveexec_b64 s[4:5], s[6:7]
         ],
     );
-    let partial = build(&masked, narrow);
+    let partial = build(&masked, narrow, 2);
     assert_eq!(wave_range(&partial), [0, u32::MAX]);
     #[cfg(windows)]
     {

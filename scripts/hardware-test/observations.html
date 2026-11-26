@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Series X test observations</title>
+<style>
+:root { color-scheme: dark; font: 1rem/1.5 system-ui, sans-serif; background: #14191d; color: #edf3f5 }
+body { max-width: 68rem; margin: 2rem auto; padding: 0 1.25rem }
+h1, h2 { margin: .5rem 0 }
+.warning { padding: .7rem 1rem; background: #641f29; border-left: .35rem solid #ff8f92 }
+main { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr)); gap: 1rem }
+section { padding: 1rem; background: #212a31; border-radius: .4rem }
+textarea { display: block; box-sizing: border-box; width: 100%; margin: .35rem 0 1rem; padding: .7rem; font: inherit }
+.drop { padding: .75rem; border: 1px dashed #91adb9; border-radius: .3rem }
+.drop:focus, button:focus-visible { outline: 3px solid #7ce5db }
+img { display: block; max-width: 100%; max-height: 17rem; margin: .5rem auto }
+[hidden] { display: none }
+button, input { font: inherit }
+button { cursor: pointer; margin: .4rem .4rem .4rem 0; padding: .35rem .75rem }
+#save { background: #9aece0; color: #12231f; border-radius: .25rem }
+</style>
+<h1>What did you see?</h1>
+<p>Describe the same moment on each build. Save here, then choose a destination in the terminal.</p>
+<p class="warning"><strong>Logs and screenshots may contain sensitive information.</strong>
+Check names, overlays and notifications. Notes can appear in the public summary. Images go only in the reviewed ZIP.</p>
+<main aria-label="Build observations"></main>
+<p role="status" id="status"></p>
+<button id="save" disabled>Save locally</button><button id="cancel">Cancel</button>
+<template>
+<section>
+<h2></h2><label>What was visible? Did anything stall or change?
+<textarea maxlength="4000" rows="4"></textarea></label>
+<div class="drop" tabindex="0">Click here and paste a screenshot with Ctrl+V, or choose an image. The preview fits within 1920 pixels.
+<input type="file" accept="image/png,image/jpeg,image/webp" aria-label="Choose screenshot">
+<img hidden alt="Screenshot included for this build"><button hidden>Remove screenshot</button></div>
+</section>
+</template>
+<script>
+const statusLine = document.querySelector('#status');
+const save = document.querySelector('#save');
+const rows = {};
+let pending = 0;
+let loaded = false;
+function refresh() { save.disabled = !loaded || pending > 0; }
+function show(row, data) {
+  row.data = data;
+  row.img.hidden = row.remove.hidden = !data;
+  if (data) row.img.src = 'data:image/png;base64,' + data;
+  else row.img.removeAttribute('src');
+}
+async function attach(row, file) {
+  if (!file) return;
+  const version = ++row.version;
+  pending++; refresh();
+  const url = URL.createObjectURL(file);
+  try {
+    if (!['image/png','image/jpeg','image/webp'].includes(file.type) || file.size > 32 * 1024 * 1024)
+      throw Error('Choose a PNG, JPEG or WebP image under 32 MiB.');
+    const source = new Image();
+    source.src = url; await source.decode();
+    const size = Math.min(1, 1920 / Math.max(source.width, source.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(source.width * size));
+    canvas.height = Math.max(1, Math.round(source.height * size));
+    canvas.getContext('2d').drawImage(source, 0, 0, canvas.width, canvas.height);
+    const data = canvas.toDataURL('image/png').split(',')[1];
+    if (data.length > Math.ceil(4194304 / 3) * 4) throw Error('Crop the screenshot and paste it again (4 MiB limit).');
+    if (version === row.version) { show(row, data); statusLine.textContent = ''; }
+  } catch (error) { statusLine.textContent = error.message; }
+  finally { URL.revokeObjectURL(url); pending--; refresh(); }
+}
+async function openDraft() {
+  const response = await fetch(location.pathname + '/draft');
+  if (!response.ok) throw Error('Reopen the editor from the terminal.');
+  const draft = await response.json();
+  for (const [side, title] of [['main','Main'], ['candidate','Candidate']]) {
+    const panel = document.querySelector('template').content.firstElementChild.cloneNode(true);
+    panel.querySelector('h2').textContent = title;
+    const row = rows[side] = { note: panel.querySelector('textarea'), img: panel.querySelector('img'),
+                              remove: panel.querySelector('button'), version: 0 };
+    row.note.value = draft[side].note; show(row, draft[side].image);
+    const input = panel.querySelector('input');
+    input.onchange = () => { attach(row, input.files[0]); input.value = ''; };
+    panel.onpaste = event => {
+      const item = Array.from(event.clipboardData.items).find(i => i.type.startsWith('image/'));
+      if (item) { event.preventDefault(); attach(row, item.getAsFile()); }
+    };
+    row.remove.onclick = () => { row.version++; show(row, ''); };
+    document.querySelector('main').append(panel);
+  }
+  loaded = true; refresh();
+}
+async function finish(action) {
+  const draft = Object.fromEntries(Object.entries(rows).map(([side,row]) => [side, {note:row.note.value, image:row.data}]));
+  try {
+    const result = await fetch(location.pathname + '/' + action, {method:'POST',
+      body:action === 'save' ? JSON.stringify(draft) : ''});
+    statusLine.textContent = await result.text();
+    if (result.ok) { document.querySelector('main').remove(); save.remove(); document.querySelector('#cancel').remove(); }
+  } catch { statusLine.textContent = 'Session closed. Return to the terminal.'; }
+}
+save.onclick = () => finish('save');
+document.querySelector('#cancel').onclick = () => finish('cancel');
+openDraft().catch(error => { statusLine.textContent = error.message; });
+</script>
+</html>
