@@ -8,8 +8,7 @@ use crate::{io, ir, resource, structure};
 
 #[test]
 fn compute_writes_through_spilled_root_uav() {
-    let slot = 3;
-    let words: [u32; 8] = [
+    let words = [
         0xF404_0200, // s_load_dwordx2 s[8:9], s[0:1], 0
         0xFA00_0000,
         0xBE8A_0384, // descriptor size
@@ -19,6 +18,30 @@ fn compute_writes_through_spilled_root_uav() {
         0x8002_0000,
         0xBF81_0000, // s_endpgm
     ];
+    verify_root_stores(&words, [0, 29, 0, 0]);
+}
+
+#[test]
+fn halfword_stores_respect_the_bound_spilled_root_uav() {
+    let words = [
+        0xf404_0200,
+        0xfa00_0000, // load starting address
+        0xbe8a_0381, // one record, index 0
+        0xbe8b_03ff,
+        0x1000_0000, // index bounds check
+        0x7e00_02ff,
+        0xbeef_3412, // value to truncate
+        0xe068_0003,
+        0x8002_0000, // cross dwords inside the view
+        0xe068_000f,
+        0x8002_0000, // crosses the end, drop both bytes
+        0xbf81_0000,
+    ];
+    verify_root_stores(&words, [0x1200_0000, 0x34, 0, 0]);
+}
+
+fn verify_root_stores(words: &[u32], expected: [u32; 4]) {
+    let slot = 3;
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -80,11 +103,13 @@ fn compute_writes_through_spilled_root_uav() {
     assert_eq!(shader.root_uavs, [slot]);
     assert!(shader.root_srvs.is_empty());
     #[cfg(windows)]
-    check_readback(&shader);
+    check_readback(&shader, expected);
+    #[cfg(not(windows))]
+    let _ = expected;
 }
 
 #[cfg(windows)]
-fn check_readback(shader: &HostShader) {
+fn check_readback(shader: &HostShader, expected: [u32; 4]) {
     use super::host::{Dispatch, Host, Root, View};
     use super::valu_tests::{ONE_AT_A_TIME, backends};
 
@@ -120,7 +145,7 @@ fn check_readback(shader: &HostShader) {
                 },
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        assert_eq!(out, [vec![0; 4], vec![0, 29, 0, 0]], "{label}");
+        assert_eq!(out, [vec![0; 4], expected.to_vec()], "{label}");
         eprintln!("{label}: root UAV write verified");
         ran += 1;
     }

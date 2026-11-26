@@ -191,6 +191,119 @@ fn raw_buffer_byte_and_halfword_loads_extend_at_every_byte_offset() {
 }
 
 #[test]
+fn raw_halfword_stores_preserve_neighbors_and_drop_incomplete_writes() {
+    // Each lane reads a synthetic address, value and two initial dwords.
+    // The second scenario shares dwords between pairs of concurrent lanes.
+    for shared in [false, true] {
+        let mut words = vec![
+            0xbe81_0380,
+            0xf408_0200,
+            0xfa00_0000, // raw SRV
+            0xf408_0300,
+            0xfa00_0020, // raw UAV
+            0x3400_0084, // v0 = lane * 16
+            0xe038_1000,
+            0x8002_0100, // buffer_load_dwordx4 v[1:4]
+        ];
+        if !shared {
+            words.extend([
+                0xe074_1000,
+                0x8003_0300, // initialize v0..v0+7
+                0xe074_1008,
+                0x8003_0300, // initialize v0+8..v0+15
+                0x3606_00ff,
+                128,         // v3 = (lane * 16) & 128
+                0x7daa_0680, // v_cmpx_ne_u32 exec, 0, v3
+            ]);
+        }
+        words.extend([
+            0xe068_1000,
+            0x8003_0201, // store low half of v2 at byte v1
+            0xbf81_0000,
+        ]);
+        let shader = buffer_shader(&words, Some(0), &|_, _| None).unwrap();
+        assert!(
+            Container::parse(&shader.dxil)
+                .unwrap()
+                .part(FourCC::DXIL)
+                .is_some()
+        );
+
+        #[cfg(windows)]
+        {
+            use super::host::{Dispatch, Host, Root, Stride, View};
+            let _one = super::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut data = Vec::new();
+            let mut expected = vec![0u8; if shared { 128 } else { 1024 }];
+            for lane in 0..64u32 {
+                let address = if shared {
+                    2 * lane
+                } else {
+                    let start = lane as usize * 16;
+                    for row in expected[start..start + 16].chunks_exact_mut(8) {
+                        row.copy_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+                    }
+                    match lane {
+                        63 => 1023, // only the first byte would fit
+                        62 => u32::MAX,
+                        _ => lane * 16 + lane % 4,
+                    }
+                };
+                let value = 0xdead_a17e ^ (lane * 197);
+                data.extend([address, value, 0x6745_2301, 0xefcd_ab89]);
+                if (shared || lane & 8 != 0)
+                    && let Some(bytes) = expected
+                        .get_mut(address as usize..)
+                        .and_then(|s| s.get_mut(..2))
+                {
+                    bytes.copy_from_slice(&(value as u16).to_le_bytes());
+                }
+            }
+            let expected: Vec<_> = expected
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(u32::from_le_bytes)
+                .collect();
+            let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+            let mut checked = false;
+            for &(name, warp) in super::valu_tests::backends(force_warp) {
+                let Ok(host) = Host::new(warp) else { continue };
+                let (root, pso) = host.compute_pipeline(&shader).unwrap();
+                let output = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(
+                                0,
+                                Root::Constants(vec![0; shader.user_data_dwords() as usize]),
+                            )],
+                            views: &[
+                                View::Buffer {
+                                    data: &data,
+                                    stride: Stride::Raw,
+                                },
+                                View::RawUav(expected.len() as u32),
+                            ],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(output[0], expected, "{name}, shared dwords = {shared}");
+                checked = true;
+                eprintln!("{name}: verified halfword stores, shared dwords = {shared}");
+            }
+            assert!(checked, "no SM 6.6 device for halfword store readback");
+        }
+    }
+}
+
+#[test]
 fn normalized_mtbuf_loads_need_no_int64() {
     for &(unorm, _) in FORMATS {
         for format in [unorm, unorm + 1] {

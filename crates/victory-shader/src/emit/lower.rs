@@ -8067,6 +8067,60 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// Replaces selected bits without losing another lane's update to the
+    /// rest of the same dword. A failed exchange supplies the next expected value.
+    fn masked_raw_store(&mut self, h: V, byte: V, mask: V, bits: V) {
+        let head = self.cur;
+        let retry = self.s.m.new_block();
+        let done = self.s.m.new_block();
+        let i32t = self.s.t.i32;
+        let zero = self.s.m.i32(0);
+        let ones = self.s.m.i32(u32::MAX);
+        let clear = self.s.m.bin(head, Bin::Xor, mask, ones);
+        self.s.m.terminate(head, Term::Br(retry));
+        let expected = self.s.m.phi(retry, i32t);
+        let keep = self.s.m.bin(retry, Bin::And, expected, clear);
+        let new = self.s.m.bin(retry, Bin::Or, keep, bits);
+        let undef = self.s.m.undef(i32t);
+        let old = self.s.op(
+            retry,
+            "atomicCompareExchange.i32",
+            Attr::NoUnwind,
+            i32t,
+            79,
+            &[h, byte, undef, undef, expected, new],
+        );
+        let success = self.s.m.cmp(retry, pred::EQ, old, expected);
+        self.s
+            .m
+            .terminate(retry, Term::CondBr(success, done, retry));
+        self.s.m.set_phi(expected, vec![(zero, head), (old, retry)]);
+        self.cur = done;
+    }
+
+    fn raw_store_short(&mut self, h: V, off: V, value: V) {
+        let c = self.cur;
+        let three = self.s.m.i32(3);
+        let aligned = self.s.m.i32(!3);
+        let four = self.s.m.i32(4);
+        let eight = self.s.m.i32(8);
+        let octet = self.s.m.i32(0xff);
+        let half = self.s.m.i32(0xffff);
+        let byte = self.s.m.bin(c, Bin::And, off, aligned);
+        let low = self.s.m.bin(c, Bin::And, off, three);
+        let shift = self.s.m.bin(c, Bin::Shl, low, three);
+        let mask = self.s.m.bin(c, Bin::Shl, half, shift);
+        let truncated = self.s.m.bin(c, Bin::And, value, half);
+        let bits = self.s.m.bin(c, Bin::Shl, truncated, shift);
+        self.masked_raw_store(h, byte, mask, bits);
+        let crosses = self.s.m.cmp(self.cur, pred::EQ, low, three);
+        let at = self.begin_guarded(Some(crosses));
+        let next = self.s.m.bin(self.cur, Bin::Add, byte, four);
+        let high = self.s.m.bin(self.cur, Bin::LShr, truncated, eight);
+        self.masked_raw_store(h, next, octet, high);
+        self.end_guarded(at, &[]);
+    }
+
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Buffer {
             data,
@@ -8139,6 +8193,7 @@ impl<'a> Lower<'a> {
             .or(plain.strip_prefix("tbuffer_load_"))
         {
             _ if atomic.is_some() || narrow_format.is_some() => (false, 1),
+            Some("short") if store => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -8182,6 +8237,53 @@ impl<'a> Lower<'a> {
         }
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
+        }
+        if name == "buffer_store_short" {
+            if index.is_some()
+                || used.is_some_and(|u| u.kind != ResourceType::Uav || u.stride > 1)
+                || self.bound_structured_stride(src, true, false).is_some()
+            {
+                return Err("a halfword store without a byte-addressed UAV");
+            }
+            match src {
+                // OOB_SELECT = 1 checks the index, which is zero without
+                // idxen or ADD_TID_ENABLE. Swizzled addressing is separate.
+                Source::Built {
+                    words: [count, control],
+                    bits,
+                    ..
+                } if (control >> 28) & 3 == 1
+                    && control & (1 << 23) == 0
+                    && bits & 0xc000_0000 == 0 =>
+                {
+                    if *count == 0 {
+                        return Ok(());
+                    }
+                }
+                Source::Loaded { .. } => {}
+                _ => return Err("a halfword store with unknown descriptor bounds"),
+            }
+            let value = self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, 1)?[0];
+            let h = self.handle(site, src, false, (0x100b, 0))?;
+            // Both heap and guest root UAVs bind bounded host views. Check
+            // both bytes before writing either dword of a straddling store.
+            let i32t = self.s.t.i32;
+            let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+            let mip = self.s.m.undef(i32t);
+            let size = self
+                .s
+                .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+            let bytes = self.s.m.extract(c, size, 0);
+            let one = self.s.m.i32(1);
+            let next = self.s.m.bin(c, Bin::Add, off, one);
+            let in_view = self.s.m.cmp(c, pred::IULT, next, bytes);
+            let no_wrap = self.s.m.cmp(c, pred::IULT, off, next);
+            let fits = self.s.m.bin(c, Bin::And, in_view, no_wrap);
+            let enabled = guard.map_or(fits, |g| self.s.m.bin(c, Bin::And, g, fits));
+            let at = self.begin_guarded(Some(enabled));
+            self.raw_store_short(h, off, value);
+            self.end_guarded(at, &[]);
+            return Ok(());
         }
         if narrow_format.is_some()
             && used.is_some_and(|u| u.kind == ResourceType::Cbv || u.stride > 1)
