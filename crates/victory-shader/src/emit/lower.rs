@@ -6,6 +6,7 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::bitcode::{Attr, Bin, Cast, Module, Term, V, pred};
@@ -125,9 +126,10 @@ fn lower_program<const PARTIAL: bool>(
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    let uses = OnceCell::new();
     let mut waves = waves;
     loop {
-        match Lower::new(parts, &bad, numeric_selects, waves, view_stride)
+        match Lower::new(parts, &bad, &uses, numeric_selects, waves, view_stride)
             .run::<PARTIAL>(pixel_inputs)
         {
             Ok(l) => return Ok(l),
@@ -220,13 +222,60 @@ type HandleKey = (usize, Site, u8, bool, (u32, u32));
 /// Source element id, element-relative channel, value, and optional f16 half.
 type ExportStore = (usize, u8, Value, Option<bool>);
 
-struct Lower<'a> {
+/// The SSA uses needed when lowering consults the program beyond the current
+/// instruction. Built on demand and shared by phi retries.
+struct Uses<'a> {
+    readers: HashMap<Value, Vec<Reader<'a>>>,
+    first_lanes: HashMap<Value, Value>,
+}
+
+enum Reader<'a> {
+    Inst(&'a Inst),
+    Phi(Value),
+}
+
+impl<'a> Uses<'a> {
+    fn new(p: &'a Program) -> Self {
+        let mut readers = HashMap::<_, Vec<_>>::new();
+        let mut first_lanes = HashMap::new();
+        for block in &p.blocks {
+            for phi in &block.phis {
+                for &arg in &phi.args {
+                    readers.entry(arg).or_default().push(Reader::Phi(phi.value));
+                }
+            }
+            for inst in &block.insts {
+                for &(_, value) in &inst.reads {
+                    readers.entry(value).or_default().push(Reader::Inst(inst));
+                }
+                if inst.name() == "v_readfirstlane_b32"
+                    && let Some(&(_, source)) = inst.reads.iter().find(|r| matches!(r.0, Reg::V(_)))
+                {
+                    for &(_, value) in &inst.writes {
+                        first_lanes.insert(value, source);
+                    }
+                }
+            }
+        }
+        Self {
+            readers,
+            first_lanes,
+        }
+    }
+
+    fn readers(&self, value: Value) -> impl Iterator<Item = &Reader<'a>> {
+        self.readers.get(&value).into_iter().flatten()
+    }
+}
+
+struct Lower<'a, 'p> {
     s: Shader,
-    x: &'a Parts<'a>,
+    x: &'a Parts<'p>,
     /// Original to retained element ids for mesh vertex and primitive exports.
     mesh_output_ids: Option<[Vec<Option<usize>>; 2]>,
     view_stride: Option<ViewStride<'a>>,
     bad: &'a HashMap<Value, Why>,
+    uses: &'a OnceCell<Uses<'p>>,
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
@@ -598,10 +647,11 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
-impl<'a> Lower<'a> {
+impl<'a, 'p> Lower<'a, 'p> {
     fn new(
-        x: &'a Parts<'a>,
+        x: &'a Parts<'p>,
         bad: &'a HashMap<Value, Why>,
+        uses: &'a OnceCell<Uses<'p>>,
         numeric_selects: bool,
         waves: super::ComputeWaves,
         view_stride: Option<ViewStride<'a>>,
@@ -768,6 +818,7 @@ impl<'a> Lower<'a> {
             mesh_output_ids: None,
             view_stride,
             bad,
+            uses,
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
             floats: HashMap::new(),
@@ -4126,28 +4177,20 @@ impl<'a> Lower<'a> {
         ia.name() == ib.name() && oa == ob && same_base && same_soffset
     }
 
+    fn uses(&self) -> &Uses<'p> {
+        self.uses.get_or_init(|| Uses::new(self.x.p))
+    }
+
     /// The same value, or two `v_readfirstlane_b32` of the same VGPR value
     /// (each waterfall loop reads the index anew).
     fn same_scalar(&self, x: Value, y: Value) -> bool {
         if x == y {
             return true;
         }
-        let first_lane_of = |v: Value| {
-            self.x
-                .p
-                .blocks
-                .iter()
-                .flat_map(|b| &b.insts)
-                .find(|i| i.writes.iter().any(|w| w.1 == v))
-                .filter(|i| i.name() == "v_readfirstlane_b32")
-                .and_then(|i| {
-                    i.reads
-                        .iter()
-                        .find(|r| matches!(r.0, Reg::V(_)))
-                        .map(|r| r.1)
-                })
-        };
-        matches!((first_lane_of(x), first_lane_of(y)), (Some(a), Some(b)) if a == b)
+        let first_lanes = &self.uses().first_lanes;
+        first_lanes
+            .get(&x)
+            .is_some_and(|a| first_lanes.get(&y) == Some(a))
     }
 
     /// The element stride used by scalar data loads through this SRV.
@@ -4163,39 +4206,37 @@ impl<'a> Lower<'a> {
     fn read_only_by_bvh(&self, inst: &Inst) -> bool {
         let mut pending: Vec<Value> = inst.writes.iter().map(|w| w.1).collect();
         let mut seen = HashSet::new();
-        let mut reads = 0;
+        let mut read = false;
         while let Some(v) = pending.pop() {
             if !seen.insert(v) {
                 continue;
             }
-            for block in &self.x.p.blocks {
-                for phi in block.phis.iter().filter(|phi| phi.args.contains(&v)) {
-                    pending.push(phi.value);
-                }
-                for reader in block
-                    .insts
-                    .iter()
-                    .filter(|r| r.reads.iter().any(|r| r.1 == v))
-                {
-                    let rsrc = match &reader.fields {
-                        Fields::Image {
-                            rsrc: Operand::Scalar { code, dwords },
-                            ..
-                        } if reader.name().starts_with("image_bvh") => (*code, *dwords),
-                        _ => return false,
-                    };
-                    let in_rsrc = reader.reads.iter().any(|r| {
-                        r.1 == v
-                            && matches!(r.0, Reg::S(n) if (rsrc.0..rsrc.0 + rsrc.1).contains(&n))
-                    });
-                    if !in_rsrc {
-                        return false;
+            for reader in self.uses().readers(v) {
+                let inst = match *reader {
+                    Reader::Phi(value) => {
+                        pending.push(value);
+                        continue;
                     }
-                    reads += 1;
+                    Reader::Inst(inst) => inst,
+                };
+                let Fields::Image {
+                    rsrc: Operand::Scalar { code, dwords },
+                    ..
+                } = inst.fields
+                else {
+                    return false;
+                };
+                if !inst.name().starts_with("image_bvh")
+                    || !inst.reads.iter().any(|r| {
+                        r.1 == v && matches!(r.0, Reg::S(n) if (code..code + dwords).contains(&n))
+                    })
+                {
+                    return false;
                 }
+                read = true;
             }
         }
-        reads > 0
+        read
     }
 
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
@@ -4400,42 +4441,38 @@ impl<'a> Lower<'a> {
     /// Whether a phi, or an instruction other than an interpolation's second
     /// half (`v_interp_p2*`), reads `v`.
     fn read_past_interpolation(&self, v: Value) -> bool {
-        self.x.p.blocks.iter().any(|b| {
-            b.phis.iter().any(|p| p.args.contains(&v))
-                || b.insts.iter().any(|i| {
-                    !i.name().starts_with("v_interp_p2") && i.reads.iter().any(|r| r.1 == v)
-                })
+        self.uses().readers(v).any(|reader| match reader {
+            Reader::Phi(_) => true,
+            Reader::Inst(inst) => !inst.name().starts_with("v_interp_p2"),
         })
     }
 
     /// A scalar buffer load takes the whole descriptor by reference. Its
     /// byte offset can also name one of those SGPRs, this time as a value.
     fn scalar_record_count_used(&self, v: Value) -> bool {
-        self.x.p.blocks.iter().any(|b| {
-            b.phis.iter().any(|p| p.args.contains(&v))
-                || b.insts.iter().any(|i| {
-                    if let Fields::Smem { soffset, .. } = i.fields
-                        && i.name().starts_with("s_buffer_load_dword")
-                    {
-                        return matches!(soffset, Operand::Scalar { code, .. }
-                            if i.read(Reg::S(code)) == Some(v));
-                    }
-                    i.reads.iter().any(|r| r.1 == v)
-                })
+        self.uses().readers(v).any(|reader| match reader {
+            Reader::Phi(_) => true,
+            Reader::Inst(inst) => {
+                if let Fields::Smem { soffset, .. } = inst.fields
+                    && inst.name().starts_with("s_buffer_load_dword")
+                {
+                    return matches!(soffset, Operand::Scalar { code, .. }
+                        if inst.read(Reg::S(code)) == Some(v));
+                }
+                true
+            }
         })
     }
 
     /// Whether an instruction or phi reads `v` other than as a resource
     /// operand of a memory instruction (which takes the descriptor whole).
     fn read_as_data(&self, v: Value) -> bool {
-        self.x.p.blocks.iter().any(|b| {
-            b.phis.iter().any(|p| p.args.contains(&v))
-                || b.insts.iter().any(|i| {
-                    !matches!(
-                        i.fields,
-                        Fields::Image { .. } | Fields::Buffer { .. } | Fields::Smem { .. }
-                    ) && i.reads.iter().any(|r| r.1 == v)
-                })
+        self.uses().readers(v).any(|reader| match reader {
+            Reader::Phi(_) => true,
+            Reader::Inst(inst) => !matches!(
+                inst.fields,
+                Fields::Image { .. } | Fields::Buffer { .. } | Fields::Smem { .. }
+            ),
         })
     }
 
@@ -9437,6 +9474,55 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn ssa_use_index_keeps_readers_through_joins_and_first_lane_sources() {
+        use super::{Reader, Reg, Uses};
+
+        let words = [
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0x7E06_0501, // v_readfirstlane_b32 s3, v1
+            0x7E08_0502, // v_readfirstlane_b32 s4, v2
+            0x8000_0402, // s_add_u32 s0, s2, s4
+            0x8001_0203, // s_add_u32 s1, s3, s2
+            0xBF84_0001, // s_cbranch_scc0 over the replacement of s2
+            0xBE82_0304, // s_mov_b32 s2, s4
+            0x8005_0402, // s_add_u32 s5, s2, s4
+            S_ENDPGM,
+        ];
+        let code: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let entry = &p.blocks[0].insts;
+        let s2 = entry[0].write(Reg::S(2)).unwrap();
+        let s3 = entry[1].write(Reg::S(3)).unwrap();
+        let s4 = entry[2].write(Reg::S(4)).unwrap();
+        let v1 = entry[0].read(Reg::V(1)).unwrap();
+        let v2 = entry[2].read(Reg::V(2)).unwrap();
+        let uses = Uses::new(&p);
+        assert_eq!(uses.first_lanes.get(&s2), Some(&v1));
+        assert_eq!(uses.first_lanes.get(&s3), Some(&v1));
+        assert_eq!(uses.first_lanes.get(&s4), Some(&v2));
+
+        let phi = p
+            .blocks
+            .iter()
+            .flat_map(|block| &block.phis)
+            .find(|phi| phi.reg == Reg::S(2))
+            .unwrap();
+        let readers: Vec<_> = uses.readers(s2).collect();
+        let [Reader::Inst(first), Reader::Inst(second), Reader::Phi(join)] = readers.as_slice()
+        else {
+            panic!("expected both adds and the join to read s2");
+        };
+        assert!(std::ptr::eq(*first, &entry[3]));
+        assert!(std::ptr::eq(*second, &entry[4]));
+        assert_eq!(*join, phi.value);
+        assert!(
+            uses.readers(phi.value).any(
+                |reader| matches!(reader, Reader::Inst(inst) if inst.write(Reg::S(5)).is_some())
+            )
+        );
+    }
 
     /// The blocks of `words` (a wave32 program) whose `s_barrier` loses its
     /// thread-group sync.
