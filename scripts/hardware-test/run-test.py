@@ -77,7 +77,10 @@ def console_name(console):
 def parse_request(data):
     request = json.loads(data)
     console = request.get("console", "series-x")
-    if (type(request["version"]) is not int or (request["version"], console) not in ((1, "series-x"), (2, "series-s"))
+    fresh_profile = request.get("fresh_profile", False)
+    version = 3 if fresh_profile else 2 if console == "series-s" else 1
+    if (type(fresh_profile) is not bool or console not in ("series-x", "series-s")
+            or type(request["version"]) is not int or request["version"] != version
             or type(request["pr"]) is not int or request["pr"] < 1
             or not isinstance(request["scenario"], str) or not request["scenario"].strip()
             or not request["scenario"].isprintable()):
@@ -862,7 +865,8 @@ def run_request(manifest, options):
     console = request.get("console", "series-x")
     print(f"VIctory PR #{request['pr']} | {console_name(console)} | two launches", flush=True)
     instruction_block(PRIVACY_HEADING, LOG_PRIVACY + " Your reports stay on this machine until you choose to share.")
-    if options.fresh_profile:
+    fresh_profile = options.fresh_profile or request.get("fresh_profile", False)
+    if fresh_profile:
         print("Each build will use its own empty, temporary player data directory.", flush=True)
     if options.plan:
         if binding:
@@ -901,7 +905,7 @@ def run_request(manifest, options):
         try:
             for number, side in enumerate(("main", "candidate"), start=1):
                 instruction_block(f"RUN {number} OF 2  |  {side.upper()}  |  WHAT TO DO", request["scenario"])
-                launch(side, Path(work) / side, title, results, windows, console, options.fresh_profile)
+                launch(side, Path(work) / side, title, results, windows, console, fresh_profile)
             complete = True
         finally:
             if any(results.glob("*.log")):
@@ -913,7 +917,7 @@ def run_request(manifest, options):
                         out.write(path, path.name)
                 heading = "REPORT READY" if complete else "TEST INTERRUPTED"
                 instruction_block(heading, "Keep this full troubleshooting archive on your machine.", f"Local logs: {bundle}")
-                report = diagnostic_summary(request, results, windows, complete, destination, options.fresh_profile)
+                report = diagnostic_summary(request, results, windows, complete, destination, fresh_profile)
                 summary_path = destination / "summary.txt"
                 summary_path.write_text(report, encoding="utf-8")
                 share = destination / "share"

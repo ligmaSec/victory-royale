@@ -74,7 +74,8 @@ runtime on first use.
 The checkout menu uses a signed-in GitHub CLI (`gh auth login`). Type the PR number
 shown in the menu, or press Enter to cancel. If a request includes a number, you
 can append it directly to the checkout command. Add `--plan` to preview the scenario
-and build revisions. For first-run scenarios, add `--fresh-profile` to give each
+and build revisions. First-run requests can require empty player data automatically.
+To select this mode yourself, add `--fresh-profile` to give each
 build its own empty player data directory. These temporary directories are removed
 after the test. For comparisons using an existing save, use the normal command.
 An extracted kit includes both builds and needs no GitHub login.
@@ -197,7 +198,8 @@ request against the copy pinned in its bundled runner.
 Run the [hardware kit workflow](../.github/workflows/hardware-request.yml) on
 `main` with the PR number, console profile (Series X by default), and a short scenario.
 Both builds use that profile. Specify where to start,
-what to observe and when to close each run. If someone else asked for the test,
+what to observe and when to close each run. Select **Start each build with empty player data**
+for first-run menus. The published request applies that setting when selected from the tester menu. If someone else asked for the test,
 have them comment on this PR with `/victory hardware-test` on its own first line
 followed by their scenario. Put that comment URL in **requester_comment** when
 dispatching. For your own request leave the field blank. The workflow then uses

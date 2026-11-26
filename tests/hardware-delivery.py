@@ -160,7 +160,7 @@ class RequestDelivery(unittest.TestCase):
         out = self.root / "kit.zip"
         build = {"run": 9, "revision": "f" * 40, "sha256": "0" * 64}
         pull = {"user": author, "head": {"sha": "c" * 40}, "base": {"ref": "main", "repo": {"full_name": keys.REPO}}}
-        args = ["prepare", "7", "--console", "series-s", "--scenario", "Observe.", "--output", str(out), "--published", "--requester-comment", comment]
+        args = ["prepare", "7", "--console", "series-s", "--fresh-profile", "--scenario", "Observe.", "--output", str(out), "--published", "--requester-comment", comment]
         with mock.patch.dict(os.environ, GITHUB_RUN_ID="812", GITHUB_ACTOR="publisher", GITHUB_ACTOR_ID="22"), \
                 mock.patch.object(sys, "argv", args), mock.patch.object(prepare, "api", return_value=pull), \
                 mock.patch.object(prepare, "find_build", side_effect=[(build, "base", b"one"),
@@ -173,7 +173,7 @@ class RequestDelivery(unittest.TestCase):
                 self.assertIn(name, kit.namelist())
         trusted = hashlib.sha256(data).hexdigest()
         request = json.loads(data)
-        self.assertEqual((request["version"], request["console"]), (2, "series-s"))
+        self.assertEqual((request["version"], request["console"], request["fresh_profile"]), (3, "series-s", True))
         self.assertEqual(request["delivery"]["requester"], keys.account(requester))
         manifest = self.root / "request.json"
         for modified in (dict(request, delivery={"requester": keys.account(publisher), "registration": None}),

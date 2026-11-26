@@ -241,6 +241,19 @@ class HardwareRequest(unittest.TestCase):
             with self.subTest(version=version, console=console), self.assertRaises(ValueError):
                 runner.parse_request(json.dumps(dict(self.request, version=version, console=console)))
 
+    def test_published_first_run_request_uses_empty_data_without_a_tester_flag(self):
+        shutil.copy(self.package, self.packages / (self.build["sha256"] + ".tar.gz"))
+        for console in ("series-s", "series-x"):
+            request = dict(self.request, version=3, fresh_profile=True, console=console)
+            self.manifest.write_text(json.dumps(request))
+            launches = []
+            self.run_pair(lambda side, folder, title, results, windows, selected, fresh:
+                          launches.append((side, selected, fresh)))
+            self.assertEqual(launches, [("main", console, True), ("candidate", console, True)])
+            for overrides in ({"version": 1}, {"version": 2}, {"fresh_profile": False}, {"fresh_profile": 1}):
+                with self.assertRaises(ValueError):
+                    runner.parse_request(json.dumps(dict(request, **overrides)))
+
     def test_fresh_pair_and_partial(self):
         self.request.update(version=2, console="series-s")
         self.manifest.write_text(json.dumps(self.request))

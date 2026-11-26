@@ -80,6 +80,7 @@ def prepare():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pr", type=int)
     parser.add_argument("--console", choices=("series-x", "series-s"), default="series-x")
+    parser.add_argument("--fresh-profile", action="store_true", help="require empty player data on both launches")
     parser.add_argument("--scenario", required=True, help="what to do in each run and when to close it")
     parser.add_argument("--output", required=True, type=Path, help="new request ZIP")
     parser.add_argument("--review-dir", type=Path, help="directory containing both native review executables")
@@ -102,6 +103,9 @@ def prepare():
     # Older runners hard-code Series X. They must decline a Series S kit.
     if args.console == "series-s":
         request.update(version=2, console=args.console)
+    # Older checkout runners must decline a kit that requires fresh data.
+    if args.fresh_profile:
+        request.update(version=3, console=args.console, fresh_profile=True)
     if binding:
         request["delivery"] = binding
         request["publication_run"] = int(os.environ["GITHUB_RUN_ID"])
