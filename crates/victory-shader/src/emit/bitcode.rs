@@ -504,7 +504,6 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
-    #[cfg(test)]
     pub(crate) fn has_dx_op(&self, name: &str, opcode: i64) -> bool {
         self.dx_op_count(name, opcode) != 0
     }

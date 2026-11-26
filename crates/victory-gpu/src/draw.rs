@@ -734,6 +734,16 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        self.bind_dispatch::<false>(list, p, compute, [0; 3])
+    }
+
+    fn bind_dispatch<const THREADS: bool>(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        compute: bool,
+        dims: [u32; 3],
+    ) -> bool {
         list.mark_work();
         self.depth_sampled = false;
         let l = &list.list;
@@ -813,6 +823,10 @@ impl State {
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
+                    if THREADS && u.root == victory_shader::emit::DISPATCH_THREADS {
+                        values[u.index as usize] = dims[u.dword as usize];
+                        continue;
+                    }
                     if u.indexed_buffer {
                         let selected =
                             self.user_value(compute, u.slot, RootType::Constants, u.dword);
@@ -1248,12 +1262,30 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    pub(crate) fn dispatch_mode<const THREADS: bool>(
+        &mut self,
+        list: &HostList,
+        x: u32,
+        y: u32,
+        z: u32,
+    ) {
+        let dims = [x, y, z];
+        #[cfg(feature = "diagnostics")]
+        let describe = || {
+            if THREADS {
+                format!("thread dispatch {x}x{y}x{z}")
+            } else {
+                format!("dispatch {x}x{y}x{z}")
+            }
+        };
+        if THREADS && dims.contains(&0) {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
-            self.frame_op(&format!("dispatch {x}x{y}x{z}"), true, false);
+            self.frame_op(&describe(), true, false);
             return;
         }
         let Some(p) = self.bound_pipeline(true) else {
@@ -1265,28 +1297,40 @@ impl State {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             #[cfg(feature = "diagnostics")]
-            self.frame_op(&format!("dispatch {x}x{y}x{z}"), true, false);
+            self.frame_op(&describe(), true, false);
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
             #[cfg(feature = "diagnostics")]
-            self.frame_op_why(
-                &format!("dispatch {x}x{y}x{z}"),
-                true,
-                false,
-                Some("a graphics pipeline"),
-            );
+            self.frame_op_why(&describe(), true, false, Some("a graphics pipeline"));
             return;
         }
-        if !self.bind(list, &p, true) {
+        let (p, [x, y, z]) = if THREADS {
+            let Some(plan) = crate::pipeline::host::thread_dispatch(self.pipeline as This, p, dims)
+            else {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                self.frame_op_why(
+                    &describe(),
+                    true,
+                    false,
+                    Some("invalid size or partial compute pipeline unavailable"),
+                );
+                return;
+            };
+            plan
+        } else {
+            (p, dims)
+        };
+        if !self.bind_dispatch::<THREADS>(list, &p, true, dims) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        list.note_op(|| self.op_text(describe(), true));
         #[cfg(feature = "diagnostics")]
-        self.frame_op(&format!("dispatch {x}x{y}x{z}"), true, true);
+        self.frame_op(&describe(), true, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -4228,6 +4272,7 @@ mod bindless_tests {
         };
 
         let gfx_srv_uav = HostPipeline {
+            compute_threads: None,
             structured_strides: Vec::new(),
             compute: false,
             mesh: false,
@@ -4246,6 +4291,7 @@ mod bindless_tests {
             name: "gfx_srv_uav".into(),
         };
         let gfx_srv_only = HostPipeline {
+            compute_threads: None,
             structured_strides: Vec::new(),
             compute: false,
             mesh: false,
@@ -4264,6 +4310,7 @@ mod bindless_tests {
             name: "gfx_srv_only".into(),
         };
         let compute_srv = HostPipeline {
+            compute_threads: Some([1; 3]),
             structured_strides: Vec::new(),
             compute: true,
             mesh: false,
