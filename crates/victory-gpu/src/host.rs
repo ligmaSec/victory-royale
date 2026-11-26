@@ -873,6 +873,8 @@ struct Deferred {
     /// address, bytes), and upload fills made since (destination, source,
     /// bytes): doing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Root constant uploads reusable until the next recorded title-memory write.
+    constant_snapshots: std::collections::HashMap<(u64, u64), u64>,
     /// Most detailed mip this list has copied for each texture.
     textures: std::collections::HashMap<usize, u32>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -884,6 +886,15 @@ struct Deferred {
     copy_gen: u64,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+}
+
+impl Deferred {
+    /// Subsequent reads of title memory must observe the recorded write.
+    fn title_written(&mut self) {
+        self.refreshed.clear();
+        self.constant_snapshots.clear();
+        self.copy_gen += 1;
+    }
 }
 
 impl Host {
@@ -1979,8 +1990,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
-        deferred.copy_gen += 1;
+        deferred.title_written();
     }
 
     /// Monotonic count of deferred title-memory copies recorded on this list
@@ -2002,6 +2012,21 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
+    }
+
+    /// The host address of an aligned snapshot of an unaligned root constant buffer.
+    pub(crate) fn snapshot_constants(&self, address: u64, len: u64) -> Option<u64> {
+        let key = (address, len);
+        if let Some(&gpu) = self.deferred().constant_snapshots.get(&key) {
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        let mut deferred = self.deferred();
+        deferred
+            .copies
+            .push(Step::Fill(to as usize, address as usize, len as usize));
+        deferred.constant_snapshots.insert(key, gpu);
+        Some(gpu)
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -2276,8 +2301,7 @@ impl HostList {
         self.mark_work();
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
-        deferred.refreshed.clear();
-        deferred.copy_gen += 1;
+        deferred.title_written();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -2794,6 +2818,84 @@ mod title_copies {
         assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
         assert!(to[2 * BLOCK..].iter().all(|&b| b == 7));
         release(holes);
+    }
+
+    #[test]
+    fn constant_snapshots_follow_title_writes_and_replay() {
+        let Some(host) = super::host() else {
+            eprintln!("skipping constant snapshot readback: needs D3D12");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let mut source = [1u8; 32];
+        let address = source.as_mut_ptr() as u64;
+        let updated = [2u8; 32];
+        let before = list.snapshot_constants(address, 32).unwrap();
+        let repeat = list.snapshot_constants(address, 32).unwrap();
+        let short = list.snapshot_constants(address, 16).unwrap();
+        list.defer_copy(source.as_mut_ptr(), updated.as_ptr(), updated.len());
+        let after = list.snapshot_constants(address, 32).unwrap();
+        list.defer(move || {
+            // SAFETY: source remains live and unused while the list runs.
+            unsafe { (address as *mut u8).write(3) };
+        });
+        let final_value = list.snapshot_constants(address, 32).unwrap();
+        list.close();
+
+        let read = |gpu| {
+            let scratch = list.scratch.lock().unwrap();
+            let (_, mapped, base) = scratch.chunks[0];
+            let offset = gpu - base;
+            assert!(offset < scratch.used);
+            // SAFETY: the list has completed and the offset is inside its mapped chunk.
+            unsafe { ((mapped + offset as usize) as *const u8).read() }
+        };
+        for initial in [1, 4] {
+            source[0] = initial;
+            host.execute(&[&list]);
+            assert_eq!([read(before), read(repeat), read(short)], [initial; 3]);
+            assert_eq!([read(after), read(final_value)], [2, 3]);
+        }
+        assert_ne!(before, short);
+        assert_eq!(
+            before, repeat,
+            "repeated constants share their scratch allocation"
+        );
+
+        list.reset();
+        source[0] = 5;
+        let next = list.snapshot_constants(address, 32).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(read(next), source[0]);
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn time_repeated_constant_snapshots() {
+        let Some(host) = super::host() else { return };
+        let list = host.new_list().unwrap();
+        const BYTES: usize = 1 << 16;
+        let source = vec![1u8; BYTES * 128];
+        for distinct in [1, 128] {
+            for frame in 0..65 {
+                let begin = std::time::Instant::now();
+                for bind in 0..128 {
+                    let offset = (bind % distinct) * BYTES;
+                    let address = source[offset..].as_ptr() as u64;
+                    std::hint::black_box(list.snapshot_constants(address, BYTES as u64).unwrap());
+                }
+                list.close();
+                host.execute(&[&list]);
+                list.reset();
+                if frame > 0 {
+                    eprintln!(
+                        "submission: {distinct} sources, {} us",
+                        begin.elapsed().as_micros()
+                    );
+                }
+            }
+        }
     }
 
     /// Host-owned staging (`title_dst = false`, `defer_fill`) still copies;
