@@ -3076,8 +3076,9 @@ fn keep_shown() -> bool {
 /// place of `new`, a view of another placed texture, until `new` is made:
 /// both textures (not buffers) and views of one dimension and format, and
 /// either the same resource description elsewhere (moved) or the same kind
-/// of texture with the same aspect in another size (a title that streams a
-/// texture in places it anew with more levels). Not another kind of texture:
+/// of texture with the same aspect, slices, samples and flags in another
+/// size (a title that streams a texture in places it anew with more
+/// levels). Not another kind of texture:
 /// what it would show is not this one's.
 fn can_stand_for(old: &View, new: &View) -> bool {
     let (View::Placed(false, a, from), View::Placed(false, b, to)) = (old, new) else {
@@ -3090,8 +3091,16 @@ fn can_stand_for(old: &View, new: &View) -> bool {
     if a[2..13] == b[2..13] {
         return true;
     }
+    // Another size of one texture keeps its depth or slices (word 7's low
+    // half), samples (9, 10) and flags (12): only its levels and size
+    // change. A texture of fewer slices standing for an array read nothing
+    // past them, black or cut away by its alpha test (walls and floors of a
+    // house gone while the title streamed it, run of 2026-11-26).
     let (wide, high) = ([a[4], b[4]].map(u64::from), [a[6], b[6]].map(u64::from));
     a[8] == b[8]
+        && a[7] & 0xffff == b[7] & 0xffff
+        && a[9..11] == b[9..11]
+        && a[12] == b[12]
         && !wide.contains(&0)
         && !high.contains(&0)
         && wide[0] * high[1] == wide[1] * high[0]
@@ -3607,6 +3616,40 @@ mod tests {
         };
         assert!(!can_stand_for(&old, &View::Placed(true, resource, desc)));
         assert!(!can_stand_for(&old, &View::Shader(0, None)));
+    }
+
+    /// A texture never stands for one of another size with other slices,
+    /// samples or flags: a single slice shown for an array reads nothing
+    /// past it (black, or cut away by an alpha test).
+    #[test]
+    fn a_texture_of_other_slices_never_stands_for_another() {
+        let texture = [3, 0, 0, 0, 512, 0, 256, 0x8_0001, 98, 1, 0, 0x105, 0, 0];
+        let view = |resource: [u32; 14], address: u32| {
+            let mut desc = [0u32; 16];
+            (desc[0], desc[1], desc[10], desc[11]) = (98, 5, address, 0xb);
+            View::Placed(false, resource, desc)
+        };
+        let old = view(texture, 0x1000_0000);
+        let mut twice = texture;
+        (twice[4], twice[6], twice[7]) = (1024, 512, 0x9_0001);
+        assert!(can_stand_for(&old, &view(twice, 0x2000_0000)));
+        let mut slices = twice;
+        slices[7] = 0x9_0040;
+        assert!(!can_stand_for(&old, &view(slices, 0x2000_0000)));
+        assert!(!can_stand_for(&view(slices, 0x1000_0000), &old));
+        let mut samples = twice;
+        samples[9] = 4;
+        assert!(!can_stand_for(&old, &view(samples, 0x2000_0000)));
+        let mut quality = twice;
+        quality[10] = 1;
+        assert!(!can_stand_for(&old, &view(quality, 0x2000_0000)));
+        let mut flags = twice;
+        flags[12] = 4;
+        assert!(!can_stand_for(&old, &view(flags, 0x2000_0000)));
+        // Another layout of one texture in another size still stands.
+        let mut layout = twice;
+        layout[11] = 0x104;
+        assert!(can_stand_for(&old, &view(layout, 0x2000_0000)));
     }
 
     /// The texture that stands for missing ones can be made and viewed.
