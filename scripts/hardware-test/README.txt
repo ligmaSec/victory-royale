@@ -1,4 +1,4 @@
-Run this Series X comparison
+Run this hardware comparison
 
 Extract the whole kit. Open a terminal in the folder containing this file.
 Use the command for your system.

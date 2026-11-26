@@ -23,7 +23,7 @@ World gameplay remains unplayable. On Windows a GPU hang can trigger a display
 driver reset. Use the diagnostics build with `VICTORY_D3D12_WARP=1` to
 investigate on the software adapter.
 
-Testing a pull request on Windows or Linux/Proton? The [interactive Series X test](docs/testing.md#run-a-series-x-hardware-test) runs both builds and gives you one ZIP to send back.
+Testing a pull request on Windows or Linux/Proton? The [interactive hardware test](docs/testing.md#run-a-hardware-test) runs both builds and gives you one ZIP to send back.
 
 ## Run on Linux
 

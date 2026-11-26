@@ -160,7 +160,7 @@ class RequestDelivery(unittest.TestCase):
         out = self.root / "kit.zip"
         build = {"run": 9, "revision": "f" * 40, "sha256": "0" * 64}
         pull = {"user": author, "head": {"sha": "c" * 40}, "base": {"ref": "main", "repo": {"full_name": keys.REPO}}}
-        args = ["prepare", "7", "--scenario", "Observe.", "--output", str(out), "--published", "--requester-comment", comment]
+        args = ["prepare", "7", "--console", "series-s", "--scenario", "Observe.", "--output", str(out), "--published", "--requester-comment", comment]
         with mock.patch.dict(os.environ, GITHUB_RUN_ID="812", GITHUB_ACTOR="publisher", GITHUB_ACTOR_ID="22"), \
                 mock.patch.object(sys, "argv", args), mock.patch.object(prepare, "api", return_value=pull), \
                 mock.patch.object(prepare, "find_build", side_effect=[(build, "base", b"one"),
@@ -173,6 +173,7 @@ class RequestDelivery(unittest.TestCase):
                 self.assertIn(name, kit.namelist())
         trusted = hashlib.sha256(data).hexdigest()
         request = json.loads(data)
+        self.assertEqual((request["version"], request["console"]), (2, "series-s"))
         self.assertEqual(request["delivery"]["requester"], keys.account(requester))
         manifest = self.root / "request.json"
         for modified in (dict(request, delivery={"requester": keys.account(publisher), "registration": None}),
@@ -183,7 +184,7 @@ class RequestDelivery(unittest.TestCase):
             self.assertIn("Private delivery unavailable for this request.", report.getvalue())
         run = dict(path=".github/workflows/hardware-request.yml", head_branch="main", event="workflow_dispatch",
                    conclusion="success", head_repository={"full_name": keys.REPO})
-        artifact = {"name": "victory-series-x-pr-7", "digest": "sha256:" + runner.digest(out)}
+        artifact = {"name": "victory-series-s-pr-7", "digest": "sha256:" + runner.digest(out)}
         with mock.patch.object(keys, "github", side_effect=[run, {"artifacts": [artifact]}, run, {"artifacts": [artifact]}]):
             self.assertTrue(runner.official_archive(out, request))
             with zipfile.ZipFile(out, "a") as zip_out:
@@ -305,7 +306,7 @@ class RequestDelivery(unittest.TestCase):
         # Replacing both fields with a different legitimate account must fail too.
         # Exercise the extracted runner through its normal argument parsing and results menu.
         build = {"run": 712, "revision": "a" * 40, "sha256": "b" * 64}
-        original = {"version": 1, "pr": 7, "scenario": "Observe.", "delivery": binding,
+        original = {"version": 2, "console": "series-s", "pr": 7, "scenario": "Observe.", "delivery": binding,
                     "main": build, "candidate": build}
         manifest = self.root / "request.json"
         manifest.write_text(json.dumps(original), encoding="utf-8")
@@ -314,7 +315,8 @@ class RequestDelivery(unittest.TestCase):
         manifest.write_text(json.dumps(changed), encoding="utf-8")
         title = self.root / "fixture.exe"
         title.touch()
-        def launch(side, folder, game, results, windows):
+        def launch(side, folder, game, results, windows, console):
+            self.assertEqual(console, "series-s")
             (results / (side + ".log")).write_text("synthetic run")
         def menu(title, context, lines, actions, default, cancel):
             self.assertEqual(title, "Hardware test results")

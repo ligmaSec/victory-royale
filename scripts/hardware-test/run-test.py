@@ -1,4 +1,4 @@
-"""Find and run a Series X hardware comparison for VIctory. Python 3.9+."""
+"""Find and run a hardware comparison for VIctory. Python 3.9+."""
 import argparse
 from collections import Counter
 import csv
@@ -70,9 +70,15 @@ def read_request(path):
     return parse_request(path.read_bytes())
 
 
+def console_name(console):
+    return {"series-x": "Series X", "series-s": "Series S"}[console]
+
+
 def parse_request(data):
     request = json.loads(data)
-    if (request["version"] != 1 or type(request["pr"]) is not int or request["pr"] < 1
+    console = request.get("console", "series-x")
+    if (type(request["version"]) is not int or (request["version"], console) not in ((1, "series-x"), (2, "series-s"))
+            or type(request["pr"]) is not int or request["pr"] < 1
             or not isinstance(request["scenario"], str) or not request["scenario"].strip()
             or not request["scenario"].isprintable()):
         raise ValueError("Unrecognized test request.")
@@ -135,22 +141,22 @@ def choose_title():
     return Path(chosen).expanduser()
 
 
-def launch(side, folder, title, results, windows):
+def launch(side, folder, title, results, windows, console="series-x"):
     env = os.environ.copy()
     # Ignore a developer override that could silently substitute a different build.
     env.pop("VICTORY_EXE", None)
     env["VICTORY_TRACE_PIPELINES"] = "1"
     cache = folder / "cache"
     env["VICTORY_CACHE_DIR"] = str(cache) if windows else "Z:" + str(cache).replace("/", "\\")
-    args = [str(title), "--console", "series-x"]
+    args = [str(title), "--console", console]
     if windows:
-        command = [str(folder / "victory.exe"), "run", str(title), "--execute", "--console", "series-x"]
+        command = [str(folder / "victory.exe"), "run", str(title), "--execute", "--console", console]
     else:
         env.update(VKD3D_SHADER_CACHE_PATH=str(folder / "vkd3d"), DXVK_STATE_CACHE_PATH=str(folder / "dxvk"))
         command = ["bash", str(folder / "victory-proton.sh"), "--report", "--runtime", "pinned", *args]
-    console = results / (side + ".log")
+    log_path = results / (side + ".log")
     report = None
-    with console.open("wb") as log, subprocess.Popen(command, cwd=title.parent, env=env,
+    with log_path.open("wb") as log, subprocess.Popen(command, cwd=title.parent, env=env,
                                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
         with process.stdout:
             for line in process.stdout:
@@ -199,7 +205,7 @@ def hardware_requests(number):
         artifacts = github_rows(f"actions/runs/{run_id}/artifacts?per_page=100",
                                 '.artifacts[] | select(.expired == false) | {name}')
         for artifact in artifacts:
-            match = re.fullmatch(r"victory-series-x-pr-([1-9][0-9]*)", artifact["name"])
+            match = re.fullmatch(r"victory-series-[xs]-pr-([1-9][0-9]*)", artifact["name"])
             if match:
                 pr = int(match[1])
                 if pr in open_prs and pr not in available:
@@ -216,9 +222,9 @@ def select_published(number, list_only, folder):
     available = hardware_requests(number)
     if number is None:
         if not available:
-            print("There are no open Series X hardware test requests.")
+            print("There are no open hardware test requests.")
             return None
-        print("Series X hardware test requests:")
+        print("Hardware test requests:")
         for pr, (pull, run_id, _) in sorted(available.items()):
             status = "kit available" if run_id else f"see request at https://github.com/{REPO}/pull/{pr}"
             print(f"  #{pr}  {pull['title']}  [{status}]")
@@ -238,7 +244,7 @@ def select_published(number, list_only, folder):
         print(f"PR #{number} is looking for testers. See https://github.com/{REPO}/pull/{number}")
         print("This request has no unexpired kit published from main.")
         return None
-    print(f"Downloading the Series X test for PR #{number}…", flush=True)
+    print(f"Downloading the hardware test for PR #{number}…", flush=True)
     subprocess.run(["gh", "run", "download", str(run_id), "-R", "github.com/" + REPO, "-n", artifact, "-D", str(folder)],
                    check=True)
     manifest = folder / "request.json"
@@ -247,6 +253,9 @@ def select_published(number, list_only, folder):
     request = read_request(manifest)
     if request["pr"] != number:
         raise ValueError("The published kit names a different PR.")
+    expected = f"victory-{request.get('console', 'series-x')}-pr-{number}"
+    if artifact != expected:
+        raise ValueError("The published kit names a different console profile.")
     parents = github_rows("git/commits/" + request["candidate"]["revision"], ".parents[] | {sha}")
     if [parent["sha"] for parent in parents] != [request["main"]["revision"], pull["head"]]:
         raise ValueError(f"PR #{number} changed after this kit was built. Ask the requester to publish a fresh kit.")
@@ -265,7 +274,7 @@ def official_archive(path, request):
                 or run["conclusion"] != "success"):
             return False
         expected = "sha256:" + digest(path)
-        name = f"victory-series-x-pr-{request['pr']}"
+        name = f"victory-{request.get('console', 'series-x')}-pr-{request['pr']}"
         artifacts = report_keys.github(prefix + f"runs/{run_id}/artifacts")["artifacts"]
         return any(a["name"] == name and a["digest"] == expected for a in artifacts)
     except (OSError, ValueError, KeyError, subprocess.SubprocessError):
@@ -292,7 +301,7 @@ def unpack_kit(path, folder, plan):
 def run():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("request", nargs="?", help="PR number, test kit ZIP or request JSON")
-    parser.add_argument("--list", action="store_true", help="list Series X hardware test requests")
+    parser.add_argument("--list", action="store_true", help="list hardware test requests")
     parser.add_argument("--output-dir", type=Path, help="parent directory for the unique report")
     parser.add_argument("--plan", action="store_true", help="preview the selected test without launching")
     parser.add_argument("--title", type=Path, help="use this executable instead of the file chooser")
@@ -528,7 +537,7 @@ def side_metrics(results, side, windows, frame_log, submission_log, timeline):
 
 def diagnostic_summary(request, results, windows, complete, destination):
     shader_ids = {}
-    rows = [f"Series X hardware test | PR #{request['pr']} | " + ("Windows" if windows else "Linux/Proton"),
+    rows = [f"{console_name(request.get('console', 'series-x'))} hardware test | PR #{request['pr']} | " + ("Windows" if windows else "Linux/Proton"),
             "Comparison completed" if complete else "Partial comparison",
             "Timings cover all recorded phases, including menus."]
     for side in ("main", "candidate"):
@@ -710,8 +719,8 @@ def report_overview(summary):
     return rows
 
 
-def share_result(pr, filtered, kit, binding=None):
-    context = f"Series X  ·  PR #{pr}"
+def share_result(pr, filtered, kit, binding=None, console="series-x"):
+    context = f"{console_name(console)}  ·  PR #{pr}"
     with zipfile.ZipFile(filtered) as archive:
         initial = archive.read("summary.txt").decode("utf-8") if "summary.txt" in archive.namelist() else ""
     if not sys.stdin.isatty():
@@ -841,7 +850,8 @@ def run_request(manifest, options):
     data = manifest.read_bytes()
     request = parse_request(data)
     binding = request.get("delivery") if hashlib.sha256(data).hexdigest() == options.trusted_digest else None
-    print(f"VIctory PR #{request['pr']} | Series X | two launches", flush=True)
+    console = request.get("console", "series-x")
+    print(f"VIctory PR #{request['pr']} | {console_name(console)} | two launches", flush=True)
     instruction_block(PRIVACY_HEADING, LOG_PRIVACY + " Your reports stay on this machine until you choose to share.")
     if options.plan:
         if binding:
@@ -880,7 +890,7 @@ def run_request(manifest, options):
         try:
             for number, side in enumerate(("main", "candidate"), start=1):
                 instruction_block(f"RUN {number} OF 2  |  {side.upper()}  |  WHAT TO DO", request["scenario"])
-                launch(side, Path(work) / side, title, results, windows)
+                launch(side, Path(work) / side, title, results, windows, console)
             complete = True
         finally:
             if any(results.glob("*.log")):
@@ -903,7 +913,7 @@ def run_request(manifest, options):
                         # Fixed ZIP metadata avoids recording local times or file modes.
                         entry = zipfile.ZipInfo(name)
                         out.writestr(entry, (destination / name).read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
-                share_result(request["pr"], filtered, options.review_kit, binding)
+                share_result(request["pr"], filtered, options.review_kit, binding, console)
 
 
 if __name__ == "__main__":
