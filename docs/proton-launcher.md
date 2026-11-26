@@ -39,6 +39,10 @@ the checkout. Pass the Linux path to the title executable to the launcher.
 ./scripts/victory-proton.sh --run "/path/to/game/title.exe"
 ```
 
+At startup, `victory.exe run` prints the active Proton build in the terminal,
+including when UMU selects it automatically. This also works when starting
+the executable directly through Proton. No diagnostic logging is required.
+
 Pass the title path alone to check mapping and import binding first.
 Invocations without a mode, including the original `TITLE.exe --execute`,
 use Proton's libraries by default. The launcher
