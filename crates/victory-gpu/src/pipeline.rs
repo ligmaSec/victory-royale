@@ -287,19 +287,29 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
         .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
 }
 
-/// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
-/// stays in the host's copies and is not copied back into title memory. A
-/// check for a first run of the whole builder: a stage that stores where
-/// it should not can then not reach the title's own objects (run 98), and
-/// the programs that walk the structures read the host's copies anyway.
-/// shortcut: not a way to run: the title also reads results back (sizes,
-/// counters) and gets none, and a copy's pages are overwritten from title
-/// memory when the title writes them.
+/// Keeps what the structure builder's stages store in the host's copies
+/// instead of copying it back into title memory. On by default: a full
+/// builder run with its writes copied back ends in a null read in the
+/// title's image DLL, while a run with them kept out finishes without a
+/// crash. The programs that walk the structures read the host's copies
+/// anyway.
+/// `VICTORY_BVH_QUARANTINE=0` opts back into copying builder writes into
+/// title memory. shortcut: not a way to run either way — the title reads
+/// results back (sizes, counters) and gets none from the quarantine, and a
+/// copy's pages are overwritten from title memory when the title writes
+/// them.
+#[cfg(windows)]
+fn quarantine_writes(value: Option<&std::ffi::OsStr>) -> bool {
+    !matches!(value, Some(v) if v == "0")
+}
+
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     is_builder(this)
-        && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+        && *ON.get_or_init(|| {
+            quarantine_writes(std::env::var_os("VICTORY_BVH_QUARANTINE").as_deref())
+        })
 }
 
 /// Whether the structure builder may run at all (`VICTORY_BVH_BUILDER=1`).
@@ -793,6 +803,17 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn builder_writes_are_quarantined_unless_opted_out() {
+        use std::ffi::OsStr;
+
+        assert!(super::quarantine_writes(None));
+        assert!(super::quarantine_writes(Some(OsStr::new("1"))));
+        assert!(super::quarantine_writes(Some(OsStr::new(""))));
+        assert!(!super::quarantine_writes(Some(OsStr::new("0"))));
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
