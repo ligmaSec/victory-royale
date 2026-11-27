@@ -6004,15 +6004,15 @@ mod world_capture_tests {
         crate::descriptor::create_rtv(std::ptr::null(), target.0, std::ptr::null(), handle);
         let rtv = host.rtv(crate::resource::host_resource(target.0), None);
         let mut state = State::default();
+        // Use distinct 8-bit color codes, not values on UNORM rounding ties.
+        let red = |frame: u64| (frame * 16) as u8;
         for frame in 1..=11 {
             let list = host.new_list().unwrap();
             state.set_targets(&list, &[handle], 0);
             state.set_targets(&list, &[handle], 0);
+            let color = [f32::from(red(frame)) / 255.0, 0.0, 1.0, 1.0];
             // SAFETY: the open list has a live RTV in render-target state.
-            unsafe {
-                list.list
-                    .ClearRenderTargetView(rtv, &[frame as f32 / 16.0, 0.0, 1.0, 1.0], None)
-            };
+            unsafe { list.list.ClearRenderTargetView(rtv, &color, None) };
             list.close();
             host.execute(&[&list]);
             if frame == 3 {
@@ -6021,9 +6021,18 @@ mod world_capture_tests {
             assert_eq!(crate::queue::present_test_frame(), crate::object::S_OK);
         }
         let folder = crate::capture::folder().unwrap();
-        assert_eq!(std::fs::read_dir(folder).unwrap().count(), 4);
+        let dumps = std::fs::read_dir(folder)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| {
+                std::path::Path::new(&entry.file_name())
+                    .extension()
+                    .is_some_and(|extension| extension == "png")
+            })
+            .count();
+        assert_eq!(dumps, 4);
         for frame in [5, 8, 9, 10] {
-            let expected = [((frame * 255 + 8) / 16) as u8, 0, 255, 255].repeat(16);
+            let expected = [red(frame), 0, 255, 255].repeat(16);
             crate::capture::save(frame, 4, 4, 16, false, &expected);
             let dumped = folder.join(format!("frame-{frame}-00-{:?}-4x4-f28.png", target.0));
             let reference = folder.join(format!("frame-{frame}.png"));
