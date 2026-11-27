@@ -1200,6 +1200,7 @@ enum Outcome {
 
 fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
     let mut ok = true;
+    let mut boundary = None;
     ops.retain_mut(|op| {
         let there = physical
             .views
@@ -1215,16 +1216,22 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
                 }
                 victory_gpu::title_memory_unmapping(base, PAGE);
             }
-            Some(_) if !unmap(physical, op.at, PAGE) => {
-                ok = false;
-                return false;
+            Some(_) => {
+                // Unmapping and restoring parts of a larger view can
+                // change the boundaries just seen.
+                boundary = None;
+                if !unmap(physical, op.at, PAGE) {
+                    ok = false;
+                    return false;
+                }
             }
-            _ => {}
+            None => {}
         }
         if op.old.is_none() && op.slice.is_some() {
             // Two workers must not split the same placeholder concurrently.
-            split_at(op.at);
-            split_at(op.at + PAGE);
+            boundary = split_page(op.at, boundary, split_at);
+        } else {
+            boundary = None;
         }
         true
     });
@@ -1470,26 +1477,43 @@ fn placeholder(at: usize) -> Option<(usize, usize)> {
     })
 }
 
+/// Adjacent scatter pages share a boundary. While the mapping lock is
+/// held, the next page need not ask again after a confirmed boundary.
+fn split_page(
+    at: usize,
+    boundary: Option<usize>,
+    mut split: impl FnMut(usize) -> bool,
+) -> Option<usize> {
+    if boundary != Some(at) {
+        split(at);
+    }
+    split(at + PAGE).then_some(at + PAGE)
+}
+
 /// Splits the placeholder holding `at` in two there, if it starts below.
+/// Returns true if `at` was already a reservation base or the split succeeded.
 /// The same call frees reserved memory that replaced a placeholder back to
 /// one, committed pages and all, so everything below `at` in it must be
 /// reserved: nothing committed is ever freed here.
-fn split_at(at: usize) {
-    if let Some((start, _)) = placeholder(at)
-        && start < at
-        && placeholder(start).is_some_and(|(_, stop)| stop >= at)
-    {
+fn split_at(at: usize) -> bool {
+    let Some((start, _)) = placeholder(at) else {
+        return false;
+    };
+    if start == at {
+        return true;
+    }
+    if start < at && placeholder(start).is_some_and(|(_, stop)| stop >= at) {
         // SAFETY: `[start, at)` is reserved and holds no data; the host
-        // fails the call on anything but a placeholder or memory that
-        // replaced one, and then changes nothing.
-        unsafe {
+        // fails on anything but a placeholder or memory that replaced one.
+        return unsafe {
             VirtualFree(
                 start as *mut c_void,
                 at - start,
                 MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
             )
-        };
+        } != 0;
     }
+    false
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
@@ -1907,6 +1931,22 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    #[test]
+    fn adjacent_scatter_pages_recheck_only_unconfirmed_boundaries() {
+        let mut calls = Vec::new();
+        let mut split = |at| {
+            calls.push(at);
+            at != 3 * PAGE
+        };
+        let first = split_page(PAGE, None, &mut split);
+        assert_eq!(first, Some(2 * PAGE));
+        let second = split_page(2 * PAGE, first, &mut split);
+        assert_eq!(second, None);
+        let third = split_page(3 * PAGE, second, &mut split);
+        assert_eq!(third, Some(4 * PAGE));
+        assert_eq!(calls, [PAGE, 2 * PAGE, 3 * PAGE, 3 * PAGE, 4 * PAGE]);
     }
 
     /// A scatter of pages at consecutive addresses maps each one:
