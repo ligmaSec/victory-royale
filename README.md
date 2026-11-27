@@ -13,7 +13,7 @@ it can and on first use where it must (shaders). See
 
 The Windows executable can also be launched under Proton on x86-64 Linux. See
 [Running with the Proton launcher](docs/proton-launcher.md). Builds and checksums are
-available from [successful main CI runs](docs/testing.md#ci-and-build-downloads).
+available from [successful main CI runs that package a build](docs/testing.md#ci-and-build-downloads).
 
 ## Status
 
@@ -23,12 +23,12 @@ World gameplay remains unplayable. On Windows a GPU hang can trigger a display
 driver reset. Use the diagnostics build with `VICTORY_D3D12_WARP=1` to
 investigate on the software adapter.
 
-Testing a pull request on Windows or Linux/Proton? The [interactive hardware test](docs/testing.md#run-a-hardware-test) runs both builds and gives you one ZIP to send back.
+Testing a pull request on Windows or Linux/Proton? The [interactive hardware test](docs/testing.md#run-a-hardware-test) runs both builds from separate copies of your own standard `7952987A` save. It keeps the raw logs local and lets you review a filtered ZIP before sharing.
 
 ## Run on Linux
 
-Install UMU (`umu-run`) and extract the verified Proton build from a successful
-`main` CI run. From the extracted `victory` directory, choose one command.
+Install UMU (`umu-run`) and extract the verified Proton build from a packaging
+run on `main`. From the extracted `victory` directory, choose one command.
 
 ```sh
 ./victory-proton.sh --test                                # check the launcher offline
@@ -48,11 +48,19 @@ then the same commands with `./scripts/victory-proton.sh`.
 ## Getting started
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`). On x86-64 Linux, follow the
+shader model 6.6 and resource binding tier 3 for menus, plus mesh shaders
+for the world. Building from source also requires the Rust toolchain pinned in
+`rust-toolchain.toml`. On x86-64 Linux, follow the
 [Proton guide](docs/proton-launcher.md) to build and launch the Windows executable.
 
-Clone the repository and run the remaining commands from the checkout.
+With an [extracted CI build](docs/testing.md#ci-and-build-downloads), open
+PowerShell in the folder containing `victory.exe` and run:
+
+```powershell
+.\victory.exe run 'D:\Xbox Games\Title\title.exe' --execute
+```
+
+To build from source, clone the repository and run the remaining commands from the checkout.
 
 ```sh
 git clone https://github.com/ligmaSec/victory-royale.git
@@ -72,8 +80,8 @@ the Windows paging file size, then retry.
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace -- --test-threads=1 # serializes D3D12 tests; no game data
+copy victory.example.toml victory.toml   # optional: customize paths outside the repo
+cargo test --workspace --locked -- --test-threads=1 # serializes D3D12 tests; no game data
 cargo run -p victory -- config           # check your paths
 ```
 
@@ -91,7 +99,7 @@ display modes VIctory advertises through DXGI. To use the lower-resolution
 profile, pass `--console series-s` when starting the title:
 
 ```powershell
-target\release\victory.exe run <game dir>\<the title's exe> --execute --console series-s
+.\target\release\victory.exe run 'D:\Xbox Games\Title\title.exe' --execute --console series-s
 ```
 
 Series S lowers the scene resolution and can reduce memory usage. The UI
@@ -128,8 +136,14 @@ victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
 victory config
 ```
 
+All commands accept `--diagnostic-jsonl FILE` to write structured diagnostics
+to a new file outside the checkout.
+
 `translate --jobs N` requires a positive worker count. Omit it to use the
-default worker count.
+available parallelism (four workers if it cannot be determined). On Windows,
+`--validate` loads the DXIL validator and `--pipelines` creates host D3D12
+pipelines. For a private offline dump, create a directory outside the checkout
+and set `VICTORY_EMIT_DUMP` to that path before running `translate --list`.
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
@@ -152,24 +166,28 @@ If a hash differs, restore that file from your verified backup and rerun with
 the same build of VIctory and the same options. A breakpoint can have other
 causes. Include the archive verification outcome in your test report.
 
-A release build has no debugging aids. Build them in with
+Release builds include crash reporting and info-level logging. To enable
+debug and trace logging, frame captures, and GPU diagnostics, build with
 
 ```powershell
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
 ```
 
-The on/off switches below (`...=1`) are off when unset or set to `0`.
+Unset a diagnostic override to return to its default. Choose paths outside the
+checkout for captures and dumps.
 
 | Variable | Effect |
 |----------|--------|
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
+| `VICTORY_PROFILE=<ms>` | sample busy threads at the specified interval and log per-thread CPU time and stack samples |
+| `VICTORY_TRACE_PIPELINES=1` | log shader identities and the compiling thread in release builds too. Diagnostics adds the host pipeline name |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_CAPTURE_WORLD=1` | with `VICTORY_CAPTURE`, also saves the first frame that ran at least 500 draws and the frames two and six presents later. The log identifies the first frame |
+| `VICTORY_CAPTURE=<dir>` | saves power-of-two presented frames plus any listed in `VICTORY_CAPTURE_FRAMES=<list>` |
+| `VICTORY_CAPTURE_WORLD=1` | with `VICTORY_CAPTURE`, also saves the first frame that ran at least 500 draws and the frames two and six presents later. Check the image to identify the scene |
 | `VICTORY_DUMP_TARGETS=1` | with `VICTORY_CAPTURE`, saves supported targets bound or written on explicitly listed frames and the two `VICTORY_CAPTURE_WORLD` follow-ups |
 | `VICTORY_SHOW_TARGET=2560x1440-f28` | shows the last render target of that size and DXGI format each frame instead of the title's frame (copied 1:1 to the top left, only when its format matches the window's), e.g. the world's geometry while its lit image is black |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
@@ -183,21 +201,22 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_SKIP_WAVE64=mesh,compute` | omit draws and dispatches whose pipeline has a program of a listed stage written for 64-lane waves (on hosts with 32-lane waves, such as NVIDIA's, these can hang the GPU) |
 | `VICTORY_SLOT67_HR=<name>` | what the device's `DeserializeComputePipelineStateX` (slot 67, used by the AMD upscaler with GFX10 compute programs we do not translate) returns: `E_FAIL` (the default, also without this build), `E_INVALIDARG`, `E_NOTIMPL` or `S_OK` (a pipeline whose dispatches are dropped); the title's reaction to each shows whether it has a fallback |
 | `VICTORY_FSPX_REJECT_SLOT62=1` | fail `CreateComputePipelineStateX` (slot 62) with `E_FAIL` for FSPX compute modules instead of making a pipeline whose dispatches are dropped |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
+| `VICTORY_GPU_TIMING=1` | times each submission list separately. Enable `VICTORY_D3D12_DRED=1` to record command detail for slow lists |
 | `VICTORY_WAIT_TIMEOUT_MS=<ms>` | override the 2000 ms fail-open timeout for mid-list GPU memory waits |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_ADAPTER=<name>` | select a D3D12 adapter by case-insensitive substring (default: the first GPU, in high-performance order, with shader model 6.6, resource binding tier 3 and mesh shaders; the log says what is missing when none has all three) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_SHADER_OPT=<bits>` | which clean-up passes run over each translated shader (own shader cache entries): `0` none, 1 dead code, 2 constants and identities, 4 reuse of values, 8 branch facts, 16 loads within a block; unset runs all. Every pass is exact, so a fault that goes away with `0` is in a pass |
+| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); lowering the limit changes shader execution, so check the rendered result alongside frame times |
+| `VICTORY_ROOT_SRV_DIRECT=1` | use direct root shader-resource views in place of bounded views. Unset to restore the bounds (even `0` selects direct views) |
+| `VICTORY_SHADER_OPT=<bits>` | which clean-up passes run over each translated shader (own shader cache entries): `0` none, 1 dead code, 2 constants and identities, 4 reuse of values, 8 branch facts, 16 loads within a block; unset runs all. If a failure changes with `0`, vary the pass bits to isolate a reproducer |
 | `VICTORY_ALIAS_COPY=0` | views the title places in the memory of a texture the host writes are filled from title memory again instead of copied from that texture on the host |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 | `VICTORY_NO_WATCHDOG=1` | apply the opt-in title watchdog disarm hooks (Series 1.0.2.1) |
 | `VICTORY_SKIP_CPU_CHECK=1` | skip the AVX2 pre-flight check before `--execute` (for CPU emulators such as Intel SDE) |
-| `VICTORY_PAD_LOG=1` | log DualSense / HID pad discovery and reports |
-| `VICTORY_COPY_MODE=plain` | copy title GPU memory without the timed/stats path used for the frame-rate line |
+| `VICTORY_PAD_LOG=1` | log changes in DualSense HID readings. Unset to disable this extra output (even `0` enables it) |
+| `VICTORY_COPY_MODE=plain` | use plain copies for timing experiments. The default guards against unmapped pages |
 | `VICTORY_WARP=1` | force the shader-test host device onto WARP (distinct from `VICTORY_D3D12_WARP`) |
-| `VICTORY_SAVE_STOP=<n>` | test helper: hang the process at save step `n` (used by crash-survival tests) |
+| `VICTORY_SAVE_STOP=<n>` | test harness only: stop the crash-survival test child at save step `n` |
 
 Every build appends unhandled exceptions, panics, and host GPU failures to
 `crashes.log` in the title's data folder.
@@ -224,11 +243,11 @@ preceding messages across the two runs.
 A host device removal, a hang, or a frame that comes out wrong is much easier
 to place with these next to it:
 
-* the adapter and the driver, as the title's own window sees them (GPU model,
-  the Adrenalin or GeForce version, and the Windows build number - a driver
-  update between two reports changes what is worth comparing);
-* whether `VICTORY_D3D12_WARP=1` reproduces it: a failure that survives the
-  software adapter is ours, one that does not points at the driver;
+* the GPU selected in the host log, driver version and OS build. For Linux
+  include the Vulkan driver and Proton build.
+* on Windows, whether the same failure occurs with the diagnostics build on
+  WARP. Include the last stage reached on each adapter. A hardware-only
+  failure can also come from a host-specific path in VIctory.
 * the last lines of `crashes.log`, which name the faulting code and the
   commands in flight when `VICTORY_D3D12_DRED=1` was set;
 * the variables from the table above that were set for the run, and the build

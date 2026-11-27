@@ -3,13 +3,14 @@
 The native Linux CLI can inspect files and translate shaders. Running the
 title uses the Windows executable under Proton. The launch path requires
 x86-64 Linux, an AVX2 CPU, UMU, and a Vulkan driver that exposes Shader
-Model 6.6 through vkd3d-proton. World rendering also needs mesh shaders.
+Model 6.6 and D3D12 resource binding tier 3 through vkd3d-proton. World
+rendering also needs mesh shaders.
 
 ## Build on Linux
 
 Install Rust with rustup, a native C toolchain, and the x86-64 Linux UCRT
 distribution of LLVM-MinGW. Put its `bin` directory first on `PATH`.
-To embed the three GPU helper shaders, install the Linux DirectX Shader
+To embed the GPU helper shaders, install the Linux DirectX Shader
 Compiler (`dxc`). The build command uses `dxc` on `PATH` or the compiler
 selected by `VICTORY_BUILD_DXC`. Run the following from the checkout.
 [LLVM-MinGW releases](https://github.com/mstorsjo/llvm-mingw/releases) ·
@@ -23,7 +24,8 @@ rustup target add x86_64-pc-windows-gnullvm
 The launcher finds the release executable in the Cargo target directory.
 If you build without Linux DXC, leave `VICTORY_BUILD_DXC` unset. Supply
 Windows `dxcompiler.dll` and `dxil.dll` beside `victory.exe` if Wine's HLSL
-compiler rejects the helper shaders on startup.
+compiler rejects a helper shader. `VICTORY_DXC` can also point to the
+Windows compiler DLL or its directory.
 
 An existing x64 MSVC build also works with the launcher. With `cargo-xwin`,
 LLVM, and the MSVC Rust target installed, build one using
@@ -39,19 +41,22 @@ the checkout. Pass the Linux path to the title executable to the launcher.
 ./scripts/victory-proton.sh --run "/path/to/game/title.exe"
 ```
 
-At startup, `victory.exe run` prints the active Proton build in the terminal,
-including when UMU selects it automatically. This also works when starting
-the executable directly through Proton. No diagnostic logging is required.
+At startup, `victory.exe run` prints `Proton version:` when it recognizes the
+active Proton installation, including one selected by UMU. The label is
+`unavailable` if the version file in a recognized installation cannot be read
+or parsed. Direct launches through Proton use the same detection. In
+`--report` mode look for the line in `launcher.log`.
 
 Pass the title path alone to check mapping and import binding first.
 Invocations without a mode, including the original `TITLE.exe --execute`,
 use Proton's libraries by default. The launcher
-forwards other `victory run` options and arguments after `--`. To select a
+reads launcher options before the title path. Put `victory run` options such
+as `--console series-s` after the path and title arguments after `--`. To select a
 specific build, set `VICTORY_EXE` to its Linux path. By default the launcher
 looks beside itself for `victory.exe`, then under `${CARGO_TARGET_DIR:-target}`
 for the gnullvm and MSVC release builds, in that order.
 
-On first launch UMU fetches Proton and the Steam Linux Runtime. The default
+On first use, UMU may need to download its runtime and a Proton build. The default
 prefix is `${XDG_DATA_HOME:-$HOME/.local/share}/victory/proton`, and the
 default `GAMEID` is `umu-victory`. Set `WINEPREFIX`, `GAMEID` or `PROTONPATH`
 to override them. Use Windows paths in `victory.toml`.
@@ -59,9 +64,9 @@ to override them. Use Windows paths in `victory.toml`.
 The launcher searches `$XDG_DATA_HOME/Steam`, `$HOME/.steam/steam` and
 `$HOME/.local/share/Steam` for Proton Experimental. It uses the first install
 with an executable `steamapps/common/Proton - Experimental/proton`. An explicit
-`PROTONPATH` takes precedence. The launcher recognises Experimental at that path
-when its `version` file contains `experimental-` and it uses a `steamapps/common`
-layout. It gives UMU Unix paths and sets `STEAM_COMPAT_LIBRARY_PATHS` to the
+`PROTONPATH` takes precedence. For an explicit path, the launcher recognizes
+Experimental when its `version` file contains `experimental-` and the path
+uses a `steamapps/common` layout. It gives UMU Unix paths and sets `STEAM_COMPAT_LIBRARY_PATHS` to the
 Steam library. Each VIctory package directory gets its own install symlink under
 that library, so two builds can run at the same time. A caller-supplied
 `STEAM_COMPAT_INSTALL_PATH` is used as-is: the default symlink is neither
@@ -69,8 +74,7 @@ created nor checked in that case. When the launcher discovers Experimental on
 its own and cannot set up that symlink (for example a read-only Steam library),
 it warns, leaves `STEAM_COMPAT_INSTALL_PATH` for UMU to choose, and still runs
 that Experimental runtime through `umu-run` with Unix paths. An explicitly set
-`PROTONPATH` instead reports the failure. This is the configuration used to
-reach the first world frame on Linux. Other layouts keep the `Z:` path
+`PROTONPATH` instead reports the failure. Other layouts keep the `Z:` path
 behaviour; a non-experimental `PROTONPATH` also keeps it.
 
 The launcher creates shader-cache directories at
@@ -83,7 +87,7 @@ to the standard directories under `$HOME`.
 
 ## Capture a workstation run
 
-For a requested PR comparison, follow the [interactive Series X test](testing.md#run-a-series-x-hardware-test). It runs both builds and bundles their logs. To capture a single launch, use the command below.
+For a requested PR comparison, follow the [interactive hardware test](testing.md#run-a-hardware-test). It runs both builds and bundles their logs. To capture a single launch, use the command below.
 
 ```sh
 ./scripts/victory-proton.sh --report "/path/to/game/title.exe"
@@ -110,8 +114,8 @@ On first use of the pinned runtime, the launcher downloads the x64 vkd3d-proton 
 using `curl` over HTTPS. It checks the SHA-256 pinned in this launcher and keeps
 the verified archive under `${XDG_CACHE_HOME:-$HOME/.cache}/victory`. Subsequent
 runs can use the cached archive offline. Each run stages the two DLLs beside a
-temporary copy of the selected Victory executable. The report includes the
-runtime selection and DLL hashes. This pin is a 3.2 development build from
+temporary copy of the selected Victory executable. The report records the runtime selection and, for pinned or custom DLLs,
+their hashes. This pin is a 3.2 development build from
 upstream commit `ec20719`. The release includes provenance, notices, and source.
 [Runtime release](https://github.com/ligmaSec/victory-royale/releases/tag/runtime-vkd3d-ec20719)
 
@@ -136,8 +140,8 @@ and runs in Linux CI.
 
 `./tests/proton-smoke.sh` compiles its synthetic title with the LLVM-MinGW
 toolchain and gnullvm Rust target above, even when `VICTORY_EXE` points to
-an MSVC build. The test checks the launcher's exit status and the return
-value from the title. It uses a separate `victory/proton-smoke` prefix under
+an MSVC build. The test checks the launcher's exit status, the reported Proton version, and the
+return value from the title. It uses a separate `victory/proton-smoke` prefix under
 the XDG data directory. Set `VICTORY_SMOKE_PREFIX` to choose another test prefix.
 
 To reproduce the loader integration tests after the smoke test, build the

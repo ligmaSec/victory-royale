@@ -6,7 +6,7 @@ If this is your first contribution, try one test and tell us what happened.
 You can help without writing a patch. Browse [PRs looking for testers](https://github.com/ligmaSec/victory-royale/pulls?q=is%3Apr+is%3Aopen+label%3A%22tester+wanted%22) to find a test. A result from a second machine can
 show whether a failure follows a particular build, GPU driver, or setting.
 
-- **Testing a pull request?** Use the [interactive hardware test](docs/testing.md#run-a-hardware-test) on Windows or Linux/Proton. Pick the PR and follow the same scenario twice. Choose **Describe what you saw** to record observations for main and candidate. Paste a screenshot for either build there. The public comment includes reviewed notes and timings. Screenshots travel in the encrypted ZIP if you choose private delivery. Logs may contain usernames, local paths, or other sensitive information. Use the results screen to preview the summary, redact text or exclude files before sharing. The runner previews a summary you can post to the PR and can send detailed diagnostics encrypted to the verified requester named on screen using GitHub CLI authenticated with gist access. Keep the raw logs local.
+- **Testing a pull request?** Use the [interactive hardware test](docs/testing.md#run-a-hardware-test) on Windows or Linux/Proton. Supply your own standard `7952987A` save, pick the PR and follow its scenario once per build. Choose **Describe what you saw** to record observations for main and candidate. Paste a screenshot for either build there. The public comment includes reviewed notes and timings. Screenshots travel in the encrypted ZIP if you choose private delivery. Logs may contain usernames, local paths, or other sensitive information. Use the results screen to preview the summary, redact text or exclude files before sharing. The runner previews a summary you can post to the PR and can send detailed diagnostics encrypted to the verified requester named on screen using GitHub CLI authenticated with gist access. Keep the raw logs local.
 - **Reporting a single Linux run?** Install UMU (`umu-run`) and extract a tested
   [Proton build](docs/testing.md#ci-and-build-downloads). From its `victory`
   directory, run `./victory-proton.sh --report "/path/to/title.exe"`.
@@ -72,11 +72,12 @@ Linux, use the [Proton guide](docs/proton-launcher.md#build-on-linux).
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
-cargo test --workspace --locked          # needs no game data
+cargo test --workspace --locked -- --test-threads=1   # Windows CI, synthetic inputs
 ```
 
-To run the title you also need `victory.toml` (copy `victory.example.toml`)
-with every path outside the repository.
+The title executable is a positional argument to `victory run`. To override
+the default data and cache locations or configure paths used by other commands,
+copy `victory.example.toml` to `victory.toml` and set the paths outside the checkout.
 
 ## Check a change
 
@@ -86,9 +87,13 @@ Follow the [code standards](docs/code-standards.md). The workspace tests use syn
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --locked
+cargo test --workspace --locked -- --test-threads=1
 cargo xtask policy
 ```
+
+Linux CI uses `cargo test --workspace --locked`. For documentation changes,
+run `bash tests/docs.sh` and `cargo xtask policy` from the checkout, then verify
+the affected commands and links. The documentation check enforces layout.
 
 ## Report a failure
 

@@ -36,15 +36,17 @@ accepted.
 
 ## Where data lives
 
-Outside the repository, configured in `victory.toml`: `game_dir` (the
-user's dump), `test_titles`, and `cache_dir` for everything derived
-(default `%LOCALAPPDATA%\victory\cache`).
+Keep game files and derived data outside the repository. Set `game_dir` (the
+user's dump), `test_titles`, `cache_dir` (derived data), and `data_dir`
+(persistent title data) under `[paths]` in `victory.toml`. The default cache
+is `%LOCALAPPDATA%\victory\cache` on Windows or `$XDG_CACHE_HOME/victory`
+on native Linux (`~/.cache/victory` if the XDG directory is unset).
 
 Hardware comparisons use the standard player-provided `7952987A` save.
 The ignored root directory `saves/7952987A/` is its local input location.
-Git leaves empty directories out of clones. Create `saves/` locally or pass
-an external `7952987A` folder with `--save-dir`. Keep save files out of
-fixtures, release packages and reports.
+Create the directory locally or pass an external `7952987A` folder to the
+hardware test runner with `--save-dir`. The runner gives each build a separate
+copy. Keep save files out of commits, fixtures, artifacts and reports.
 
 Under Wine/Proton, vkd3d-proton and DXVK write shader caches
 (`vkd3d-proton.cache`, `*.dxvk-cache`) into the current directory. They are
@@ -57,18 +59,26 @@ cache home by default.
 ## Enforcement
 
 1. `.gitignore` keeps common data types out of `git status`.
-2. `cargo xtask policy` (run by the pre-commit hook; install with
-   `cargo xtask install-hooks`) is an allowlist: files must have an allowed
-   type, be under 512 KiB, contain no binary data or known binary
-   signatures, and hold no long hex/base64 runs. Exceptions need an entry
-   with a reason in `xtask/src/policy.rs`.
-3. At runtime, everything that writes derived data calls
-   `victory_core::ensure_outside_repo`.
-4. Tests that need real files take their paths from environment variables
-   and skip when unset. They assert on properties, never on snapshots.
+2. `cargo xtask policy` checks tracked files and unignored untracked files.
+   Install the pre-commit hook with `cargo xtask install-hooks` to check
+   staged changes with `cargo xtask policy --staged`. Files must have an
+   allowed name, path or extension, be at most 512 KiB, contain no NUL bytes
+   or known binary headers, and hold no long hex/base64 runs. Exceptions
+   need an entry with a reason in `xtask/src/policy.rs`.
+3. Configured cache and title-data paths are checked by
+   `victory_core::ensure_outside_repo`. Some diagnostic writers use the path
+   supplied directly. Set capture, audio and shader dump destinations outside
+   the checkout, including when working with an ignored file type.
+4. The default suite runs without proprietary inputs. Opt-in reference tests
+   take external paths from environment variables. Set the required variables
+   before running an ignored fixture test explicitly. Assert on properties
+   rather than storing snapshots of game material.
 
 ## If something slips through
 
-A follow-up commit is not enough. Rewrite history
-(`git filter-repo --path <file> --invert-paths`), force-push, and have
-everyone re-clone.
+If prohibited material was published, tell the maintainers which path and
+revision are affected without reposting the material. Maintainers coordinate
+the history rewrite (for a single path,
+`git filter-repo --path <file> --invert-paths`), the force-push of affected refs
+and fresh clones. Check
+whether affected CI artifacts or release downloads also need removal.

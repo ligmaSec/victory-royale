@@ -1,8 +1,6 @@
 # Code standards
 
-What a change has to look like to merge. The first section is checked by CI;
-the rest is what review looks for. Each rule describes what the tree already
-does, so the nearest file is always a valid example.
+CI runs the checks listed below. Review covers the remaining standards.
 
 ## Project language
 
@@ -19,7 +17,12 @@ Use each test directory’s README for instructions specific to that suite.
 | Asset policy | `cargo xtask policy` | Linux, and again as a test |
 | Lints | `cargo clippy --workspace --all-targets --locked -- -D warnings` | Windows and Linux |
 | Lints, diagnostics build | the same with `--all-features` | Windows |
-| Tests | `cargo test --workspace --locked` | Windows and Linux |
+| Tests | `cargo test --workspace --locked` | Linux |
+| Tests, serialized for the shared D3D12 driver state | `cargo test --workspace --locked -- --test-threads=1` | Windows |
+
+Documentation-only changes run the documentation layout and asset-policy
+checks. See the [CI workflow](../.github/workflows/ci.yml) for the minimum
+Rust version check and the synthetic hardware, WARP and Proton checks.
 
 The toolchain is the one pinned in `rust-toolchain.toml`. Formatting follows
 `rustfmt.toml` (2024 edition, Unix newlines, field-init and `?` shorthand)
@@ -99,7 +102,7 @@ in the change that closes the gap.
   fields rather than values formatted into the message:
   `tracing::warn!(dll = %site.dll, symbol = %site.symbol, "unimplemented
   import called, returning 0")`.
-- `debug!` and `trace!` exist only in builds with the `diagnostics` feature.
+- `debug!` and `trace!` output requires a build with the `diagnostics` feature.
   Anything a tester on a release build must see is `info!` or above.
 - Anything that can fire per draw or per frame logs once. The GPU crate has
   a `once!` macro for this.
@@ -135,16 +138,16 @@ in the change that closes the gap.
 
 ## Where code goes
 
-- Everything except `victory-game` is platform-level and must work for any
-  Xbox Series title. Code that knows about one game (formats, build
-  identities, per-build offsets) belongs in `victory-game`.
+- Keep platform code reusable across Xbox Series titles. Code that knows
+  about one game (formats, build identities, per-build offsets) belongs in
+  `victory-game`.
 - Code that writes derived data calls `victory_core::ensure_outside_repo`
   first.
 - A `Converter` in `victory-pipeline` is deterministic bytes in, bytes out.
   Bump its version whenever its output changes.
-- Debugging aids (environment switches, captures, extra validation) compile
-  only with the `diagnostics` feature, and every switch is listed in the
-  README's table.
+- Compile development-only debugging aids (environment switches, captures,
+  extra validation) behind the `diagnostics` feature, and list every switch
+  in the README's table.
 
 ## Portability and runtime boundaries
 

@@ -3,7 +3,7 @@
 The default test run needs no game data and no console SDK:
 
 ```powershell
-cargo test --workspace --locked
+cargo test --workspace --locked -- --test-threads=1
 ```
 
 Linux CI runs the portable workspace tests. Windows CI also exercises the
@@ -17,9 +17,10 @@ Run `cargo xtask install-hooks` to enable it on commit.
 ## CI and build downloads
 
 Every pull request and push to `main` runs the documentation and asset checks.
-Changes limited to project guides and test READMEs finish there. Code, workflow,
-dependency, and other changes also run the Windows and Linux workspace suites,
-workflow lint, formatting, the minimum-Rust check, and the distribution test.
+The docs-only route covers the root README, contributor and agent guides, Markdown
+under `docs/`, and the Metal and runtime test READMEs. Other changes also run the
+Windows and Linux workspace suites, workflow and shell lint, formatting, the
+minimum-Rust check, and the distribution test.
 Manual runs and merge-group checks use the full suite.
 
 A push merging a code PR can reuse its successful minimum-Rust job when the
@@ -27,13 +28,14 @@ merged Git tree matches the one the job tested. Direct code pushes and merges
 without matching test evidence rerun it. The regression gate verifies the
 expected jobs for each path. A docs-only merge does not publish a binary.
 
-The distribution job builds the x86-64 Windows release on Linux and checks that
-all three compiled DXIL helpers are present in the executable. It unpacks the
+The distribution job builds the x86-64 Windows release on Linux and checks the
+embedded DXIL for `argument_clamp`, `rect_expand` and `rect_rewrite`. It unpacks the
 archive, exercises the offline launcher checks and pinned runtime selection with
-a fake UMU, and runs the packaged executable
-under Wine against synthetic PE fixtures. The suite checks import binding, TLS,
-threads, memory, DLL loading, and expected title return codes. Failed runs retain
-the synthetic case logs and summary for three days. Game rendering and
+a fake UMU, and runs the packaged executable under Wine against
+[synthetic PE fixtures](../tests/runtime/README.md). The suite checks import
+binding, TLS, threads, memory, DLL loading, and expected title return codes.
+If an archive test fails, CI retains any synthetic case logs and summary it
+produced for three days. Game rendering and
 the full UMU/Proton runtime still require a separate workstation test.
 
 Successful main builds deliver `victory-proton-x86_64-<commit>` for 14 days.
@@ -43,14 +45,25 @@ For a requested comparison, use the [interactive hardware test](#run-a-hardware-
 to get both matched builds. For a single run, Windows testers can launch the extracted
 `victory.exe` with the [usual Windows launch command](../README.md#getting-started).
 
-Download the artifact from the CI run, unzip the Actions download, and run
-the following in the extracted directory.
+Download the artifact from the CI run and unzip the Actions download. On Linux,
+run these commands in the extracted directory.
 
 ```sh
 sha256sum --check SHA256SUMS
 tar -xf victory-proton-x86_64.tar.gz
 ./victory/victory-proton.sh --test
 ./victory/victory-proton.sh --run "/path/to/game/title.exe"
+```
+
+On Windows, open PowerShell in the extracted directory. Verify the inner
+archive before unpacking it, then run the executable in the `victory` folder.
+
+```powershell
+$expected = ((Get-Content -LiteralPath SHA256SUMS -Raw) -split '\s+')[0]
+$archive = 'victory-proton-x86_64.tar.gz'
+if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $expected) { throw 'SHA-256 mismatch' }
+tar.exe -xf $archive
+.\victory\victory.exe run 'D:\Xbox Games\Title\title.exe' --execute
 ```
 
 <a id="run-a-series-x-hardware-test"></a>
@@ -76,15 +89,17 @@ copy in `saves/7952987A/` at the checkout root, or beside an extracted runner
 in the same layout. It contains `saves/` with your progress and may also contain
 `storage/` with settings. To keep the checkout empty, pass
 `--save-dir "/path/to/7952987A"`. Each build starts with its own temporary copy
-of the same progress and settings. The runner warns if the save is missing.
-You can still preview a request with `--plan`.
+of the same progress and settings. Launching requires a folder named `7952987A`
+with at least one file under its `saves/` directory. You can preview a request
+with `--plan` even before the save is available.
 
 The checkout menu uses a signed-in GitHub CLI (`gh auth login`). Type the PR number
 shown in the menu, or press Enter to cancel. If a request includes a number, you
 can append it directly to the checkout command. Add `--plan` to preview the scenario
 and build revisions. An extracted kit includes both builds and needs no GitHub login.
 
-1. Select your game's `.exe` when prompted. The runner checks both packages and starts
+1. Select your game's `.exe` when prompted, or pass its full path with
+   `--title` on the runner command line. The runner checks both packages and starts
    **main** first. Follow **WHAT TO DO** above the launch and close the game at the point
    specified in the scenario.
 2. The **candidate** opens next. Repeat the same steps with the same settings and window
@@ -240,7 +255,8 @@ The packager matches the successful PR build to its tested main parent and check
 both artifact digests. A documentation-only push can pass CI without packaging a
 build. If the tested parent is the current head of `main`, run
 `gh workflow run ci.yml --ref main`. Wait for CI to finish, then prepare the kit
-again. If either revision has moved or expired, refresh the matched pair first.
+again. If the tested parent is older and its artifact is unavailable, update the
+PR against a main revision with a package and wait for PR CI to test the new pair.
 Post the tested revisions, configuration and observed differences on the PR. For
 performance comparisons, include frame times and stalls alongside average or median FPS.
 
@@ -251,11 +267,12 @@ The Windows graphics tests create a Direct3D 12 device.
 | Need | Used by |
 |------|---------|
 | A D3D12 adapter with shader model 6.6 | execution tests in `victory-shader` (`emit/host.rs`) |
-| Windows SDK `dxil.dll` | DXIL validation in `victory-shader` tests; they print `no dxil.dll; skipped` without it |
-| `VICTORY_WARP=1` | run the host on the WARP software adapter instead of the default GPU |
+| `dxil.dll` from the Windows SDK or at the path set by `VICTORY_DXIL` | DXIL validation in `victory-shader` tests |
+| `VICTORY_WARP=1` | select the WARP software adapter in the shader tests |
+| `VICTORY_D3D12_WARP=1` with the `diagnostics` feature | select WARP for the `victory-gpu` host, as CI does for the copy-back and world capture checks |
 
 `VICTORY_WARP=1` is useful on a machine whose GPU lacks a feature, or when a
-test fails on one driver and you want to know whether it is the driver. WARP
+comparing a GPU test failure with the software adapter. WARP
 is not a real GPU, so behaviour that depends on the hardware (wave size,
 driver quirks) is only settled by a run on that hardware.
 
@@ -263,8 +280,11 @@ Run one crate or one test on its own:
 
 ```powershell
 cargo test -p victory-shader --locked
-cargo test -p victory-shader --locked -- <test name> --nocapture
+cargo test -p victory-shader --locked TEST_FILTER -- --nocapture
 ```
+
+Replace `TEST_FILTER` with part of the test name. For synthetic shader readback
+on Apple Silicon, see the [standalone Metal suite](../tests/metal/README.md).
 
 ### Running the title under Wine without a sound device
 
@@ -312,17 +332,23 @@ A stall appears in the log when presentation resumes.
 
 * **Differential shader tests** (`victory-shader/src/emit/diff_tests.rs`)
   compile the same HLSL with the console compiler and the PC compiler and
-  compare what each draws. They need `VICTORY_CONSOLE_DXC` (the console SDK's
-  `dxc.exe`) and a PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows
-  SDK's), and **skip without them**: a green run without those variables did
-  not run them. `VICTORY_DIFF_ONLY` narrows them to matching cases.
-* **`#[ignore]` tests** need reference data made outside the repository and
-  run with `-- --ignored`:
-  * `victory-formats` XMA: `VICTORY_XMA_STREAMS=<dir>` (`*.xma` with `*.ctx`),
-    `VICTORY_XMA_REFERENCE=<dir>` (`mono`/`stereo` `.xmadata` and `.ref`).
-  * `victory-formats` BCPack: `VICTORY_BCPACK_TABLES`, `VICTORY_BCPACK_CASES`.
+  compare draw and dispatch output. They need `VICTORY_CONSOLE_DXC` (the console SDK's
+  `dxc.exe`) and a PC `dxc.exe`. The PC compiler comes from `VICTORY_PC_DXC`,
+  the newest Windows SDK that contains it, or the directory containing
+  `VICTORY_DXIL`, in that order. Tests that compare compiler output skip when
+  the compilers are unavailable. Set `VICTORY_DIFF_ONLY` to the exact case
+  name to run that case.
+* **Ignored format tests** use inputs made outside the repository. Set the
+  variables for the test you want, then run its command. Keep the inputs
+  outside Git under the [asset policy](asset-policy.md).
 
-  Never commit that data; see the asset policy.
+  | Test filter for `cargo test -p victory-formats --locked TEST_FILTER -- --ignored` | Environment and inputs |
+  | --- | --- |
+  | `walks_saved_streams` | `VICTORY_XMA_STREAMS` points to a directory with `*.xma` and matching `*.ctx` files |
+  | `matches_a_reference_decoder` | `VICTORY_XMA_REFERENCE` points to a directory with `mono.xmadata`, `mono.ref`, `stereo.xmadata` and `stereo.ref` |
+  | `reference_chunks` | `VICTORY_BCPACK_TABLES` points to the table file and `VICTORY_BCPACK_CASES` to a directory with packed `*.bc<n>` chunks and matching `*.out` files |
+
+  Benchmarks and some device-specific tests are also ignored by default.
 
 ## The loader's integration tests
 
