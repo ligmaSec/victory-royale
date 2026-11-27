@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Host, Root, View, assert_test_wave_size};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -13,6 +13,19 @@ use crate::native::{
 use crate::{ShaderError, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
+
+fn hardware(wave_size: Option<u32>) -> Option<Host> {
+    let host = match Host::new_test_backend(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 hardware device ({e}); not run");
+            return None;
+        }
+    };
+    wave_size
+        .is_none_or(|lanes| host.supports_test_wave(lanes, "hardware"))
+        .then_some(host)
+}
 
 /// 64 threads in one console wave. Each thread t holds the bit `1 << (t >> 1)`; the threads
 /// below s0 (a root constant) OR theirs over the wave inside `if (t < s0) { ... }` and store
@@ -216,19 +229,12 @@ fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; not run");
+    let Some(host) = hardware(Some(32)) else {
         return;
     };
-    let (root, pso) = match host.compute_pipeline(&shader) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!(
-                "the hardware device does not take this program (waves of 32?): {e}; not run"
-            );
-            return;
-        }
-    };
+    let (root, pso) = host
+        .compute_pipeline(&shader)
+        .unwrap_or_else(|e| panic!("hardware: compute_pipeline failed: {e}"));
     let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     let out = host
         .dispatch(
@@ -332,25 +338,16 @@ fn on_64_lanes(native: &NativeProgram, p: &ir::Program) -> HostShader {
     shader
 }
 
-/// Dword 0 of the UAV after `shader` ran with root constants `constants`; none without a
-/// device that takes it.
+/// Dword 0 of the UAV after `shader` ran with root constants `constants`; none without
+/// hardware support for its fixed 64-lane wave.
 fn dispatched(shader: &HostShader, constants: &[u32]) -> Option<u32> {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; not run");
-        return None;
-    };
-    let (root, pso) = match host.compute_pipeline(shader) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!(
-                "the hardware device does not take this program (waves of 64?): {e}; not run"
-            );
-            return None;
-        }
-    };
+    let host = hardware(Some(64))?;
+    let (root, pso) = host
+        .compute_pipeline(shader)
+        .unwrap_or_else(|e| panic!("hardware: compute_pipeline failed: {e}"));
     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     for u in &shader.user_data {
         if u.root == RootType::Constants {
@@ -511,7 +508,7 @@ fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
         while tree.len() > 1 {
             tree = tree.chunks(2).map(|c| add(c[0], c[1])).collect();
         }
-        let Some(got) = on_the_card(&shader, [stay, 0]) else {
+        let Some(got) = on_the_card(&shader, [stay, 0], 64) else {
             return;
         };
         ran = true;
@@ -565,14 +562,12 @@ fn a_16_bit_sum_rounds_to_nearest_when_asked_to() {
             let mut copy = shader.dxil.clone();
             v.validate(&mut copy).expect("DXIL validation failed");
         }
-        let Ok(host) = Host::new(false) else {
-            eprintln!("no SM 6.6 hardware device; not run");
+        let Some(host) = hardware(None) else {
             return;
         };
-        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-            eprintln!("the hardware device does not take this program; not run");
-            return;
-        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("hardware: compute_pipeline failed: {e}"));
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         let out = host
             .dispatch(
@@ -651,19 +646,12 @@ fn a_wave_or_inside(skip: u32, name: &str) {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; not run");
+    let Some(host) = hardware(Some(32)) else {
         return;
     };
-    let (root, pso) = match host.compute_pipeline(&shader) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!(
-                "the hardware device does not take this program (waves of 32?): {e}; not run"
-            );
-            return;
-        }
-    };
+    let (root, pso) = host
+        .compute_pipeline(&shader)
+        .unwrap_or_else(|e| panic!("hardware: compute_pipeline failed: {e}"));
     // (threads below s0 take the branch; thread t gives bit t >> 1)
     for (below, expected) in [
         (64u32, u32::MAX),
@@ -696,21 +684,22 @@ fn a_wave_or_inside(skip: u32, name: &str) {
 }
 
 /// Runs `shader` on the hardware device with the root constants `s0`, `s1` and gives dword 0
-/// of the UAV; None (and a line) without a device that takes it.
-fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
-    whole_uav(shader, constants, 1).map(|out| out[0])
+/// of the UAV; None (and a line) without hardware support for `wave_size`.
+fn on_the_card(shader: &HostShader, constants: [u32; 2], wave_size: u32) -> Option<u32> {
+    whole_uav(shader, constants, wave_size, 1).map(|out| out[0])
 }
 
 /// As [`on_the_card`], and gives the first `dwords` dwords of the UAV.
-fn whole_uav(shader: &HostShader, constants: [u32; 2], dwords: u32) -> Option<Vec<u32>> {
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; not run");
-        return None;
-    };
-    let Ok((root, pso)) = host.compute_pipeline(shader) else {
-        eprintln!("the hardware device does not take this program; not run");
-        return None;
-    };
+fn whole_uav(
+    shader: &HostShader,
+    constants: [u32; 2],
+    wave_size: u32,
+    dwords: u32,
+) -> Option<Vec<u32>> {
+    let host = hardware(Some(wave_size))?;
+    let (root, pso) = host
+        .compute_pipeline(shader)
+        .unwrap_or_else(|e| panic!("hardware: compute_pipeline failed: {e}"));
     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     for u in &shader.user_data {
         if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
@@ -752,6 +741,7 @@ fn a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is() {
     let native = native_of(&words, false, 32);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    assert_test_wave_size(&shader, 32);
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
@@ -765,7 +755,7 @@ fn a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is() {
         (0, 0, 0),
         (10, 1, 5),
     ] {
-        let Some(got) = on_the_card(&shader, [below, other]) else {
+        let Some(got) = on_the_card(&shader, [below, other], 32) else {
             return;
         };
         assert_eq!(got, expected, "{below} lanes in the mask, s1 = {other}");
@@ -833,7 +823,7 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
         (32, 3, 1),
         (32, 7, 2),
     ] {
-        let Some(got) = on_the_card(&shader, [below, s1]) else {
+        let Some(got) = on_the_card(&shader, [below, s1], 32) else {
             return;
         };
         assert_eq!(got, expected, "{below} lanes inside, s1 = {s1}");
@@ -865,10 +855,12 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let Ok(host) = Host::new(true) else { return };
-    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+    let Ok(host) = Host::new_test_backend(true) else {
         return;
     };
+    let (root, pso) = host
+        .compute_pipeline(&shader)
+        .unwrap_or_else(|e| panic!("warp: compute_pipeline failed: {e}"));
     for count in [0u32, 1, 7, 63, 64, 65, 74, 77, 127, 128] {
         let mut constants = vec![0; shader.user_data_dwords() as usize];
         constants[limit.index as usize] = count;
@@ -1000,7 +992,7 @@ fn a_far_early_out_is_left_out_and_the_gate_counts_the_lanes_of_both_halves() {
         (1, 0),
         (0, 5),
     ] {
-        let Some(got) = whole_uav(&shader, [below, failing], 128) else {
+        let Some(got) = whole_uav(&shader, [below, failing], 32, 128) else {
             return;
         };
         assert_eq!(

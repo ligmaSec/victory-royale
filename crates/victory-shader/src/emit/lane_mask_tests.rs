@@ -3,8 +3,9 @@
 //! programs lowered to DXIL, validated by `dxil.dll` when present, and run
 //! on the host GPU and WARP against the console's result, lane by lane.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Host, Root, View, assert_test_wave_size};
 use super::{HostShader, lower, validator};
+use crate::dxbc::Container;
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -80,13 +81,13 @@ fn program(body: &[u32]) -> Vec<u32> {
     w
 }
 
-/// `before` runs in every lane, then `inside` in the lanes below 10
+/// `before` runs in every lane, then `inside` in the lanes below s2
 /// (`s_and_saveexec_b32 s6, vcc_lo` and `s_cbranch_execz` over it); EXEC
 /// is restored from s6 after it, then `after` runs in every lane.
 fn branch(before: &[u32], inside: &[u32], after: &[u32]) -> Vec<u32> {
     let mut body = before.to_vec();
     body.extend_from_slice(&[
-        v_cmp_lanes_below(10),
+        0x7D88_0002, // v_cmp_gt_u32 vcc_lo, s2, v0
         s_and_saveexec_b32(6, VCC_LO),
         s_cbranch_execz(inside.len() as u16),
     ]);
@@ -96,21 +97,31 @@ fn branch(before: &[u32], inside: &[u32], after: &[u32]) -> Vec<u32> {
     program(&body)
 }
 
-/// Lowers `words` as a wave32 compute program of 32 lanes with the table
-/// of views at s0 (the raw UAV at entry 0).
-fn lowered(words: &[u32]) -> Result<lower::Lowered, crate::ShaderError> {
+/// Lowers a wave32 compute shader with the UAV table at s0 and the branch
+/// limit in s2. `wide` uses the same retry as opt-in wave-wide translation.
+fn lowered(words: &[u32], wide: bool) -> Result<(HostShader, Option<u32>), crate::ShaderError> {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 32,
-        layout: vec![RootParam {
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            sgprs: 1,
-            base_register: 0,
-            user_data: 0,
-            slot: 0,
-        }],
+        layout: vec![
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 2,
+                slot: 1,
+            },
+        ],
         used: vec![UsedResource {
             kind: ResourceType::Uav,
             root: RootType::Table,
@@ -122,41 +133,30 @@ fn lowered(words: &[u32]) -> Result<lower::Lowered, crate::ShaderError> {
             slot: 0,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 1 << 1,
+            rsrc2: 3 << 1,
             threads: [LANES as u32, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+    let c = Container {
+        digest: [0; 16],
+        version: (1, 0),
+        parts: Vec::new(),
+    };
+    if wide {
+        return super::widen(&c, &native, &p, false, false);
+    }
     let st = structure::structure(&p)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native)?;
-    lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-    })
+    super::emit_program(&c, &native, &p, &st, &io, &res)
 }
 
-fn build(words: &[u32]) -> HostShader {
-    let lowered = lowered(words).expect("lower");
-    let shader = HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        samplers: lowered.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
-        root_uavs: lowered.root_uavs,
-        root_indexed_views: Vec::new(),
-    };
+fn build(words: &[u32], wide: bool) -> HostShader {
+    let (shader, wave_size) = lowered(words, wide).expect("lower");
+    assert_eq!(wave_size, Some(32));
+    assert_test_wave_size(&shader, 32);
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
             .expect("DXIL validation failed");
@@ -166,22 +166,44 @@ fn build(words: &[u32]) -> HostShader {
     shader
 }
 
-/// Runs `shader` on the hardware GPU and on WARP (each skipped without a
-/// device) and checks that every lane stored `want[lane]`.
-fn check(shader: &HostShader, want: &[u32; LANES]) {
+fn build_after_widening(words: &[u32]) -> HostShader {
+    lower::take_needs();
+    let Err(error) = lowered(words, false) else {
+        panic!("a per-lane join would give some lanes the wrong SGPR value");
+    };
+    assert!(
+        matches!(
+            error,
+            crate::ShaderError::Unsupported {
+                what: lower::LANE_MASK,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(
+        !lower::take_needs().is_empty(),
+        "no divergent arm was named"
+    );
+    build(words, true)
+}
+
+/// On each backend that supports wave32, dispatches every case and compares
+/// each lane's stored dword. A supported device must accept the pipeline.
+fn check(shader: &HostShader, cases: &[(u32, [u32; LANES])]) {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
+        let host = match Host::new_test_backend(warp) {
+            Ok(host) => host,
+            Err(why) => {
+                eprintln!("{label}: {why}; skipped");
+                continue;
+            }
         };
-        // A mask read as a number needs the console's 32-lane wave. A
-        // runner without a GPU gives WARP (4 lanes) for both.
-        if !runs_wave32(&host) {
-            eprintln!("{label} device has no 32-lane wave; skipped");
+        if !host.supports_test_wave(32, label) {
             continue;
         }
         // A device that runs 32-lane waves must take the pipeline: a refusal
@@ -189,44 +211,35 @@ fn check(shader: &HostShader, want: &[u32; LANES]) {
         let (root, pso) = host
             .compute_pipeline(shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
-        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let limit = shader
+            .user_data
+            .iter()
+            .find(|u| (u.root, u.slot, u.dword) == (RootType::Constants, 1, 0))
+            .expect("s2 branch limit")
+            .index as usize;
         let views = [View::RawUav(LANES as u32)];
-        let words = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
-                    views: &views,
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        assert_eq!(words[0], want, "{label}");
+        for (below, want) in cases {
+            let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+            ud[limit] = *below;
+            let words = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(words[0], want, "{label}, lanes below {below}");
+        }
         ran += 1;
     }
     if ran == 0 {
         eprintln!("no SM 6.6 device with a 32-lane wave; not run");
     }
-}
-
-/// Whether `host` can run a wave of 32 lanes.
-fn runs_wave32(host: &Host) -> bool {
-    use windows::Win32::Graphics::Direct3D12::{
-        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
-    };
-    let mut opts1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-    // SAFETY: the options struct matches the feature asked for.
-    let ok = unsafe {
-        host.device.CheckFeatureSupport(
-            D3D12_FEATURE_D3D12_OPTIONS1,
-            (&raw mut opts1).cast(),
-            size_of_val(&opts1) as u32,
-        )
-    }
-    .is_ok();
-    ok && (opts1.WaveLaneCountMin..=opts1.WaveLaneCountMax).contains(&32)
 }
 
 /// The console's result: `inside` for the lanes below 10, `outside` for
@@ -239,67 +252,75 @@ fn below_ten(inside: u32, outside: u32) -> [u32; LANES] {
 /// the branch: 27 lanes are counted, 22 of which do not run there.
 #[test]
 fn a_negated_compare_counts_the_lanes_outside_its_branch() {
-    let shader = build(&branch(
-        &[],
-        &[
-            v_cmp_lanes_below(5), // lanes 0-4 of the 10 in the branch
-            s_not_b32(20, VCC_LO),
-            s_bcnt1_i32_b32(4, 20),
-            v_mov_b32(1, 4),
-        ],
-        &[],
-    ));
-    check(&shader, &below_ten(27, 0));
+    let shader = build(
+        &branch(
+            &[],
+            &[
+                v_cmp_lanes_below(5), // lanes 0-4 of the 10 in the branch
+                s_not_b32(20, VCC_LO),
+                s_bcnt1_i32_b32(4, 20),
+                v_mov_b32(1, 4),
+            ],
+            &[],
+        ),
+        false,
+    );
+    check(&shader, &[(10, below_ten(27, 0))]);
 }
 
 /// The lanes that skipped a branch, as the saved EXEC without the current
 /// one (`s_andn2_b32 s20, s6, exec_lo`), read as a number in the branch.
 #[test]
 fn the_lanes_that_skipped_a_branch_read_as_a_number_inside_it() {
-    let shader = build(&branch(
-        &[],
-        &[s_andn2_b32(20, 6, EXEC_LO), v_mov_b32(1, 20)],
-        &[],
-    ));
-    check(&shader, &below_ten(!0x3FF, 0));
+    let shader = build(
+        &branch(&[], &[s_andn2_b32(20, 6, EXEC_LO), v_mov_b32(1, 20)], &[]),
+        false,
+    );
+    check(
+        &shader,
+        &[
+            (0, [0; LANES]),
+            (10, below_ten(!0x3FF, 0)),
+            (32, [0; LANES]),
+        ],
+    );
 }
 
 /// A compare written in a branch and read as a number after EXEC is
 /// restored, through the join of its value and the 0 the other path keeps.
 #[test]
 fn a_compare_from_a_branch_reads_as_a_number_after_the_join() {
-    let shader = build(&branch(
+    let shader = build_after_widening(&branch(
         &[s_mov_b32(20, 0x80)],
         &[v_cmp_lanes_below(5), s_mov_b32(20, VCC_LO)],
         &[v_mov_b32(1, 20)],
     ));
-    check(&shader, &[0x1F; LANES]);
+    check(&shader, &[(0, [0; LANES]), (10, [0x1F; LANES])]);
 }
 
 /// The lanes that skip a branch keep the -1 written before it only where no
 /// lane enters; once one does, the wave's s20 is the branch's compare,
 /// clear in them. Taking each lane's own path would give them -1.
 #[test]
-fn a_number_before_a_branch_that_writes_a_mask_is_refused() {
-    let words = branch(
+fn a_branch_mask_overwrites_the_old_number_for_every_lane() {
+    let shader = build_after_widening(&branch(
         &[s_mov_b32(20, 0xC1)],
         &[v_cmp_lanes_below(5), s_mov_b32(20, VCC_LO)],
         &[v_mov_b32(1, 20)],
-    );
-    let e = lowered(&words).err().expect("lowered");
-    assert!(e.to_string().contains("lane mask"), "{e}");
+    ));
+    check(&shader, &[(0, [!0; LANES]), (10, [0x1F; LANES])]);
 }
 
 /// Both arms of an if/else write s20: the wave leaves through the else
 /// arm, so on the console the lanes of the then arm read its compare
 /// (clear in them), not their own.
 #[test]
-fn a_mask_both_arms_write_is_refused() {
+fn the_last_arm_to_write_a_mask_broadcasts_it_to_every_lane() {
     let then_arm = [v_cmp_lanes_below(5), s_mov_b32(20, VCC_LO)];
     let else_arm = [v_cmp_lanes_above(19), s_mov_b32(20, VCC_LO)];
     let mut body = vec![
         s_mov_b32(20, 0x80),
-        v_cmp_lanes_below(10),
+        0x7D88_0002, // v_cmp_gt_u32 vcc_lo, s2, v0
         s_and_saveexec_b32(6, VCC_LO),
         s_xor_b32(6, EXEC_LO, 6),
         s_cbranch_execz(then_arm.len() as u16),
@@ -312,6 +333,13 @@ fn a_mask_both_arms_write_is_refused() {
     ]);
     body.extend_from_slice(&else_arm);
     body.extend_from_slice(&[s_or_b32(EXEC_LO, EXEC_LO, 6), v_mov_b32(1, 20)]);
-    let e = lowered(&program(&body)).err().expect("lowered");
-    assert!(e.to_string().contains("lane mask"), "{e}");
+    let shader = build_after_widening(&program(&body));
+    check(
+        &shader,
+        &[
+            (0, [0xFFF0_0000; LANES]),
+            (10, [0xFFF0_0000; LANES]),
+            (32, [0x1F; LANES]),
+        ],
+    );
 }

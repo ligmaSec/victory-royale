@@ -6,7 +6,7 @@
 //! near `1.0`, turn-range reduction for `v_sin_*`/`v_cos_*`, and the LDS
 //! float atomics `ds_min_f32`/`ds_max_f32`.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Host, Root, View, assert_test_wave_size};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -200,14 +200,24 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
 /// modules take this lock too.
 pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// `Host::new(false)` also selects WARP when the environment forces it.
-/// Do not run that backend twice or label software results as hardware.
+/// Do not list hardware when the environment forces the software backend.
 pub(super) fn backends(force_warp: bool) -> &'static [(&'static str, bool)] {
     if force_warp {
         &[("warp", true)]
     } else {
         &[("hardware", false), ("warp", true)]
     }
+}
+
+fn configured_backends() -> &'static [(&'static str, bool)] {
+    backends(std::env::var_os("VICTORY_WARP").is_some_and(|v| v == "1"))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Requires {
+    Sm66,
+    Wave32,
+    Wave32AndDoubles,
 }
 
 #[test]
@@ -223,26 +233,35 @@ fn run_cases(
     cases: &[[u32; 4]],
     check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
-    let warp = std::env::var_os("VICTORY_WARP").is_some_and(|v| v == "1");
-    run_cases_on(shader, cases, backends(warp), check);
+    run_cases_on(shader, cases, configured_backends(), Requires::Sm66, check);
 }
 
 fn run_cases_on(
     shader: &HostShader,
     cases: &[[u32; 4]],
     devices: &[(&str, bool)],
+    requires: Requires,
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
+    if requires != Requires::Sm66 {
+        assert_test_wave_size(shader, 32);
+    }
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for &(label, warp) in devices {
-        let host = match Host::new(warp) {
+        let host = match Host::new_test_backend(warp) {
             Ok(host) => host,
             Err(e) => {
                 eprintln!("no SM 6.6 {label} device ({e}); skipped");
                 continue;
             }
         };
+        if requires != Requires::Sm66 && !host.supports_test_wave(32, label) {
+            continue;
+        }
+        if requires == Requires::Wave32AndDoubles && !host.supports_test_doubles(label) {
+            continue;
+        }
         let (root, pso) = host
             .compute_pipeline(shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
@@ -271,9 +290,8 @@ fn run_cases_on(
         }
         ran += 1;
     }
-    if ran == 0 && devices.iter().all(|&(_, warp)| !warp) {
-        // A case for the hardware adapter alone, on a machine without one.
-        eprintln!("no SM 6.6 hardware device; a hardware-only case not run");
+    if ran == 0 && (requires != Requires::Sm66 || devices.iter().all(|&(_, warp)| !warp)) {
+        eprintln!("no SM 6.6 backend meeting this case's requirements; not run");
         return;
     }
     assert!(ran > 0, "no SM 6.6 device available ({devices:?})");
@@ -627,12 +645,12 @@ fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
             body.push(vop1(0x001, 0, sgpr(12))); // v_mov_b32 v0, s12
             let shader = build_cs(&body, 32, 0);
             let inputs: Vec<[u32; 4]> = selectors.iter().map(|&(a, b)| [a, b, 0, 0]).collect();
-            // Cross-lane code declares WaveSize(32), which WARP's pipeline
-            // creation refuses: hardware only.
+            // v_readlane and the row permutations require one fixed 32-lane wave.
             run_cases_on(
                 &shader,
                 &inputs,
-                &[("hardware", false)],
+                configured_backends(),
+                Requires::Wave32,
                 |backend, i, inp, got| {
                     let want = permlane_source(u32::from(read), inp[0], inp[1], cross);
                     assert_eq!(
@@ -1641,14 +1659,14 @@ fn ds_min_max_f32_order_floats_and_return_the_old_value() {
         returns_new.extend(ds(plain, 0, 5, 2));
         returns_new.extend(ds(DS_READ_B32, 0, 5, 0));
         for (body, old_result) in [(returns_old, true), (returns_new, false)] {
-            // One thread with LDS declares WaveSize(32), which WARP's
-            // pipeline creation refuses: hardware only (the 64-thread test
-            // below runs on WARP too).
+            // The one-wave LDS form declares WaveSize(32). The separate multiwave test
+            // below also exercises the atomics on devices with narrower waves.
             let shader = build_cs(&body, 1, 512);
             run_cases_on(
                 &shader,
                 &cases,
-                &[("hardware", false)],
+                configured_backends(),
+                Requires::Wave32,
                 |backend, _, inp, got| {
                     let (old, data) = (f32::from_bits(inp[0]), f32::from_bits(inp[1]));
                     let want = if old_result {
@@ -1985,53 +2003,26 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         v.validate(&mut copy).expect("DXIL validation failed");
     }
 
-    let cases: &[(f64, f32)] = &[(1.25, 5.0), (-0.75, -3.0)];
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            continue;
-        };
-        let (root, pso) = match host.compute_pipeline(&shader) {
-            Ok(p) => p,
-            // WARP does not support fixed WaveSize(32) on SM 6.6.
-            Err(e) if warp => {
-                eprintln!("{label}: compute_pipeline skipped ({e})");
-                continue;
-            }
-            Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
-        };
-        for &(x, want) in cases {
-            let b = x.to_bits();
-            let inputs = [b as u32, (b >> 32) as u32, 0, 0];
-            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-            for u in &shader.user_data {
-                ud[u.index as usize] = match (u.root, u.slot) {
-                    (RootType::Constants, 0) => inputs[u.dword as usize],
-                    (RootType::Table, 1) => 0,
-                    other => panic!("unexpected user data {other:?}"),
-                };
-            }
-            let out = host
-                .dispatch(
-                    &root,
-                    &pso,
-                    &Dispatch {
-                        roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
-                        samplers: &[],
-                        groups: [1, 1, 1],
-                    },
-                )
-                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+    let values = [(1.25f64, 5.0f32), (-0.75, -3.0)];
+    let cases = values.map(|(x, _)| {
+        let b = x.to_bits();
+        [b as u32, (b >> 32) as u32, 0, 0]
+    });
+    run_cases_on(
+        &shader,
+        &cases,
+        configured_backends(),
+        Requires::Wave32AndDoubles,
+        |label, i, _, got| {
+            let (x, want) = values[i];
             assert_eq!(
-                out[0][0],
+                got,
                 want.to_bits(),
-                "{label}: wave f64 sum({x}) = {:#010x}, want {:#010x}",
-                out[0][0],
+                "{label}: wave f64 sum({x}) = {got:#010x}, want {:#010x}",
                 want.to_bits(),
             );
-        }
-    }
+        },
+    );
 }
 
 /// Whether the hardware adapter is an AMD RDNA card's: what the translator
@@ -2039,7 +2030,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
 fn rdna_card() -> bool {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::*;
-    let Ok(host) = Host::new(false) else {
+    let Ok(host) = Host::new_test_backend(false) else {
         return false;
     };
     let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
@@ -2140,9 +2131,13 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
             lower::TEST_RDNA.set(None);
             written.push(shader.dxil.clone());
             let mut all = Vec::new();
-            run_cases_on(&shader, &cases, &[("hardware", false)], |_, _, _, r| {
-                all.push(r)
-            });
+            run_cases_on(
+                &shader,
+                &cases,
+                &[("hardware", false)],
+                Requires::Sm66,
+                |_, _, _, r| all.push(r),
+            );
             got.push(all);
         }
         assert_ne!(written[0], written[1], "{name}: written alike");
@@ -2357,8 +2352,10 @@ fn typed_d16_table_uav_roundtrip_uint_sint_and_float() {
         ),
     ];
 
-    for (backend, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else { continue };
+    for &(backend, warp) in configured_backends() {
+        let Ok(host) = Host::new_test_backend(warp) else {
+            continue;
+        };
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{backend}: compute_pipeline failed: {e}"));
@@ -2500,8 +2497,10 @@ fn typed_non_d16_table_load_preserves_integer_bits() {
         ("R32_UINT", DXGI_FORMAT_R32_UINT, 4, &r32_data, r32_data),
     ];
 
-    for (backend, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else { continue };
+    for &(backend, warp) in configured_backends() {
+        let Ok(host) = Host::new_test_backend(warp) else {
+            continue;
+        };
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{backend}: compute_pipeline failed: {e}"));

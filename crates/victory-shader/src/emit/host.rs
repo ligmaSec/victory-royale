@@ -17,6 +17,20 @@ pub struct Host {
     pub device: ID3D12Device,
 }
 
+/// Assert the exact wave size declared in the PSV, even when no backend can run the shader.
+#[cfg(test)]
+pub(super) fn assert_test_wave_size(shader: &HostShader, lanes: u32) {
+    let container = Container::parse(&shader.dxil).expect("DXIL container");
+    let psv = container.part(FourCC::PSV0).expect("PSV0").data;
+    let size = crate::dxbc::u32_at(psv, 0).expect("PSV0 info size") as usize;
+    let info = &psv[4..][..size];
+    assert_eq!(
+        [16, 20].map(|offset| crate::dxbc::u32_at(info, offset).expect("PSV0 wave size")),
+        [lanes, lanes],
+        "expected an exact {lanes}-lane wave requirement in DXIL"
+    );
+}
+
 /// What the stage declares that a pipeline must match.
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;
@@ -62,7 +76,7 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
-fn pick_adapter(filter: Option<&str>) -> Result<IDXGIAdapter1, String> {
+fn pick_adapter(filter: Option<&str>, hardware_only: bool) -> Result<IDXGIAdapter1, String> {
     let needle = filter.map(|s| s.trim().to_ascii_lowercase());
     // SAFETY: plain DXGI enumeration and D3D12 capability probe.
     unsafe {
@@ -88,6 +102,9 @@ fn pick_adapter(filter: Option<&str>) -> Result<IDXGIAdapter1, String> {
             i += 1;
             let desc = adapter.GetDesc1().map_err(err)?;
             let is_sw = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+            if is_sw && (hardware_only || needle.is_none()) {
+                continue;
+            }
             if let Some(ref want) = needle {
                 let len = desc
                     .Description
@@ -98,8 +115,6 @@ fn pick_adapter(filter: Option<&str>) -> Result<IDXGIAdapter1, String> {
                 if !name.contains(want) {
                     continue;
                 }
-            } else if is_sw {
-                continue;
             }
             if D3D12CreateDevice(
                 &adapter,
@@ -122,7 +137,22 @@ impl Host {
     /// The high-performance adapter (or `VICTORY_ADAPTER` substring match), or
     /// WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
-        let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        Self::new_device(
+            warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1"),
+            false,
+        )
+    }
+
+    /// Unlike `new`, a hardware test never silently selects a software adapter.
+    #[cfg(test)]
+    pub(super) fn new_test_backend(warp: bool) -> Result<Self, String> {
+        if !warp && std::env::var_os("VICTORY_WARP").is_some_and(|v| v == "1") {
+            return Err("VICTORY_WARP=1 forces the software backend".into());
+        }
+        Self::new_device(warp, true)
+    }
+
+    fn new_device(warp: bool, hardware_only: bool) -> Result<Self, String> {
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             let mut device: Option<ID3D12Device> = None;
@@ -135,7 +165,7 @@ impl Host {
                 let filter = std::env::var("VICTORY_ADAPTER")
                     .ok()
                     .filter(|s| !s.trim().is_empty());
-                let adapter = pick_adapter(filter.as_deref())?;
+                let adapter = pick_adapter(filter.as_deref(), hardware_only)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             }
             let device = device.ok_or("no device")?;
@@ -157,6 +187,51 @@ impl Host {
             }
             Ok(Host { device })
         }
+    }
+
+    /// Check the device's advertised support for the shader's fixed wave size before PSO creation.
+    #[cfg(test)]
+    pub(super) fn supports_test_wave(&self, lanes: u32, label: &str) -> bool {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: OPTIONS1 writes the structure of the given size.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .unwrap_or_else(|e| panic!("{label}: querying D3D12_OPTIONS1 failed: {e}"));
+        let supports = options.WaveOps.as_bool()
+            && (options.WaveLaneCountMin..=options.WaveLaneCountMax).contains(&lanes);
+        if !supports {
+            eprintln!(
+                "{label}: requires WaveSize({lanes}); WaveOps={}, supported lanes {}..={}; not run",
+                options.WaveOps.as_bool(),
+                options.WaveLaneCountMin,
+                options.WaveLaneCountMax,
+            );
+        }
+        supports
+    }
+
+    #[cfg(test)]
+    pub(super) fn supports_test_doubles(&self, label: &str) -> bool {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: OPTIONS writes the structure of the given size.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .unwrap_or_else(|e| panic!("{label}: querying D3D12_OPTIONS failed: {e}"));
+        let supports = options.DoublePrecisionFloatShaderOps.as_bool();
+        if !supports {
+            eprintln!("{label}: no DoublePrecisionFloatShaderOps; not run");
+        }
+        supports
     }
 
     /// The root signature translated shaders expect: user data per stage

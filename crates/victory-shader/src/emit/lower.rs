@@ -276,6 +276,7 @@ fn half_shift(width: u32) -> u32 {
 
 type HandleKey = (usize, Site, u8, bool, (u32, u32));
 type LdsMeetings = (Vec<bool>, Vec<(bool, bool)>);
+type LaneRegions = Vec<(usize, Vec<bool>)>;
 
 struct Lower<'a> {
     s: Shader,
@@ -309,6 +310,9 @@ struct Lower<'a> {
     mask_phis: HashMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
+    /// Scalar data phis with a lane mask on at least one incoming path.
+    mask_data_phis: HashSet<Value>,
+    mask_regions: std::cell::OnceCell<Option<LaneRegions>>,
     read_phis: HashSet<Value>,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
@@ -443,8 +447,7 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
-/// mask is written: structurisation's `active` masks hold only lanes that
-/// reach that block, so the ballot misses none.
+/// mask is written if all its bits belong to lanes running that block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaskData {
     /// Compute: host lane n is console lane n (the program declares the
@@ -488,8 +491,7 @@ pub(super) fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
 
 /// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
 /// not post-dominate it, which only some lanes run. Not the branches the wave takes together
-/// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
-fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
+fn lane_regions(st: &Structured) -> Option<LaneRegions> {
     control_regions(st, true)
 }
 
@@ -507,7 +509,7 @@ fn every_thread_blocks(st: &Structured) -> Option<Vec<bool>> {
 }
 
 /// Per-lane branch regions. `skip_wide` leaves out branches the wave takes together.
-fn control_regions(st: &Structured, skip_wide: bool) -> Option<Vec<(usize, Vec<bool>)>> {
+fn control_regions(st: &Structured, skip_wide: bool) -> Option<LaneRegions> {
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (b, e) in st.exits.iter().enumerate() {
@@ -584,6 +586,46 @@ fn control_regions(st: &Structured, skip_wide: bool) -> Option<Vec<(usize, Vec<b
         regions.push((d, seen));
     }
     Some(regions)
+}
+
+/// Whether a divergent branch can send lanes along different incoming edges to `b`
+/// even though `b` is inside its region (another path can bypass the join entirely).
+fn split_join(st: &Structured, branch: usize, region: &[bool], b: usize) -> bool {
+    let LaneExit::Branch {
+        taken, not_taken, ..
+    } = st.exits[branch]
+    else {
+        unreachable!("a lane region starts at a branch");
+    };
+    let incoming = |start| {
+        let mut seen = vec![false; region.len()];
+        let mut stack = vec![(branch, start)];
+        let mut preds = Vec::new();
+        while let Some((q, r)) = stack.pop() {
+            if r == b {
+                preds.push(q);
+            } else if r != branch && region[r] && !std::mem::replace(&mut seen[r], true) {
+                match st.exits[r] {
+                    LaneExit::Jump(t) => stack.push((r, t)),
+                    LaneExit::Branch {
+                        taken, not_taken, ..
+                    } => {
+                        stack.extend([(r, taken), (r, not_taken)]);
+                    }
+                    LaneExit::End | LaneExit::Indirect => {}
+                }
+            }
+        }
+        preds.sort_unstable();
+        preds.dedup();
+        preds
+    };
+    let yes = incoming(taken);
+    if yes.is_empty() {
+        return false;
+    }
+    let no = incoming(not_taken);
+    !no.is_empty() && yes != no
 }
 
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
@@ -1392,6 +1434,46 @@ thread_local! {
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
+    reads_mask_data_from(st, i, |v| is_mask_word(st, v))
+}
+
+fn is_mask_word(st: &Structured, v: Value) -> bool {
+    st.masks.contains_key(&v) || st.highs.contains_key(&v)
+}
+
+/// A numeric SGPR phi need not appear in `Structured::masks`: structure only
+/// follows it when something asks for its lane bit. The incoming ballots
+/// still require console lanes when it (or another phi fed from it) is read.
+fn mask_data_phis(p: &Program, st: &Structured) -> HashSet<Value> {
+    let phis = || {
+        p.blocks
+            .iter()
+            .flat_map(|b| &b.phis)
+            .filter(|phi| matches!(phi.reg, Reg::S(c) if c != EXEC && c != EXEC + 1))
+    };
+    let mut masks: HashSet<_> = phis()
+        .filter(|phi| phi.args.iter().any(|&v| is_mask_word(st, v)))
+        .map(|phi| phi.value)
+        .collect();
+    if masks.is_empty() {
+        return masks;
+    }
+    let mut users = HashMap::<Value, Vec<Value>>::new();
+    for phi in phis().filter(|phi| !masks.contains(&phi.value)) {
+        for &arg in &phi.args {
+            users.entry(arg).or_default().push(phi.value);
+        }
+    }
+    let mut work: Vec<_> = masks.iter().copied().collect();
+    while let Some(v) = work.pop() {
+        if let Some(next) = users.remove(&v) {
+            work.extend(next.into_iter().filter(|&w| masks.insert(w)));
+        }
+    }
+    masks
+}
+
+fn reads_mask_data_from(st: &Structured, i: &Inst, is_mask: impl Fn(Value) -> bool) -> bool {
     // A scalar select uses the condition of the whole guest wave, even
     // when the preceding mask operation has no scalar-dword consumers.
     if matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_))
@@ -1400,8 +1482,7 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     {
         return true;
     }
-    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
-    let ops: Vec<&Operand> = match &i.fields {
+    let ops = match &i.fields {
         // A mask operation (its result a mask) is no data use.
         Fields::Sop { .. }
             if i.writes
@@ -1410,16 +1491,16 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
         {
             return false;
         }
-        Fields::Sop { src, .. } => src.iter().collect(),
+        Fields::Sop { src, .. } => src,
         Fields::Valu(v)
             if !matches!(i.name(), "v_cndmask_b32") && !i.name().contains("_co_ci_") =>
         {
-            v.src.iter().collect()
+            &v.src
         }
         _ => return false,
     };
-    ops.into_iter().any(|op| match *op {
-        Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(is_mask),
+    ops.iter().any(|op| match *op {
+        Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(&is_mask),
         _ => false,
     })
 }
@@ -1634,6 +1715,16 @@ impl<'a> Lower<'a> {
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+        let mask_data_phis = if x.native.stage == HwStage::Cs {
+            mask_data_phis(p, x.st)
+        } else {
+            HashSet::new()
+        };
+        let reads_mask_data = |i: &Inst| {
+            reads_mask_data_from(x.st, i, |v| {
+                is_mask_word(x.st, v) || mask_data_phis.contains(&v)
+            })
+        };
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
@@ -1662,7 +1753,7 @@ impl<'a> Lower<'a> {
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
-                    || reads_mask_as_data(x.st, i)
+                    || reads_mask_data(i)
             }) || lane_constant_masks(x.st)
                 // (a branch the wave takes together asks the wave)
                 || !x.st.wide.is_empty();
@@ -1687,7 +1778,7 @@ impl<'a> Lower<'a> {
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                         || n.starts_with("ds_permute")
                         || n.starts_with("ds_bpermute")
-                        || reads_mask_as_data(x.st, i)
+                        || reads_mask_data(i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
                 if !crosses && (s.lds_dwords == 0 || group <= 32) {
@@ -1750,7 +1841,7 @@ impl<'a> Lower<'a> {
                             "v_writelane"
                         } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
                             "ds_(b)permute"
-                        } else if reads_mask_as_data(x.st, i) {
+                        } else if reads_mask_data(i) {
                             "mask as data"
                         } else {
                             continue;
@@ -1905,6 +1996,8 @@ impl<'a> Lower<'a> {
             phi_at,
             mask_phis: HashMap::new(),
             pending_masks: Vec::new(),
+            mask_data_phis,
+            mask_regions: std::cell::OnceCell::new(),
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
             stale: HashSet::new(),
@@ -3463,24 +3556,46 @@ impl<'a> Lower<'a> {
             .collect();
         self.coherent.extend(found);
     }
-    /// taken in the block that writes the mask (see [`MaskData`]).
+
+    /// Whether a ballot at `b` sees the whole console wave, even outside EXEC.
+    fn whole_mask_wave(&self, b: usize) -> bool {
+        !self.local
+            && if self.exchange.is_some() {
+                self.all_lanes(b)
+            } else {
+                self.halves.is_none()
+                    && self
+                        .mask_regions
+                        .get_or_init(|| lane_regions(self.x.st))
+                        .as_ref()
+                        .is_some_and(|regions| regions.iter().all(|(_, r)| !r[b]))
+            }
+    }
+
+    /// Gets the mask's dword from a ballot where all its set bits can be seen.
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
         let (lo, high) = match self.x.st.highs.get(&v) {
             Some(&lo) => (lo, true),
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
-        // A mask that holds lanes outside EXEC where it is written (the complement of one,
-        // say) is the ballot of the lanes that are there: all of them, where two exchanging
-        // host waves know every lane runs that block.
-        let made = self.def_block.get(&lo).copied();
-        let whole =
-            self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
-        if !self.x.st.active.contains(&lo) && !whole {
-            if self.exchange.is_some() && !self.local {
-                need(made.unwrap_or(0));
+        if self.mask_data == MaskData::Console && !self.console_lanes {
+            return Err(LANE_MASK);
+        }
+        // A mask that holds bits outside EXEC (the complement of one, say)
+        // can still be balloted where every lane of the wave runs the writer.
+        // A missing branch proof never licenses a ballot of only the lanes here.
+        if !self.x.st.active.contains(&lo) {
+            let made = self.def_block.get(&lo).copied();
+            let whole = self.mask_data == MaskData::Console
+                && !self.local
+                && made.is_none_or(|b| self.whole_mask_wave(b));
+            if !whole {
+                if self.exchange.is_some() && !self.local {
+                    need(made.unwrap_or(0));
+                }
+                return Err(MASK_ELSEWHERE);
             }
-            return Err(MASK_ELSEWHERE);
         }
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
@@ -5863,8 +5978,24 @@ impl<'a> Lower<'a> {
             })
     }
 
-    fn is_mask(&self, v: Option<Value>) -> bool {
-        v.is_some_and(|v| self.x.st.masks.contains_key(&v))
+    fn scalar_mask_as_dword(&self, inst: &Inst, mask: Value) -> bool {
+        // Compute the dword instead of balloting a mask whose bits reach outside EXEC.
+        // An EXEC write can re-enable lanes that don't run the host block, even
+        // though structure marks EXEC active. Require the input masks to be numbers
+        // already or ballottable where all lanes of this console wave run.
+        !self.x.st.active.contains(&mask)
+            && self.read_as_number(mask)
+            && (inst.read(Reg::S(EXEC)).is_none() && inst.read(Reg::S(EXEC + 1)).is_none()
+                || self.console_lanes
+                    && !self.local
+                    && inst.reads.iter().all(|&(_, v)| {
+                        !is_mask_word(self.x.st, v)
+                            || matches!(self.vals.get(&v), Some(Val::I32(_)))
+                            || self
+                                .def_block
+                                .get(&v)
+                                .is_none_or(|&b| self.whole_mask_wave(b))
+                    }))
     }
 
     fn sop(&mut self, inst: &Inst) -> Result<(), Why> {
@@ -5878,12 +6009,11 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
-        // EXEC-derived masks stay on the mask path; preserve other SGPR bit patterns when
-        // their non-active result is consumed as ordinary scalar data.
-        let numeric_mask = inst.read(Reg::S(EXEC)).is_none()
-            && inst.read(Reg::S(EXEC + 1)).is_none()
-            && lo.is_some_and(|v| !self.x.st.active.contains(&v) && self.read_as_number(v));
-        if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) && !numeric_mask {
+        if inst.write(Reg::S(EXEC)).is_some()
+            || lo.is_some_and(|v| {
+                self.x.st.masks.contains_key(&v) && !self.scalar_mask_as_dword(inst, v)
+            })
+        {
             return Err(LANE_MASK);
         }
         if matches!(
@@ -9935,22 +10065,18 @@ impl<'a> Lower<'a> {
             }
             self.s.m.set_phi(v, incoming);
         }
-        // A join that only another join reads is read wherever that one is. Left
-        // unmarked, a value without a DXIL form coming into it became zero without a
-        // word (the looked-up tint of the material resolve programs, whose size
-        // computation had no value, was zero in every lane that way).
-        // shortcut: only with `VICTORY_STRICT_JOINS` set (the offline pack
-        // listing sets it to count them): 40 programs that translate today
-        // stop by name with it (vehicle paint pixel shaders at "the first
-        // half of an interpolation", foliage mesh shaders); until those are
-        // lowered they keep drawing with that zero.
+        // Likewise mark a read of a phi's incoming phis. For scalar mask dwords
+        // this is essential even without strict joins: the incoming value must not
+        // silently become zero or pick a different path in different lanes.
+        // Unrelated joins keep the opt-in strict policy.
         static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let strict = *STRICT.get_or_init(|| std::env::var_os("VICTORY_STRICT_JOINS").is_some());
-        let mut work: Vec<Value> = if strict {
-            self.read_phis.iter().copied().collect()
-        } else {
-            Vec::new()
-        };
+        let mut work: Vec<Value> = self
+            .read_phis
+            .iter()
+            .copied()
+            .filter(|v| strict || self.mask_data_phis.contains(v))
+            .collect();
         while let Some(v) = work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
@@ -9964,10 +10090,36 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            if self.read_phis.contains(&phi.value) && self.mask_data_phis.contains(&phi.value) {
+                // An SGPR is written once for the wave, not once per lane. A
+                // lane-local phi would leave skipped lanes with the old value
+                // even when this wave executed the write. Name the arm for
+                // the existing opt-in wave-wide retry.
+                let regs = self.mask_regions.get_or_init(|| lane_regions(self.x.st));
+                let Some(regions) = regs else {
+                    return Err(unsupported(p.blocks[b].offset, LANE_MASK));
+                };
+                let preds = &p.blocks[b].preds;
+                let mut divergent = false;
+                for (branch, region) in regions {
+                    if !preds.iter().any(|&q| region[q])
+                        || region[b] && !split_join(self.x.st, *branch, region, b)
+                    {
+                        continue;
+                    }
+                    divergent = true;
+                    for &q in preds.iter().filter(|&&q| region[q]) {
+                        need(q);
+                    }
+                }
+                if divergent {
+                    return Err(unsupported(p.blocks[b].offset, LANE_MASK));
+                }
+            }
+            let st = self.x.st;
             // A join of numbers with dead registers (`dead`): the paths that bring those
             // never read the result, so they bring zero. Not for a join that is itself a
             // lane mask (a ballot gives that one as data).
-            let st = self.x.st;
             let numbers = !bit
                 && !st.masks.contains_key(&phi.value)
                 && !st.highs.contains_key(&phi.value)
