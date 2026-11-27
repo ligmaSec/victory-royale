@@ -5848,8 +5848,8 @@ mod tests {
     }
 
     /// What may stand for a texture that is not there yet: one of its kind in
-    /// another place or size; another one only if asked; nothing a shader
-    /// cannot read in its place.
+    /// another place or size; another description only if asked and the
+    /// view's format, dimension and component mapping agree.
     #[test]
     fn a_slot_shows_on_what_can_stand_for_its_new_texture() {
         let texture = [3, 0, 0, 0, 512, 0, 256, 0x8_0001, 98, 1, 0, 0x105, 0, 0];
@@ -5865,11 +5865,16 @@ mod tests {
         square[6] = 512;
         let mut buffer = texture;
         buffer[0] = 1;
+        let mut other_format = twice;
+        other_format[8] = 83;
         assert_eq!(kin(&old, &view(texture, 98, 4, 0x1000_0000)), Kin::Same);
         assert_eq!(kin(&old, &view(texture, 98, 4, 0x2000_0000)), Kin::Moved);
         assert_eq!(kin(&old, &view(twice, 98, 4, 0x2000_0000)), Kin::Sized);
         assert_eq!(kin(&old, &view(square, 98, 4, 0x2000_0000)), Kin::Other);
-        assert_eq!(kin(&old, &view(twice, 83, 4, 0x2000_0000)), Kin::Other);
+        assert_eq!(
+            kin(&old, &view(other_format, 83, 4, 0x2000_0000)),
+            Kin::None
+        );
         assert_eq!(kin(&old, &view(texture, 98, 9, 0x2000_0000)), Kin::None);
         assert_eq!(kin(&old, &view(buffer, 98, 1, 0x2000_0000)), Kin::None);
         for (kin, kept) in [
