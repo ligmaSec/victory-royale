@@ -30,26 +30,8 @@ jobs:
       - name: Build and package the release executable
         run: |
           ./scripts/victory-proton.sh --build
-          python3 - <<'PYTHON'
-          from pathlib import Path
-
-          release = Path("target/x86_64-pc-windows-gnullvm/release")
-          binary = (release / "victory.exe").read_bytes()
-          for name in ("argument_clamp", "rect_expand", "rect_rewrite"):
-              shader, = release.glob(f"build/victory-gpu-*/out/{name}.dxil")
-              data = shader.read_bytes()
-              if not data.startswith(b"DXBC") or data not in binary:
-                  raise SystemExit(f"Missing embedded GPU helper: {name}")
-          PYTHON
-          dist="$RUNNER_TEMP/distribution"
-          mkdir -p "$dist/victory/tests"
-          install -m 755 target/x86_64-pc-windows-gnullvm/release/victory.exe scripts/victory-proton.sh "$dist/victory/"
-          install -m 644 LICENSE victory.example.toml "$dist/victory/"
-          install -m 644 tests/proton-launcher.sh "$dist/victory/tests/"
-          printf '%s\n' "$GITHUB_SHA" > "$dist/victory/REVISION"
-          cd "$dist"
-          tar -czf victory-proton-x86_64.tar.gz victory
-          sha256sum victory-proton-x86_64.tar.gz > SHA256SUMS
+          bash scripts/package-proton.sh target/x86_64-pc-windows-gnullvm/release \
+            "$GITHUB_SHA" "$RUNNER_TEMP/distribution"
       - name: Exercise the archive users will download
         id: runtime
         env:

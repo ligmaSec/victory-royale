@@ -31,6 +31,33 @@ An existing x64 MSVC build also works with the launcher. With `cargo-xwin`,
 LLVM, and the MSVC Rust target installed, build one using
 `cargo xwin build --locked --release -p victory --target x86_64-pc-windows-msvc`.
 
+## Package the Linux distribution
+
+From the checkout in Bash, with the cross-build tools and Linux DXC above,
+build and check the same distribution CI publishes. The packager requires
+Python 3, the full Git revision, and a new output directory outside the
+checkout whose parent already exists. It checks the three embedded GPU
+helpers before shipping only the executable, launcher, example configuration,
+license, launcher regression test, and revision.
+
+```sh
+(
+    set -e
+    revision=$(git rev-parse HEAD)
+    work=$(mktemp -d)
+    export CARGO_TARGET_DIR="$work/target"
+    VICTORY_BUILD_COMMIT="$revision" ./scripts/victory-proton.sh --build
+    bash scripts/package-proton.sh "$CARGO_TARGET_DIR/x86_64-pc-windows-gnullvm/release" \
+        "$revision" "$work/distribution"
+    mkdir "$work/unpacked"
+    cd "$work/distribution"
+    sha256sum --check --strict SHA256SUMS
+    tar -xf victory-proton-x86_64.tar.gz -C "$work/unpacked"
+    test "$(cat "$work/unpacked/victory/REVISION")" = "$revision"
+    printf 'Distribution and extracted files: %s\n' "$work"
+)
+```
+
 ## Launch
 
 Install UMU so that `umu-run` is on `PATH`. Keep your game files outside
