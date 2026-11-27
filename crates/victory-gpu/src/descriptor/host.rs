@@ -6147,7 +6147,9 @@ mod tests {
             // SAFETY: a live buffer.
             unsafe { made.GetDesc() }.Width
         };
-        for (off, raw, len) in [(8, true, 128u64), (8, false, 4 * 456)] {
+        // Use a 4-byte bias for the structured view: 456 is divisible by
+        // eight, so a page-aligned parent offset cannot cancel that bias.
+        for (off, raw, len) in [(8, true, 128u64), (4, false, 4 * 456)] {
             let v = view(start + off, raw);
             assert_eq!(width(&v), len.next_multiple_of(256));
             let (copy, address, bytes) = buffer_copy(&v).unwrap();
