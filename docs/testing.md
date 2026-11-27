@@ -253,7 +253,8 @@ requested resolution and record the actual swap-chain size from the log: a
 smaller window or Series S alone does not guarantee 1080p output. If the
 system cannot present at the specified size or initialize the required D3D12
 capabilities, record that result separately. WARP runs qualify only as
-functional checks, never as performance results.
+functional checks, never as performance results. If DXGI substitutes a
+hardware adapter for WARP, record WARP as unavailable.
 
 1. Run the [clean-data comparison](#compare-extracted-builds-locally) on the
    candidate. Complete setup, change a setting that is easy to check later,
@@ -455,14 +456,30 @@ with a working sound device.
 
 ## Comparing frame pacing
 
-Keep the build settings, driver, window size and launch sequence the same. Compare
-the menu and first scene after loading separately. Release logs include a
+Compare one save and route at a time. Pin the Proton build or Wine client and
+server, the DXGI and vkd3d-proton libraries, and the graphics driver on both
+sides. If any change, label that as a separate runtime comparison. Record
+both the actual swap-chain size and the internal render scale, plus the
+initial shader and pipeline cache state. Measure loading and interaction
+separately.
+
+Release logs include a
 `present intervals` line for every five seconds of completed frame intervals
 (or 4,096 intervals at high rates). Each line gives the sample count, mean,
 median, nearest-rank p95, longest interval and counts over 100 ms and one second.
 These are wall-clock times between successful host presents. Startup before
 the first present and gaps while DXGI reports an occluded window are excluded.
 A stall appears in the log when presentation resumes.
+
+For donor parity diagnostics, `VICTORY_SHADER_ROLES` can point to a private
+text file outside the checkout. Each nonempty line maps a full BLAKE3 shader
+container ID to one role, with whitespace between them and an optional `#`
+comment. Valid roles are `ambient-resolve`, `ambient-radiance`, `ambient-air`,
+`probe-activation`, `ray-resolve`, `hair`, `skin-init`, `scene-input`, `bake`, and
+`defrag`. Use the same locally verified role assignments in a comparison.
+Without a registry, no per-module role override is applied. Do not commit or
+upload the registry. Its purpose is to compare renderer variants, not to
+replace a clean run of the package without local overrides.
 
 ## Tests that skip or are ignored
 
