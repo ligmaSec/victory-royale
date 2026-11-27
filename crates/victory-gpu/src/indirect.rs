@@ -79,10 +79,14 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// `VICTORY_INDIRECT_WIDE=1` opts a tested backend into the wider limit;
 /// `=0` always uses the D3D12 limit. Otherwise only AMD is enabled.
 ///
-/// Per-tile dispatches at higher resolutions can exceed 65,535 groups.
-/// Truncation leaves tiles unprocessed. The console uses a wider count;
-/// only opt in on backends verified to execute the full dispatch and
-/// preserve its group IDs.
+/// The title's tile lists are dispatches of one group per tile, and two of
+/// them are classes of the picture's 8x4 tiles, 115,200 in all at
+/// 2560x1440: in a captured frame 67,440 and 47,760 (the program
+/// 2dc364df5d3278b8 and 940c2635dc1312f4). Cut to 65,535 the first list lost
+/// its last 1,905 tiles, the lowest of the picture. The console's dispatch
+/// counts are 32 bits, as are native AMD's. Some Vulkan-backed devices
+/// also support wider X; verify dispatch and group IDs on the actual
+/// D3D12 backend before opting in.
 fn widest(amd: bool) -> u32 {
     let wide = match std::env::var("VICTORY_INDIRECT_WIDE").as_deref() {
         Ok("0") => false,
@@ -409,12 +413,11 @@ fn record_clamp_as(
         ),
     ];
     let skip = usize::from(!waits);
-    // SAFETY: an open list; our root signature and pipeline; live source,
-    // count, scratch destination, and budget buffers. `src` and `count` stay
-    // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
-    // transitions `before -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`. Moving
-    // it out of `INDIRECT_ARGUMENT` orders this clamp's writes after every
-    // earlier execution's reads of the scratch buffer; nothing else writes it.
+    // SAFETY: the list is open and uses our root signature and pipeline with
+    // live source, count, scratch, and budget buffers. Source and count read
+    // via buffer promotion from COMMON or stay in GENERIC_READ. The scratch
+    // transition to UAV orders its writes after earlier indirect reads, and
+    // the transition back to INDIRECT_ARGUMENT makes it readable to execution.
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
@@ -806,7 +809,8 @@ void main() {
         };
         let at = PIECE + 1234;
         let set = |value: u8| {
-            // SAFETY: `at` is inside the mapped upload buffer.
+            // SAFETY: `at` is inside the live mapping, and each pass waits before
+            // the CPU changes these bytes.
             unsafe { now_ptr.add(at).write_volatile(value) }
         };
         // 0: the hashes are stored, nothing is flagged.
@@ -1937,7 +1941,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
 "#;
         let pass = compile_cs(&gpu.device, SOURCE).expect("the pass must compile");
         let heap = |visible: bool, n: u32| -> ID3D12DescriptorHeap {
-            // SAFETY: plain heap creation; the descriptor is live through the call.
+            // SAFETY: a valid descriptor-heap description on the live test device.
             unsafe {
                 gpu.device
                     .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {

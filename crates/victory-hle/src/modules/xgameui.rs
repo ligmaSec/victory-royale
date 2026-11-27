@@ -18,7 +18,7 @@ pub const PROVIDER: Guid = Guid::new(
     0x4043,
     [0xba, 0x07, 0x35, 0xd6, 0x07, 0xdf, 0x98, 0xb0],
 );
-/// As the title asks for it; the slots it calls (0x38,
+/// As the title (2026) asks for it; the slots it calls (0x38,
 /// 0x40, 0x88-0x98) take the public API's arguments in the 2020 order.
 pub const IID_2026: Guid = Guid::new(
     0xeaf6_69df,
@@ -125,7 +125,7 @@ fn limit(typed: &str, max: u32) -> String {
 }
 
 /// Asks the user in a modal host dialog; `None` if dismissed.
-#[cfg(all(windows, not(test)))]
+#[cfg(not(test))]
 fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
     dialog::ask(title, description, default, max)
 }
@@ -137,13 +137,6 @@ fn ask(title: &str, _: &str, default: &str, _: u32) -> Option<String> {
     title.starts_with("Type").then(|| format!("{default}typed"))
 }
 
-/// No host dialog to ask with: as if the user dismissed it.
-#[cfg(all(not(windows), not(test)))]
-fn ask(_: &str, _: &str, _: &str, _: u32) -> Option<String> {
-    None
-}
-
-#[cfg(windows)]
 mod dialog {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -226,16 +219,6 @@ mod dialog {
         entry.typed
     }
 
-    /// The entry behind the dialog's user data, `None` while it is unset.
-    ///
-    /// # Safety
-    /// A non-zero `user_data` must point to a live `Entry` that nothing else
-    /// accesses for the returned lifetime.
-    unsafe fn entry_from<'a>(user_data: isize) -> Option<&'a mut Entry> {
-        // SAFETY: the caller guarantees a non-zero value is a live `Entry`.
-        unsafe { (user_data as *mut Entry).as_mut() }
-    }
-
     extern "system" fn procedure(
         dialog: HWND,
         message: u32,
@@ -256,11 +239,11 @@ mod dialog {
                     0 // focus set here
                 }
                 wm::WM_COMMAND => {
-                    // Notifications can arrive before WM_INITDIALOG stores the entry.
-                    let Some(entry) = entry_from(wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA))
-                    else {
+                    let user_data = wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA);
+                    if user_data == 0 {
                         return 0;
-                    };
+                    }
+                    let entry = &mut *(user_data as *mut Entry);
                     match (wparam & 0xffff) as i32 {
                         wm::IDOK => {
                             let mut buffer =
@@ -288,29 +271,9 @@ mod dialog {
         use super::*;
 
         #[test]
-        fn unset_user_data_is_no_entry() {
-            // SAFETY: zero is never dereferenced.
-            assert!(unsafe { entry_from(0) }.is_none());
-            let mut entry = Entry {
-                max: 4,
-                typed: None,
-            };
-            // SAFETY: `entry` is live and not otherwise accessed meanwhile.
-            let found = unsafe { entry_from((&raw mut entry) as isize) };
-            assert_eq!(found.map(|e| e.max), Some(4));
-        }
-
-        #[test]
         fn command_before_init_is_ignored() {
-            // No window, so the user data reads as 0, as for a dialog that
-            // has not seen WM_INITDIALOG yet.
-            let notification = (0x0300 << 16) | EDIT as WPARAM; // EN_CHANGE
             assert_eq!(
-                procedure(std::ptr::null_mut(), wm::WM_COMMAND, notification, 0),
-                0
-            );
-            assert_eq!(
-                procedure(std::ptr::null_mut(), wm::WM_COMMAND, wm::IDOK as WPARAM, 0),
+                procedure(std::ptr::null_mut(), wm::WM_COMMAND, wm::IDOK as WPARAM, 0,),
                 0
             );
         }

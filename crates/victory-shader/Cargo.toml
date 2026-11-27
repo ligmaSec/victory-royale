@@ -33,6 +33,7 @@ windows = { workspace = true, optional = true, features = [
 ] }
 
 [target.'cfg(windows)'.dev-dependencies]
+victory-core.workspace = true
 tempfile.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",

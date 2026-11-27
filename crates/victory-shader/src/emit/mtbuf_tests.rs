@@ -297,109 +297,20 @@ const STRUCTURED_READ: &[u32] = &[
 ];
 
 #[test]
-fn indexed_load_uses_the_view_stride_when_metadata_is_missing_or_invalid() {
-    for metadata in [None, Some(0), Some(6), Some(2052)] {
-        let shader = buffer_shader(STRUCTURED_READ, metadata).unwrap();
+fn indexed_table_load_requires_a_declared_stride() {
+    for metadata in [None, Some(0), Some(6)] {
+        let err = buffer_shader(STRUCTURED_READ, metadata).unwrap_err();
         assert!(
-            shader.root_srvs.contains(&SLOT_TABLE_STRIDES),
-            "{metadata:?}"
+            matches!(
+                err,
+                crate::ShaderError::Unsupported {
+                    what: "a structured buffer of unknown stride",
+                    ..
+                }
+            ),
+            "{metadata:?}: {err}"
         );
     }
     let shader = buffer_shader(STRUCTURED_READ, Some(16)).unwrap();
     assert!(!shader.root_srvs.contains(&SLOT_TABLE_STRIDES));
-}
-
-#[cfg(windows)]
-#[test]
-fn undeclared_structured_stride_reads_two_view_strides() {
-    use super::host::{Dispatch, Host, Root, Stride, View};
-
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
-    let hosts: Vec<_> = super::valu_tests::backends(force_warp)
-        .iter()
-        .filter_map(|&(name, warp)| match Host::new(warp) {
-            Ok(host) => Some((name, host)),
-            Err(error) => {
-                eprintln!("{name}: {error}");
-                None
-            }
-        })
-        .collect();
-    for stride in [16, 32] {
-        let mut shader = buffer_shader(STRUCTURED_READ, Some(0)).unwrap();
-        let path = super::validator::Validator::default_path();
-        if path.is_some() {
-            super::validator::Validator::load(path.as_deref())
-                .unwrap()
-                .validate(&mut shader.dxil)
-                .unwrap();
-        }
-        let expected: Vec<u32> = (0..64).map(|i| 0x1234_0000 + i * 61 + stride).collect();
-        let mut data = vec![0xdead_beef; 64 * stride as usize / 4];
-        for (record, value) in data.chunks_exact_mut(stride as usize / 4).zip(&expected) {
-            record[1] = *value;
-        }
-        for (name, host) in &hosts {
-            let (root, pso) = host.compute_pipeline(&shader).unwrap();
-            let out = host
-                .dispatch(
-                    &root,
-                    &pso,
-                    &Dispatch {
-                        roots: vec![
-                            (
-                                0,
-                                Root::Constants(vec![0; shader.user_data_dwords() as usize]),
-                            ),
-                            (
-                                1,
-                                Root::View {
-                                    srv: true,
-                                    data: vec![stride],
-                                },
-                            ),
-                        ],
-                        views: &[
-                            View::Buffer {
-                                data: &data,
-                                stride: Stride::Raw,
-                            },
-                            View::RawUav(64),
-                        ],
-                        samplers: &[],
-                        groups: [1, 1, 1],
-                    },
-                )
-                .unwrap();
-            assert_eq!(out[0], expected, "{name}, stride {stride}");
-            eprintln!("{name}: exact readback at stride {stride}");
-        }
-    }
-}
-
-#[test]
-fn indexed_store_and_atomic_use_the_structured_uav_view_stride() {
-    for opcode in [0x1C_u32, 0x32_u32] {
-        let words = [
-            0xBE81_0380, // s_mov_b32 s1, 0
-            0xF408_0300,
-            0xFA00_0020, // s_load_dwordx4 s[12:15], s[0:1], 32
-            0xE000_2004 | (opcode << 18),
-            0x8003_0000, // store / atomic_add v0, v0, s[12:15], 0 idxen offset:4
-            0xBF81_0000, // s_endpgm
-        ];
-        let shader = buffer_shader(&words, None).unwrap();
-        assert!(shader.root_srvs.contains(&SLOT_TABLE_STRIDES));
-        #[cfg(windows)]
-        if let Some(path) = super::validator::Validator::default_path() {
-            super::validator::Validator::load(Some(&path))
-                .unwrap()
-                .validate(&mut shader.dxil.clone())
-                .unwrap();
-        }
-        assert!(!shader.dxil.is_empty());
-    }
 }

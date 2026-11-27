@@ -174,7 +174,7 @@ mod tests {
         // The lowest free place (another test may have taken it meanwhile;
         // zeroed either way).
         let mut c = Upload::new(100).unwrap();
-        // SAFETY: this upload lease owns at least 100 initialized bytes.
+        // SAFETY: `c` owns 100 initialized bytes that this test alone accesses.
         let bytes = unsafe { std::slice::from_raw_parts(c.start(), 100) };
         assert!(bytes.iter().all(|&x| x == 0));
         // More than an arena.

@@ -13,7 +13,6 @@ pub(crate) const S_FALSE: HRESULT = 1;
 pub(crate) const E_NOTIMPL: HRESULT = 0x8000_4001_u32 as i32;
 pub(crate) const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
 pub(crate) const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
-pub(crate) const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 pub(crate) const E_INVALIDARG: HRESULT = 0x8007_0057_u32 as i32;
 pub(crate) const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 /// What D3D and DXGI return for a missing item (adapter, output, private
@@ -234,17 +233,15 @@ pub(crate) const fn d3d12_object<const N: usize>(mut f: [*const (); N]) -> [*con
 
 /// The object methods' name setter: names only reach our log.
 pub(crate) extern "system" fn set_name(this: This, name: *const u16) -> HRESULT {
-    if cfg!(feature = "diagnostics") && tracing::enabled!(tracing::Level::DEBUG) {
-        let name = if name.is_null() {
-            String::new()
-        } else {
-            // SAFETY: the title passes a NUL-terminated UTF-16 string.
-            let len = (0..).take_while(|&i| unsafe { *name.add(i) } != 0).count();
-            // SAFETY: the title's string includes the units up to the NUL.
-            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(name, len) })
-        };
-        tracing::debug!(object = ?this, %name, "named");
-    }
+    let name = if name.is_null() {
+        String::new()
+    } else {
+        // SAFETY: a non-null name is NUL-terminated UTF-16.
+        let len = (0..).take_while(|&i| unsafe { *name.add(i) } != 0).count();
+        // SAFETY: `len` units were just read.
+        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(name, len) })
+    };
+    tracing::debug!(object = ?this, %name, "named");
     S_OK
 }
 

@@ -67,7 +67,7 @@ fn copies_on() -> bool {
     if ON_IN_TEST.get() {
         return true;
     }
-    cfg!(feature = "diagnostics") && asked_for!("VICTORY_COPY_BESIDE")
+    asked_for!("VICTORY_COPY_BESIDE")
 }
 
 fn stores_on() -> bool {
@@ -75,7 +75,7 @@ fn stores_on() -> bool {
     if ON_IN_TEST.get() {
         return true;
     }
-    cfg!(feature = "diagnostics") && asked_for!("VICTORY_STORE_BESIDE")
+    asked_for!("VICTORY_STORE_BESIDE")
 }
 
 #[cfg(test)]
@@ -309,6 +309,10 @@ fn learn(rip: usize, same: bool, can_look: bool) {
     };
     // (Not here, under a fault of the title's.)
     std::thread::spawn(move || {
+        if let Err(error) = victory_core::ensure_outside_repo(std::path::Path::new(&file)) {
+            tracing::warn!(%error, "write journal must be outside the checkout");
+            return;
+        }
         let Some((image, offset)) = place(rip) else {
             return;
         };

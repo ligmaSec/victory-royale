@@ -25,8 +25,6 @@
 mod console_insn_decode;
 #[cfg(windows)]
 mod crash;
-#[cfg(windows)]
-mod hooks;
 pub mod prepare;
 // Only the Windows loader publishes images; the tests run everywhere.
 #[cfg_attr(not(windows), allow(dead_code))]

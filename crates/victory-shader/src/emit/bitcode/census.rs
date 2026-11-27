@@ -7,9 +7,6 @@
 
 use super::{Cast, Module, Op, Tag, Term, V};
 use std::cell::RefCell;
-use std::collections::VecDeque;
-
-const RECENT_MODULES: usize = 32;
 
 /// The kinds, in the order of [`Census::counts`].
 pub const KINDS: [&str; 26] = [
@@ -48,9 +45,10 @@ pub struct Census {
 }
 
 thread_local! {
-    /// Recent forms from this thread. Keep a bounded history because runtime callers may not
-    /// consume the census, and the selected form is not always the one emitted last.
-    static WRITTEN: RefCell<VecDeque<(usize, u64, Census)>> = const { RefCell::new(VecDeque::new()) };
+    /// The modules this thread wrote since the last [`take`]: the length and
+    /// a hash of each one's bitcode, with its counts (a program may be
+    /// emitted in several forms before one is kept).
+    static WRITTEN: RefCell<Vec<(usize, u64, Census)>> = const { RefCell::new(Vec::new()) };
 }
 
 fn fnv(bytes: &[u8]) -> u64 {
@@ -62,32 +60,19 @@ fn fnv(bytes: &[u8]) -> u64 {
 /// Whether modules are counted (`VICTORY_SHADER_CENSUS` set).
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    cfg!(feature = "diagnostics")
-        && *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_CENSUS").is_some())
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_CENSUS").is_some())
 }
 
 /// The counts of the module whose bitcode the container `dxil` holds, if
-/// it is among the recent modules this thread wrote since the last call.
+/// this thread wrote it since the last call (which forgets the others).
 pub fn take(dxil: &[u8]) -> Option<Census> {
-    use crate::{Container, DxilProgram, FourCC};
-
-    let bitcode = Container::parse(dxil)
-        .ok()
-        .and_then(|c| c.part(FourCC::DXIL).map(|part| part.data))
-        .and_then(|part| DxilProgram::parse(part).ok())
-        .map(|program| program.bitcode);
-    WRITTEN.with(|recent| {
-        let mut recent = recent.borrow_mut();
-        let result = bitcode.and_then(|bitcode| {
-            let (len, hash) = (bitcode.len(), fnv(bitcode));
-            recent
-                .iter()
-                .rposition(|&(l, h, _)| l == len && h == hash)
-                .and_then(|index| recent.remove(index).map(|entry| entry.2))
-        });
-        recent.clear();
-        result
-    })
+    let written = WRITTEN.with(|l| std::mem::take(&mut *l.borrow_mut()));
+    let at = dxil.windows(4).position(|w| w == b"BC\xC0\xDE")?;
+    written
+        .into_iter()
+        .rev()
+        .find(|(len, hash, _)| dxil.get(at..at + len).is_some_and(|b| fnv(b) == *hash))
+        .map(|w| w.2)
 }
 
 /// Counts `m`, whose written form is `bitcode`, and keeps the result for
@@ -97,13 +82,7 @@ pub(crate) fn note(m: &Module, bitcode: &[u8]) {
         return;
     }
     let c = m.census();
-    WRITTEN.with(|recent| {
-        let mut recent = recent.borrow_mut();
-        if recent.len() == RECENT_MODULES {
-            let _ = recent.pop_front();
-        }
-        recent.push_back((bitcode.len(), fnv(bitcode), c));
-    });
+    WRITTEN.with(|l| l.borrow_mut().push((bitcode.len(), fnv(bitcode), c)));
 }
 
 fn kind(name: &str) -> usize {

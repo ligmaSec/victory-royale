@@ -606,8 +606,8 @@ impl Ctx<'_> {
                     if p.blocks[some].preds[..] != [u.0] || !self.dominates(some, h) {
                         return Err((self.at(u), SHAPE));
                     }
-                    for (b, marked) in pre.iter_mut().enumerate() {
-                        *marked = self.dominates(some, b) && !self.dominates(h, b);
+                    for (b, before_header) in pre.iter_mut().enumerate() {
+                        *before_header = self.dominates(some, b) && !self.dominates(h, b);
                     }
                     for b in (0..n).filter(|&b| pre[b]) {
                         let inside = match p.blocks[b].exit {

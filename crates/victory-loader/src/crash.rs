@@ -45,6 +45,52 @@ pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
     let _ = SAVE.set(ranges);
 }
 
+/// Reads through the OS because a previously mapped image page can be
+/// unreadable at the time a diagnostic inspects it.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn read_memory(address: usize, buffer: &mut [u8]) -> std::io::Result<()> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut read = 0;
+    // SAFETY: the buffer is writable, and the OS validates the source range.
+    let ok = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            address as *const _,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut read,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if read != buffer.len() {
+        return Err(std::io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "diagnostics")]
+fn save_memory(address: usize, len: usize, path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::File::create(path)?;
+    let mut buffer = [0; 4096];
+    let mut offset = 0;
+    while offset < len {
+        let chunk = (len - offset).min(buffer.len());
+        let at = address
+            .checked_add(offset)
+            .ok_or(std::io::ErrorKind::InvalidInput)?;
+        read_memory(at, &mut buffer[..chunk])?;
+        file.write_all(&buffer[..chunk])?;
+        offset += chunk;
+    }
+    Ok(())
+}
+
 /// The file crash reports are appended to, besides being printed.
 static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
@@ -54,6 +100,10 @@ static LOG_FIRST_CHANCE_BREAKPOINTS: AtomicBool = AtomicBool::new(false);
 /// Also appends every unhandled-exception report and panic to `file`, so a
 /// crash can be read after the console is gone.
 pub fn log_crashes_to(file: std::path::PathBuf) {
+    if let Err(error) = victory_core::ensure_outside_repo(&file) {
+        tracing::warn!(%error, "not writing the crash log");
+        return;
+    }
     if LOG.set(file).is_ok() {
         let _ = HOST.set(host());
         let print = std::panic::take_hook();
@@ -805,9 +855,11 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     }
     #[cfg(feature = "diagnostics")]
     for (address, len, file) in SAVE.get().into_iter().flatten() {
-        // SAFETY: the caller of `save_on_crash` named readable memory.
-        let bytes = unsafe { std::slice::from_raw_parts(*address as *const u8, *len) };
-        let saved = std::fs::write(file, bytes);
+        if let Err(error) = victory_core::ensure_outside_repo(file) {
+            tracing::warn!(%error, "not writing the crash dump");
+            continue;
+        }
+        let saved = save_memory(*address, *len, file);
         eprintln!(
             "  saved {address:#x}+{len:#x} to {} ({saved:?})",
             file.display()

@@ -129,12 +129,8 @@ pub enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
-    /// DirectStorage physical scatters, their page counts, and mapped views.
-    Scatter,
-    ScatterPages,
-    ScatterMaps,
 }
-const COUNTERS: usize = C::ScatterMaps as usize + 1;
+const COUNTERS: usize = 80;
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
 /// every list call (what counts here is summed up for the log alone).
@@ -212,12 +208,12 @@ static LONGEST: Mutex<(u64, String)> = Mutex::new((0, String::new()));
 /// pipelines): how many, and their microseconds.
 static WAITS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64)>>> = Mutex::new(None);
 
-type CommandTimes = HashMap<String, (u64, u64, u64)>;
+type CommandTimings = HashMap<String, (u64, u64, u64)>;
 
 /// With `VICTORY_GPU_TIMING`: the commands' time on the card since the last
 /// line by what they ran (a pipeline, or the kind of command): how many,
 /// their microseconds, and the longest one's.
-static COMMANDS_BY_WORK: Mutex<Option<CommandTimes>> = Mutex::new(None);
+static COMMANDS_BY_WORK: Mutex<Option<CommandTimings>> = Mutex::new(None);
 
 /// A command took `ms` on the card (timing run). `op` is its note: the
 /// kind and size first, then the pipeline in brackets, then what it binds.
@@ -467,21 +463,23 @@ mod command_tests {
     fn commands_are_named_by_their_pipeline() {
         use super::command_key;
         assert_eq!(
-            command_key("dispatch 2x1x1 [compute 00000000000000aa] | u4=0x1000 [heap 3: x]"),
-            "dispatch [compute 00000000000000aa]"
+            command_key(
+                "dispatch 182x1x1 [compute 24f989b98dcb03f0] | 24f989b98dcb03f0: u4=0xa6b080 [heap 341380: x]"
+            ),
+            "dispatch [compute 24f989b98dcb03f0]"
         );
         assert_eq!(
             command_key(
-                "indirect kind 10 max 1 at 0x4000 [mesh 00000000000000bb, pixel 00000000000000cc] | t"
+                "indirect kind 10 max 1 at 0xd9358fce0 [mesh 0750cb2d975c7563, pixel 085d374c5a795549] | t"
             ),
-            "indirect [mesh 00000000000000bb, pixel 00000000000000cc]"
+            "indirect [mesh 0750cb2d975c7563, pixel 085d374c5a795549]"
         );
         assert_eq!(
-            command_key("texture upload 0x5000 (128x128x1 f99 mips 3) sub 0"),
+            command_key("texture upload 0x271b61c28b0 (2048x2048x1 f99 mips 10) sub 0"),
             "texture upload"
         );
         assert_eq!(
-            command_key("alias copy of 0x6000 into 0x7000"),
+            command_key("alias copy of 0x26f66aca780 into 0x26fbdc93890"),
             "alias copy"
         );
     }
@@ -1240,14 +1238,6 @@ pub(crate) fn log(frames: f64) {
     let c: Vec<f64> = (0..COUNTERS).map(|i| taken(i) as f64 / frames).collect();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
-    if c[C::Scatter as usize] > 0.0 {
-        tracing::info!(
-            scatters = c[C::Scatter as usize],
-            pages = c[C::ScatterPages as usize],
-            maps = c[C::ScatterMaps as usize],
-            "physical page writes per frame"
-        );
-    }
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \

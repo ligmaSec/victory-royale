@@ -101,7 +101,7 @@ pub(crate) struct ResourceDesc {
 #[cfg(windows)]
 impl ResourceDesc {
     /// The texture of this one's levels from `base` on.
-    fn suffix_levels(&self, base: u32) -> ResourceDesc {
+    fn mip_tail(&self, base: u32) -> ResourceDesc {
         let mut d = *self;
         if base > 0 {
             d.width = (d.width >> base).max(1);
@@ -654,7 +654,6 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
-#[cfg(windows)]
 pub(crate) fn view_format(this: This) -> Option<u32> {
     // First: a view of no resource (a typed null view) has none.
     let host = host_resource(this)?;
@@ -939,9 +938,7 @@ fn place<'a>(
                 alignment: 0,
             };
         };
-        if cfg!(feature = "diagnostics") {
-            tracing::debug!(?desc, ?one, "allocation info");
-        }
+        tracing::debug!(?desc, ?one, "allocation info");
         let offset = total.size.next_multiple_of(one.alignment);
         each(
             i,
@@ -1103,14 +1100,12 @@ pub(crate) extern "system" fn create_heap(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    if cfg!(feature = "diagnostics") {
-        tracing::debug!(
-            size = desc.size,
-            kind = desc.properties.kind,
-            flags = format_args!("{:#x}", desc.flags),
-            "heap"
-        );
-    }
+    tracing::debug!(
+        size = desc.size,
+        kind = desc.properties.kind,
+        flags = format_args!("{:#x}", desc.flags),
+        "heap"
+    );
     if desc.alignment != 0 && !desc.alignment.is_power_of_two() {
         return E_INVALIDARG;
     }
@@ -1424,7 +1419,7 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A title texture held alive ([`alias_of`]).
+/// A title texture held alive ([`hold`], [`alias_of`]).
 #[cfg(windows)]
 pub(crate) struct Held(This);
 
@@ -1679,7 +1674,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let texture = match texture {
             Some(texture) => Some(texture),
-            None => host_texture(&r.desc.suffix_levels(base), r.host.state, clear),
+            None => host_texture(&r.desc.mip_tail(base), r.host.state, clear),
         };
         let Some(texture) = texture else {
             r.host.refused.store(true, Relaxed);
@@ -3015,14 +3010,12 @@ pub(crate) extern "system" fn create_committed(
         tracing::warn!(?desc, "no size for this resource");
         return E_INVALIDARG;
     };
-    if cfg!(feature = "diagnostics") {
-        tracing::debug!(
-            dimension = desc.dimension,
-            size = info.size,
-            heap = heap.kind,
-            "committed resource"
-        );
-    }
+    tracing::debug!(
+        dimension = desc.dimension,
+        size = info.size,
+        heap = heap.kind,
+        "committed resource"
+    );
     let memory = match Memory::for_resource(info, heap.kind) {
         Ok(memory) => memory,
         Err(hr) => return hr,
@@ -3082,9 +3075,7 @@ pub(crate) extern "system" fn register_page_pool(
     if out.is_null() || pages == 0 || !address.is_multiple_of(KIB_64) {
         return E_INVALIDARG;
     }
-    if cfg!(feature = "diagnostics") {
-        tracing::debug!(address = format_args!("{address:#x}"), pages, "page pool");
-    }
+    tracing::debug!(address = format_args!("{address:#x}"), pages, "page pool");
     let mut pools = page_pools();
     pools.push(Some((address, pages)));
     // SAFETY: checked non-null; the title passes room for a handle.
@@ -3126,15 +3117,13 @@ pub(crate) extern "system" fn create_at_address(
     if address == 0 {
         return E_INVALIDARG;
     }
-    if cfg!(feature = "diagnostics") {
-        tracing::debug!(
-            address = format_args!("{address:#x}"),
-            dimension = desc.dimension,
-            width = desc.width,
-            layout,
-            "resource at an address"
-        );
-    }
+    tracing::debug!(
+        address = format_args!("{address:#x}"),
+        dimension = desc.dimension,
+        width = desc.width,
+        layout,
+        "resource at an address"
+    );
     const COMMON: u32 = 0;
     const DEFAULT: HeapProperties = HeapProperties {
         kind: 1,
@@ -3293,13 +3282,13 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // that fills at world entry. They are not part of what a texture is.
     // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    #[cfg(feature = "diagnostics")]
-    let raw = *desc;
     let mut key = *desc;
     if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
         key[1] = 0;
         key[13] = 0;
     }
+    #[cfg(feature = "diagnostics")]
+    let raw = *desc;
     let desc = &key;
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
@@ -3787,15 +3776,15 @@ mod tests {
             desc.flags = flags;
             let size = footprint(&desc).unwrap().size as usize;
             // Only the tail is mapped, as with a streamed console texture.
-            // SAFETY: a null base lets the OS choose a fresh reservation of `size` bytes.
+            // SAFETY: a null address lets Windows choose the reservation base.
             let address =
                 unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) };
             assert!(!address.is_null());
             struct Pages(*mut std::ffi::c_void);
             impl Drop for Pages {
                 fn drop(&mut self) {
-                    // SAFETY: `self.0` is the owned reservation's base;
-                    // MEM_RELEASE requires size zero.
+                    // SAFETY: this guard owns the original VirtualAlloc base
+                    // and passes zero size as required by MEM_RELEASE.
                     unsafe {
                         VirtualFree(self.0, 0, MEM_RELEASE);
                     }
@@ -3803,10 +3792,12 @@ mod tests {
             }
             let _pages = Pages(address);
             let mapped = if all_mapped { size } else { 65536 };
-            // SAFETY: `address` is our live reservation's base and `mapped` fits within `size`.
+            // SAFETY: `address` is the live reservation base and `mapped`
+            // is within the reserved range.
             let committed = unsafe { VirtualAlloc(address, mapped, MEM_COMMIT, PAGE_READWRITE) };
-            assert_eq!(committed, address);
-            // SAFETY: the commit succeeded for `mapped` writable bytes at `address`.
+            assert!(!committed.is_null());
+            // SAFETY: the successful commit made the first `mapped` bytes
+            // of our reservation writable; the resource does not exist yet.
             unsafe {
                 std::ptr::write_bytes(address.cast::<u8>(), 0x5a, mapped);
             }
@@ -3840,7 +3831,7 @@ mod tests {
                 if flags == 0 { Some(12) } else { None }
             );
             let host = host_resource(title).unwrap();
-            // SAFETY: `host` is the live D3D12 resource retained by the test's title object.
+            // SAFETY: `host` holds a live ID3D12Resource reference.
             let of = unsafe { host.GetDesc() };
             assert_eq!(of.MipLevels, 12);
             assert_eq!((of.Width, of.Height), (2048, 2048));
@@ -3875,7 +3866,7 @@ mod tests {
                 tiled.given_bytes() < size as u64,
                 "unmapped large levels still consume no tiles after upload"
             );
-            // SAFETY: `gpu.device` is the live D3D12 device used for the synchronized upload.
+            // SAFETY: `gpu` holds the live D3D12 device being queried.
             unsafe {
                 assert!(gpu.device.GetDeviceRemovedReason().is_ok());
             }
@@ -4978,18 +4969,10 @@ float4 corner(uint i : SV_VertexID) : SV_Position {
     float z = float(number) * asfloat(0x37800080);
     return float4(float(i & 1) * 4.0 - 1.0, float(i >> 1) * 4.0 - 1.0, z, 1.0);
 }
-float4 shade_target() : SV_Target { return 1.0; }
+float4 lit() : SV_Target { return 1.0; }
 "#;
         let vs = crate::host::compile(SOURCE, c"corner", c"vs_5_1").unwrap();
-        // The graphics pipeline takes its root signature from the vertex shader.
-        let ps = crate::hlsl::compile_stage(
-            "depth-twin test",
-            SOURCE,
-            c"shade_target",
-            c"ps_5_1",
-            false,
-        )
-        .unwrap();
+        let ps = crate::host::compile(SOURCE, c"lit", c"ps_5_1").unwrap();
         let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),

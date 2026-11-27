@@ -156,7 +156,8 @@ impl Composer {
         (width, height): (u32, u32),
     ) -> windows::core::Result<()> {
         while self.views.len() <= slot {
-            // SAFETY: the live device reads this valid heap description only during the call.
+            // SAFETY: the heap description lives through the call and requests
+            // two shader-visible CBV/SRV/UAV slots on the host device.
             let heap = unsafe {
                 host.device
                     .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -270,7 +271,8 @@ mod tests {
                 Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                 ..Default::default()
             };
-            // SAFETY: the descriptor and output slot are live through creation.
+            // SAFETY: the descriptors and writable output live through the call;
+            // this is a single-sample render target in the default heap.
             unsafe {
                 host.device
                     .CreateCommittedResource(
@@ -296,7 +298,9 @@ mod tests {
         let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
         let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         let cmds = &list.list;
-        // SAFETY: the list is open; the views name retained render targets.
+        // SAFETY: Clears and barriers use fresh render-target textures on an
+        // open list. The resources and compositor outlive execution, which
+        // waits for the copy before mapping its one row of three RGBA8 pixels.
         unsafe {
             cmds.ClearRenderTargetView(host.rtv(Some(&base), None), &[0.5, 0.0, 0.0, 1.0], None);
             let overlay_rtv = host.rtv(Some(&overlay), None);

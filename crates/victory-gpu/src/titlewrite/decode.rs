@@ -435,29 +435,29 @@ fn arithmetic(alu: Alu, a: u64, b: u64, size: usize, keeps: bool, flags: u32) ->
 /// was there (`None`: not aligned).
 ///
 /// # Safety
-/// `size` is 1, 2, 4 or 8, and `at` points to that many initialized bytes
-/// valid for reads and writes. Concurrent accesses must not race with an
-/// unlocked update; a locked update requires compatible atomic accesses of
-/// the same width or synchronization.
+/// `size` is 1, 2, 4, or 8, and that many initialized bytes can be read and
+/// written at `at`. Concurrent accesses must be compatible with the access
+/// mode selected by `locked`.
 unsafe fn change(at: usize, size: usize, locked: bool, f: impl Fn(u64) -> u64) -> Option<u64> {
     if !locked {
         let mut bytes = [0u8; 8];
-        // SAFETY: `at` is readable for `size` bytes, and the separate local
-        // array is at least that large.
+        // SAFETY: the caller supplies `size` readable bytes, and `size` fits
+        // in our disjoint stack array.
         unsafe { std::ptr::copy_nonoverlapping(at as *const u8, bytes.as_mut_ptr(), size) };
         let was = u64::from_le_bytes(bytes);
-        let new = f(was).to_le_bytes();
-        // SAFETY: `at` is writable for `size` bytes with no conflicting
-        // accesses, and `new` supplies that many bytes without overlapping it.
-        unsafe { std::ptr::copy_nonoverlapping(new.as_ptr(), at as *mut u8, size) };
+        // SAFETY: the caller supplies `size` writable bytes, and the disjoint
+        // temporary supplies eight initialized bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(f(was).to_le_bytes().as_ptr(), at as *mut u8, size)
+        };
         return Some(was);
     }
     if !at.is_multiple_of(size) {
         return None;
     }
-    // SAFETY: the caller supplies valid memory and compatible concurrent
-    // access for the selected width; the check above ensures alignment.
-    let was = unsafe {
+    // SAFETY: the caller supplies valid storage and compatible accesses;
+    // the preceding check aligns `at` for the selected atomic width.
+    Some(unsafe {
         match size {
             1 => u64::from(
                 AtomicU8::from_ptr(at as *mut _)
@@ -478,8 +478,7 @@ unsafe fn change(at: usize, size: usize, locked: bool, f: impl Fn(u64) -> u64) -
                 .fetch_update(SeqCst, SeqCst, |v| Some(f(v)))
                 .ok()?,
         }
-    };
-    Some(was)
+    })
 }
 
 impl Store {
@@ -488,14 +487,13 @@ impl Store {
     /// exchanges).
     ///
     /// # Safety
-    /// [`Store::size`] initialized bytes can be read at `at` without a race.
+    /// [`Store::size`] bytes can be read at `at`.
     pub(super) unsafe fn same(&self, c: &CONTEXT) -> Option<(bool, u32)> {
         if self.locked {
             return None;
         }
         let mut there = [0u8; 32];
-        // SAFETY: the source is readable by the caller's contract, and the
-        // decoded width fits in the separate local array.
+        // SAFETY: by the caller (32 bytes at the most).
         unsafe {
             std::ptr::copy_nonoverlapping(self.at as *const u8, there.as_mut_ptr(), self.size)
         };
@@ -533,21 +531,22 @@ impl Store {
     /// nothing was done.
     ///
     /// # Safety
-    /// [`Store::size`] initialized bytes can be read and written at `to`.
-    /// Plain accesses must not race; locked updates require compatible atomic
-    /// accesses of the same width or synchronization.
+    /// [`Store::size`] bytes can be read and written at `to`.
     pub(super) unsafe fn run(&self, c: &mut CONTEXT, to: usize) -> bool {
         let (size, locked, m) = (self.size, self.locked, mask(self.size));
+        // The decoder chooses scalar widths (1, 2, 4, or 8) for all
+        // read-modify-write operations. Only Put can be wider.
         match self.op {
             Op::Put(bytes) => {
                 // As one, for those the processor stores as one.
-                let low = u64::from_le_bytes([
-                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-                ]);
-                // SAFETY: the caller provides writable memory without a race.
-                // Typed stores check alignment; the byte copy fits in `bytes`
-                // and does not overlap the target.
+                // SAFETY: the caller supplies a writable range. The typed
+                // stores check alignment; the fallback copies at most the
+                // 32 initialized bytes of the disjoint local array.
                 unsafe {
+                    let low = u64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ]);
                     match size {
                         1 => (to as *mut u8).write_volatile(bytes[0]),
                         2 if to.is_multiple_of(2) => (to as *mut u16).write_volatile(low as u16),
@@ -559,18 +558,21 @@ impl Store {
             }
             Op::Alu { alu, with, keeps } => {
                 let flags = c.EFlags;
-                let update = |v| arithmetic(alu, v, with, size, keeps, flags).0;
-                // SAFETY: ALU operations decode to scalar widths; the caller
-                // guarantees access at `to` for a plain or locked update.
-                let Some(was) = (unsafe { change(to, size, locked, update) }) else {
+                // SAFETY: the caller supplies the destination, and the decoder
+                // selects a scalar width; `change` checks locked alignment.
+                let Some(was) = (unsafe {
+                    change(to, size, locked, |v| {
+                        arithmetic(alu, v, with, size, keeps, flags).0
+                    })
+                }) else {
                     return false;
                 };
                 c.EFlags = arithmetic(alu, was, with, size, keeps, flags).1;
             }
             Op::Xchg(register) => {
                 let value = register.get(c) & m;
-                // SAFETY: XCHG has a scalar width and uses the caller's
-                // guarantee for locked updates.
+                // SAFETY: the caller supplies the destination for this scalar
+                // exchange; `change` checks locked alignment.
                 let Some(was) = (unsafe { change(to, size, true, |_| value) }) else {
                     return false;
                 };
@@ -578,10 +580,11 @@ impl Store {
             }
             Op::Xadd(register) => {
                 let value = register.get(c);
-                let add = |v: u64| v.wrapping_add(value) & m;
-                // SAFETY: XADD has a scalar width and the caller guarantees
-                // plain or locked access at `to`, as selected by the prefix.
-                let Some(was) = (unsafe { change(to, size, locked, add) }) else {
+                let Some(was) =
+                    // SAFETY: the caller supplies the destination, and the decoder
+                    // selects a scalar width; `change` checks locked alignment.
+                    (unsafe { change(to, size, locked, |v| v.wrapping_add(value) & m) })
+                else {
                     return false;
                 };
                 c.EFlags = arithmetic(Alu::Add, was, value, size, false, c.EFlags).1;
@@ -589,10 +592,16 @@ impl Store {
             }
             Op::Cmpxchg(register) => {
                 let (value, expected) = (register.get(c) & m, c.Rax & m);
-                let replace = |v| if v & m == expected { value } else { v };
-                // SAFETY: CMPXCHG has a scalar width and the caller guarantees
-                // plain or locked access at `to`, as selected by the prefix.
-                let Some(was) = (unsafe { change(to, size, locked, replace) }) else {
+                // SAFETY: the caller supplies the destination, and the decoder
+                // selects a scalar width; `change` checks locked alignment.
+                let Some(was) = (unsafe {
+                    change(
+                        to,
+                        size,
+                        locked,
+                        |v| if v & m == expected { value } else { v },
+                    )
+                }) else {
                     return false;
                 };
                 let was = was & m;

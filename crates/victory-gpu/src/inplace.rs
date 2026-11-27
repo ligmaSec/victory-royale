@@ -40,6 +40,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
+
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
@@ -1099,9 +1100,9 @@ fn describe(heap: &ID3D12Heap) -> String {
 /// (committed, read-write, write-watched): a part of it opened.
 unsafe fn private(p: &mut Probe, rig: &mut Rig) {
     const SIZE: usize = 64 * K64;
-    // SAFETY: the CPU accesses stay inside committed pages of our allocation
-    // and precede the protection changes. The GPU work is waited for before
-    // the placed buffer and heap are dropped and the allocation is released.
+    // SAFETY: the allocation is checked for success before use; the probe's
+    // aligned accesses and page operations stay within its SIZE bytes.
+    // Placed resources and heaps are dropped before the allocation is released.
     unsafe {
         let base = mem::VirtualAlloc(
             std::ptr::null(),
@@ -1197,9 +1198,10 @@ unsafe fn private(p: &mut Probe, rig: &mut Rig) {
 /// pages: reserved (as it is made today) and committed.
 unsafe fn section(p: &mut Probe, rig: &mut Rig) {
     const SIZE: usize = 32 * K64;
-    // SAFETY: CPU accesses stay within the successfully mapped views while
-    // they are live and writes precede protection changes. The GPU work is
-    // waited for before releasing its buffer, heap, and backing section.
+    // SAFETY: these are the probe's own section handles and placeholder.
+    // CPU accesses stay inside successfully mapped views of the committed
+    // section and precede unmapping; the placed buffer and heap keep the
+    // backing alive during the GPU access between views.
     unsafe {
         let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
         let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
@@ -1323,9 +1325,9 @@ unsafe fn cost(p: &mut Probe, rig: &mut Rig, memory: &dyn Fn() -> Option<[u64; 4
     let bytes = mb << 20;
     let shared = || memory().map_or(0, |m| m[3] >> 20);
     let ms = |speed: Option<f64>| speed.map_or("?".to_owned(), |ms| format!("{ms:.1}"));
-    // SAFETY: only successful allocations and section handles are used. The
-    // placed buffers fit their backing stores, and the timed copies finish
-    // before the heaps and backing stores are released.
+    // SAFETY: only successful allocations and section handles are opened.
+    // The placed buffers and copies stay within the backing size, and the
+    // D3D12 objects are dropped before releasing the allocation or handle.
     unsafe {
         let base = mem::VirtualAlloc(
             std::ptr::null(),

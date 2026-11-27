@@ -19,6 +19,8 @@
 #![cfg_attr(not(windows), allow(dead_code, unused_variables, unused_mut))]
 
 mod adapter;
+#[cfg(windows)]
+mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
@@ -118,7 +120,9 @@ mod watch;
 
 pub use frame::set_frame_interval_override;
 #[cfg(windows)]
-pub use host::{HdrDisplayInfo, display_hdr_info, on_failure, write_title_memory};
+pub use host::{
+    HdrDisplayInfo, display_hdr_info, log_defrag_counters, on_failure, write_title_memory,
+};
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).

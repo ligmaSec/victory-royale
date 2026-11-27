@@ -18,6 +18,9 @@
 //! pipelines they were dropped; that run had no lamps and no diffuse light to
 //! its end (run textures-d2, the first after a new translation; Belobug
 //! 18e57db8 found the same).
+//! Persistent initialization producers are started at creation and finished
+//! before their first dispatch, outside that frame budget: a missed head
+//! blendshape mapping leaves subsequent head skinning without its inputs.
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -25,8 +28,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
+use super::{Role, Shader};
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -44,15 +47,65 @@ pub(crate) struct Pending {
     reported_pending: AtomicBool,
     /// Distinguishes work created during loading from first-use creation.
     created_at: Instant,
-    /// A pass over the screen ([`GraphicsState::screen_pass`]).
+    /// A pass over the screen ([`GraphicsState::screen_pass`]) or a confirmed
+    /// opening-scene / bake producer that must never sit behind cold RT shaders.
     screen: bool,
+    /// Confirmed first-scene / bake producer prepared early even on a cold cache.
+    scene_input: bool,
+    /// One-time data initialization must finish before its first dispatch.
+    required_initialization: bool,
+    /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
+    left_out: Option<&'static str>,
 }
 
-// SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
-// elements point into its own names) is only read after creation.
-unsafe impl Send for Pending {}
-// SAFETY: as above.
-unsafe impl Sync for Pending {}
+fn has_role(shaders: &[Arc<Shader>], role: Role) -> bool {
+    shaders
+        .iter()
+        .any(|s| s.stage == "compute" && s.roles.has(role))
+}
+
+/// This producer writes head mappings retained for the run. Losing its first
+/// dispatch leaves later skinning reading uninitialized data even after the
+/// compiler queue has drained.
+fn required_initialization(shaders: &[Arc<Shader>]) -> bool {
+    has_role(shaders, Role::SkinInit)
+}
+
+fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
+    let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        if builder {
+            return false;
+        }
+        // Without BVH, ~1,000 ray resolve shaders shade no hits while
+        // clogging the cold compiler queue; skip unless VICTORY_RT_RESOLVE=1.
+        std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v == "0")
+    });
+    if skip_rt && has_role(shaders, Role::RayResolve) {
+        return Some("shades ray-tracing hits without BVH, left out");
+    }
+    static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
+    let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        if builder {
+            return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
+        }
+        std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
+    });
+    if skip_activate && has_role(shaders, Role::ProbeActivation) {
+        return Some("ray activation shader without BVH, left out");
+    }
+    None
+}
+
+/// Confirmed first-scene producers. Prepare these at creation even on a cold
+/// launch so cutscene lighting, tiling, and bakes never miss their first frame.
+fn scene_input(shaders: &[Arc<Shader>]) -> bool {
+    shaders
+        .iter()
+        .any(|s| s.roles.has(Role::SceneInput) || s.roles.has(Role::Bake))
+}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
@@ -68,10 +121,17 @@ impl Pending {
                 .unwrap_or_default()
                 .as_bytes(),
         );
-        let screen = graphics.as_ref().is_some_and(|g| g.screen_pass())
-            && shaders.iter().all(|s| s.stage != "mesh");
+        let required_initialization = required_initialization(&shaders);
+        let scene_input = required_initialization || scene_input(&shaders);
+        let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
+            && shaders.iter().all(|s| s.stage != "mesh"))
+            || scene_input;
+        let left_out = left_out(&shaders);
         Pending {
             screen,
+            scene_input,
+            required_initialization,
+            left_out,
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -110,10 +170,14 @@ impl Pending {
     }
 }
 
-/// Why a pipeline has no host pipeline yet (diagnostics).
+/// Why a pipeline has no host pipeline (diagnostics): intentional omission,
+/// pending compile, or failure. `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<std::borrow::Cow<'static, str>> {
     use std::borrow::Cow;
+    if let Some(why) = p.left_out {
+        return Some(Cow::Borrowed(why));
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some(Cow::Borrowed("being made")),
@@ -183,6 +247,9 @@ pub(crate) fn waiting() -> u64 {
 
 /// The compiled host pipeline, if ready within the frame's wait budget.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if p.left_out.is_some() {
+        return None;
+    }
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     let first_use = !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed);
@@ -196,7 +263,13 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         .then(|| p.created_at.elapsed().as_millis() as u64);
     if age_at_request.is_some() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if p.required_initialization {
+            // The title never repeats this write. OnceLock waits if a
+            // worker already owns the compile, or builds it here.
+            p.make();
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     if p.made.get().is_none() && !p.reported_pending.swap(true, Ordering::Relaxed) {
         tracing::info!(
@@ -204,10 +277,16 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
             pipeline = %p.key,
             shaders = ?p.shaders,
             screen = p.screen,
+            scene_input = p.scene_input,
             age_at_request_ms = age_at_request.unwrap_or(0),
             queued = WAITING.load(Ordering::Relaxed),
             "requested pipeline still compiling after its wait budget; its draw or dispatch cannot run"
         );
+    }
+    if first_use && p.required_initialization {
+        tracing::info!(frame = crate::frame::current(), shaders = ?p.shaders,
+            ready = p.made.get().is_some_and(|made| made.is_some()),
+            "persistent initialization pipeline resolved before its first dispatch");
     }
     p.made.get()?.as_ref()
 }
@@ -215,15 +294,23 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    if p.left_out.is_some() {
+        return false;
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
 
-/// At creation, start work immediately if a previous run used the pipeline.
+/// At the title's creation of a pipeline: starts it at once if an earlier
+/// run drew with it (during loading, so the world's first frames find it),
+/// or if it is a confirmed opening-scene / bake producer.
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.left_out.is_some() {
+        return;
+    }
+    if !p.shaders.is_empty() && (p.scene_input || super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, EARLY);
+        start(p, if p.scene_input { REQUESTED } else { EARLY });
     }
 }
 
@@ -557,6 +644,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn initialization_producers_are_started_early_without_classifying_recurring_skinning() {
+        let pending = |stage, init| {
+            let mut roles = super::super::Roles::default();
+            if init {
+                roles.insert(Role::SkinInit);
+            }
+            let shader = Arc::new(Shader {
+                stage,
+                hash: String::new(),
+                container: Vec::new(),
+                roles,
+                disabled: false,
+                ambient: None,
+                translated: OnceLock::new(),
+            });
+            Pending::new(vec![shader], None)
+        };
+        let p = pending("compute", true);
+        assert!(p.required_initialization && p.scene_input && p.screen);
+        assert!(!pending("pixel", true).required_initialization);
+        assert!(!pending("compute", false).required_initialization);
+    }
+
+    #[test]
     fn a_cold_compute_dispatch_respects_the_frame_budget() {
         let p = Arc::new(Pending::new(Vec::new(), None));
         // A worker has claimed the pipeline but cannot compile it yet.
@@ -564,6 +675,43 @@ mod tests {
         p.queue_state.store(MAKING, Ordering::Relaxed);
         assert!(ready(&p).is_none());
         assert!(p.made.get().is_none());
+    }
+
+    #[test]
+    fn first_initialization_dispatch_waits_for_the_compiler_past_the_frame_budget() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.required_initialization = true;
+        // A worker has already claimed this pipeline, but its driver compile
+        // has not finished. No real GPU or proprietary shader is needed.
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        let p = Arc::new(p);
+        let entered = std::sync::Barrier::new(2);
+        let (release, gate) = std::sync::mpsc::channel();
+        let (returned, result) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = p.clone();
+            let worker_entered = &entered;
+            scope.spawn(move || {
+                worker.made.get_or_init(|| {
+                    worker_entered.wait();
+                    gate.recv().unwrap();
+                    None
+                });
+            });
+            entered.wait();
+            scope.spawn(|| returned.send(ready(&p).is_some()).unwrap());
+            // The default frame budget is 500 ms. The dispatch must still
+            // be waiting after that budget, rather than returning pending.
+            let early = result.recv_timeout(Duration::from_millis(650));
+            release.send(()).unwrap();
+            assert!(matches!(
+                early,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert!(!result.recv_timeout(Duration::from_secs(10)).unwrap());
+        });
+        assert!(p.made.get().is_some());
+        assert!(!p.reported_pending.load(Ordering::Relaxed));
     }
 
     #[test]

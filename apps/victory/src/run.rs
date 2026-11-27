@@ -261,10 +261,25 @@ fn render_scale(spec: &str) -> Result<f32> {
     spec.trim()
         .parse::<f32>()
         .ok()
-        .filter(|scale| (0.5..=2.0 / 3.0).contains(scale))
-        .ok_or_else(|| {
-            anyhow::anyhow!("VICTORY_RENDER_SCALE expects 0.5 through the stock scale (two thirds)")
-        })
+        .filter(|scale| (0.5..=1.0).contains(scale))
+        .ok_or_else(|| anyhow::anyhow!("VICTORY_RENDER_SCALE expects 0.5 through 1.0"))
+}
+
+#[cfg(any(windows, test))]
+fn output_size(spec: &str) -> Result<(u32, u32)> {
+    let mode = spec
+        .trim()
+        .split_once(['x', 'X'])
+        .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)));
+    mode.filter(|mode| {
+        matches!(
+            mode,
+            (1280, 720) | (1664, 936) | (1920, 1080) | (2560, 1440) | (3840, 2160)
+        )
+    })
+    .ok_or_else(|| {
+        anyhow::anyhow!("VICTORY_OUTPUT expects a supported title mode, up to 3840x2160")
+    })
 }
 
 #[cfg(windows)]
@@ -274,39 +289,46 @@ fn configure_render_profile(image: &victory_loader::LoadedImage, console: Consol
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(error) => Err(error).with_context(|| format!("reading {name}")),
     };
-    for name in ["VICTORY_OUTPUT", "VICTORY_FFX_SCALE", "VICTORY_UPSCALER"] {
+    for name in ["VICTORY_FFX_SCALE", "VICTORY_UPSCALER"] {
         anyhow::ensure!(
             std::env::var_os(name).is_none(),
             "{name} is not supported; use the title's output and upscaler settings"
         );
     }
+    let output = setting("VICTORY_OUTPUT")?
+        .as_deref()
+        .map(output_size)
+        .transpose()?;
     let scale = setting("VICTORY_RENDER_SCALE")?
         .as_deref()
         .map(render_scale)
         .transpose()?;
     anyhow::ensure!(
-        scale.is_none() || matches!(console, Console::SeriesX),
-        "VICTORY_RENDER_SCALE is only supported on the Series X profile"
+        (scale.is_none() && output.is_none()) || matches!(console, Console::SeriesX),
+        "VICTORY_OUTPUT and VICTORY_RENDER_SCALE are only supported on the Series X profile"
     );
     let frame = frame_override(
         setting("VICTORY_FRAME_INTERVAL_MS")?.as_deref(),
         setting("VICTORY_TITLE_FPS")?.as_deref(),
     )?;
-    if scale.is_some() || frame.is_some() {
+    if output.is_some() || scale.is_some() || frame.as_ref().is_some_and(|f| f.title_fps.is_some())
+    {
         let fps = frame.as_ref().and_then(|frame| frame.title_fps);
         // SAFETY: all images have been bound, and the executable has not been entered yet.
-        unsafe { image.apply_render_profile(scale, fps) }?;
-        if let Some(frame) = frame {
-            victory_hle::set_frame_interval_override(frame.interval);
-            let title_rate = fps.map_or_else(|| "unchanged".to_owned(), |fps| fps.to_string());
-            println!(
-                "frame override {:?}, title rate {title_rate}",
-                frame.interval
-            );
-        }
-        if let Some(scale) = scale {
-            println!("render scale   {scale}");
-        }
+        unsafe { image.apply_render_profile(output, scale, fps) }?;
+    }
+    if let Some(frame) = frame {
+        victory_hle::set_frame_interval_override(frame.interval);
+        let rate = frame
+            .title_fps
+            .map_or_else(|| "unchanged".to_owned(), |fps| fps.to_string());
+        println!("frame override {:?}, title rate {rate}", frame.interval);
+    }
+    if let Some((width, height)) = output {
+        println!("output         {width}x{height}");
+    }
+    if let Some(scale) = scale {
+        println!("render scale   {scale}");
     }
     Ok(())
 }
@@ -338,7 +360,7 @@ fn check_startup_archive(path: &Path) -> Result<()> {
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
     victory_loader::dump_stacks_on_schedule();
     victory_hle::modules::audio::capture::start();
-    watch(image.base(), image.info().size_of_image as usize);
+    watch(image);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
     let size = image.info().size_of_image as usize;
@@ -361,17 +383,19 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
 /// Debugging aid: `VICTORY_WATCH=<rva>,...` (hex) logs the u32 at each
 /// title+rva whenever it changes, polled every 5 ms (an engine's state, say).
 #[cfg(all(windows, feature = "diagnostics"))]
-fn watch(base: usize, size: usize) {
+fn watch(image: &victory_loader::LoadedImage) {
     let Ok(list) = std::env::var("VICTORY_WATCH") else {
         return;
     };
-    let rvas = watch_rvas(&list, size);
+    let rvas = watch_rvas(&list, image.info().size_of_image as usize);
+    let image = image.clone();
     std::thread::spawn(move || {
         let mut seen = vec![None; rvas.len()];
         loop {
             for (&rva, seen) in rvas.iter().zip(&mut seen) {
-                // SAFETY: four bytes inside the mapped image, checked above.
-                let value = unsafe { ((base + rva) as *const u32).read_volatile() };
+                let Some(value) = image.read_diagnostic_word(rva) else {
+                    continue;
+                };
                 if *seen != Some(value) {
                     eprintln!("VIctory: title+{rva:#x} = {value:#x}");
                     *seen = Some(value);
@@ -674,7 +698,7 @@ mod cpu_check_tests {
 
 #[cfg(test)]
 mod render_profile_tests {
-    use super::{FrameOverride, frame_override, render_scale};
+    use super::{FrameOverride, frame_override, output_size, render_scale};
     use std::time::Duration;
 
     #[test]
@@ -713,11 +737,19 @@ mod render_profile_tests {
     }
 
     #[test]
-    fn render_scale_cannot_request_more_than_stock_capacity() {
+    fn render_scale_accepts_native_but_not_supersampling() {
         assert_eq!(render_scale("0.5").unwrap(), 0.5);
         assert_eq!(render_scale("0.6666667").unwrap(), 2.0 / 3.0);
-        for spec in ["1.0", "NaN", "0.49"] {
+        assert_eq!(render_scale("1.0").unwrap(), 1.0);
+        for spec in ["1.01", "NaN", "0.49"] {
             assert!(render_scale(spec).is_err());
         }
+    }
+
+    #[test]
+    fn output_accepts_the_native_mode_not_arbitrary_dimensions() {
+        assert_eq!(output_size(" 3840 X 2160 ").unwrap(), (3840, 2160));
+        assert_eq!(output_size("1920x1080").unwrap(), (1920, 1080));
+        assert!(output_size("4096x2160").is_err());
     }
 }

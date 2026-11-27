@@ -967,6 +967,13 @@ pub(super) fn write(
     after: &Threads,
     stamps: Vec<(u64, u64)>,
 ) {
+    let beside = file.with_extension("txt");
+    for path in [file, beside.as_path()] {
+        if let Err(error) = victory_core::ensure_outside_repo(path) {
+            tracing::warn!(%error, "timeline files must be outside the checkout");
+            return;
+        }
+    }
     let mut names = Names::new();
     let (events, lost) = (data.events.len(), data.lost);
     let trace = Trace::new(data.events, &stamps);
@@ -974,7 +981,6 @@ pub(super) fn write(
     if lost > 0 {
         let _ = writeln!(text, "\n{lost} events were lost: the buffer was full");
     }
-    let beside = file.with_extension("txt");
     let written = std::fs::write(&beside, text).and_then(|()| {
         let mut out = std::io::BufWriter::new(std::fs::File::create(file)?);
         chrome(&trace, &mut names, &data.stacks, after, &mut out)?;

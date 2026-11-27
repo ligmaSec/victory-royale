@@ -86,6 +86,9 @@ fn build() -> [u8; 32] {
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        if std::env::var_os("VICTORY_DEFRAG_COUNTERS").is_some_and(|v| v == "1") {
+            bytes.extend_from_slice(b"\0VICTORY_DEFRAG_COUNTERS=1\0");
+        }
         // Renderer port 5 (`VICTORY_PORT_CBV=1`): constant buffers read as raw
         // bytes. Only when on, so the translations cached without it keep
         // their key.

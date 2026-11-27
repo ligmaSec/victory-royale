@@ -5,9 +5,12 @@
 //! and root parameters, and their ranges are declared: what is written there
 //! comes back to title memory (`Shadow::gpu_writes`). A view picked by an
 //! index out of a buffer, per lane, names any of the heap's. What was
-//! written through one can stay on the card, invisible to title reads and
-//! at risk of being overwritten by a refresh. Declaring every potential
-//! target for each dispatch could otherwise cover most of the heap.
+//! written through one stayed on the card: title memory, and the title's own
+//! copies and textures made from it, never saw it, and a refresh of its 64
+//! KiB put title memory's older bytes over it. (Captures replay1 and
+//! replay2: `[compute 82a2ad6d07417d36]` writes 4.6 MB a frame of a 24 MB
+//! buffer so.) To declare all such a shader could write would be 987 MB of
+//! 573 buffers for every list that runs one.
 //!
 //! Two things make it small. The compare on the card says what changed since
 //! the last time it looked, whoever wrote it and whenever: looking now and
@@ -30,8 +33,8 @@
 //! The declarations are the submission's, made when its refreshes are done
 //! (`Host::submit`): no refresh of it finds a range closed on their account.
 //!
-//! Only copies in card memory are tracked here; CPU-visible copies use
-//! their normal snapshot and comparison path.
+//! Only copies in the card's memory: for those in the PC's, a declared range
+//! is a snapshot and a compare on the CPU. (They hold 55 MB of the 987.)
 //!
 //! What it costs: the hashing of the slice and of the buffers found, and
 //! what changed of the latter coming back. What else changes: a step on the
@@ -53,9 +56,6 @@ pub(crate) fn on() -> bool {
 /// no refresh sends title memory over it while a flight may write it, and
 /// not landed), 2 (landed too).
 fn stage() -> u8 {
-    if !cfg!(feature = "diagnostics") {
-        return 0;
-    }
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| match std::env::var("VICTORY_PICKED_WRITES").as_deref() {
         Ok("1") => 1,
@@ -365,10 +365,11 @@ pub(crate) fn log(frames: f64) {
     );
 }
 
-type Writeback = Vec<(Arc<Shadow>, Vec<(usize, usize)>)>;
-
 /// Declared writes, per copy, and those of `picked`.
-pub(crate) fn with(mut back: Writeback, picked: &[Range]) -> Writeback {
+pub(crate) fn with(
+    mut back: crate::shadow::ShadowRanges,
+    picked: &[Range],
+) -> crate::shadow::ShadowRanges {
     for (copy, at, len) in picked {
         let range = (*at, *at + *len);
         match back.iter_mut().find(|b| Arc::ptr_eq(&b.0, copy)) {

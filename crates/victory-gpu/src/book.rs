@@ -287,9 +287,8 @@ fn viewable(format: i32) -> Option<i32> {
 /// The address of a texture: the base its descriptor has.
 fn texture_address(texture: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> Option<u64> {
     struct Slot {
-        // Owns the storage named by the CPU descriptor handle.
         _heap: ID3D12DescriptorHeap,
-        handle: usize,
+        at: usize,
     }
     // SAFETY: a descriptor heap, used under the lock.
     unsafe impl Send for Slot {}
@@ -312,12 +311,9 @@ fn texture_address(texture: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> Opti
         .ok()?;
         // SAFETY: a live heap.
         let at = unsafe { heap.GetCPUDescriptorHandleForHeapStart().ptr };
-        *slot = Some(Slot {
-            _heap: heap,
-            handle: at,
-        });
+        *slot = Some(Slot { _heap: heap, at });
     }
-    let at = slot.as_ref()?.handle;
+    let at = slot.as_ref()?.at;
     let format = viewable(desc.Format.0)?;
     let mut view = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT(format),
@@ -758,8 +754,8 @@ pub(crate) fn at_loss(va: u64) -> String {
     let began = std::time::Instant::now();
     while let Some((first, bytes, end)) = crate::descriptor::host::shown_bytes(at, 16_384) {
         for (i, d) in bytes.as_chunks::<32>().0.iter().enumerate() {
-            let names = decode(d);
             let slot = first + i as u32;
+            let names = decode(d);
             let (base, len) = match names {
                 Names::Nothing => continue,
                 Names::Texture { base, meta, .. } => {

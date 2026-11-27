@@ -1644,9 +1644,7 @@ pub(crate) extern "system" fn create_heap(
     // interface version; find the flag that tells them apart if a title
     // trips over this.
     let placed = placement.address != 0 && placement.size == size;
-    if cfg!(feature = "diagnostics") {
-        tracing::debug!(?desc, placed, "descriptor heap");
-    }
+    tracing::debug!(?desc, placed, "descriptor heap");
     let (start, memory) = if placed {
         if placement.address.checked_add(size).is_none() {
             return E_INVALIDARG;
@@ -1792,7 +1790,8 @@ mod tests {
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
-        // SAFETY: request a new read/write page, not a mapping over existing memory.
+        // SAFETY: a null base lets the OS choose a new private allocation;
+        // reserving and committing a page supports write watch.
         let memory = unsafe {
             VirtualAlloc(
                 std::ptr::null(),

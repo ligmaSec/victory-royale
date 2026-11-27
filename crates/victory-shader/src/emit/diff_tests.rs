@@ -696,6 +696,17 @@ fn pc_compiler_prefers_sdk_and_supports_standalone_dxc() {
     assert_eq!(locate(None), Some((console, explicit_pc)));
 }
 
+fn write_dump(path: &Path, bytes: &[u8]) {
+    victory_core::ensure_outside_repo(path).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn scratch_dir() -> tempfile::TempDir {
+    let temp = std::env::temp_dir();
+    victory_core::ensure_outside_repo(&temp).unwrap();
+    tempfile::tempdir_in(temp).unwrap()
+}
+
 fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec<u8> {
     let input = dir.join("t.hlsl");
     let output = dir.join(format!("{entry}.bin"));
@@ -761,8 +772,8 @@ fn translated_shaders_draw_as_pc_ones() {
             return;
         }
     };
-    let dir = std::env::temp_dir().join(format!("victory-diff-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = scratch_dir();
+    let dir = scratch.path();
     let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
     let texels: Vec<[f32; 4]> = (0..16)
         .map(|i| {
@@ -818,8 +829,8 @@ fn translated_shaders_draw_as_pc_ones() {
     {
         // A case may bring its own vertex shader.
         let vs = if src.contains(" vs16(") { "vs16" } else { "vs" };
-        let vs_c = translate(&compile(&console, &dir, src, vs, "vs_6_5")).unwrap();
-        let ps_c = match translate(&compile(&console, &dir, src, "ps", "ps_6_5")) {
+        let vs_c = translate(&compile(&console, dir, src, vs, "vs_6_5")).unwrap();
+        let ps_c = match translate(&compile(&console, dir, src, "ps", "ps_6_5")) {
             Ok(s) => s,
             Err(e) => {
                 failures.push(format!("{name}: {e}"));
@@ -828,12 +839,12 @@ fn translated_shaders_draw_as_pc_ones() {
         };
         if let Ok(out) = std::env::var("VICTORY_EMIT_DUMP") {
             let stem = name.replace([' ', ','], "_");
-            std::fs::write(
-                format!("{out}/{stem}.ps.cdxil"),
-                compile(&console, &dir, src, "ps", "ps_6_5"),
-            )
-            .unwrap();
-            std::fs::write(format!("{out}/{stem}.ps.dxil"), &ps_c.dxil).unwrap();
+            let out = Path::new(&out);
+            write_dump(
+                &out.join(format!("{stem}.ps.cdxil")),
+                &compile(&console, dir, src, "ps", "ps_6_5"),
+            );
+            write_dump(&out.join(format!("{stem}.ps.dxil")), &ps_c.dxil);
         }
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
@@ -856,8 +867,8 @@ fn translated_shaders_draw_as_pc_ones() {
             .unwrap();
 
         let (vs_p, ps_p) = (
-            compile(&pc, &dir, src, vs, "vs_6_5"),
-            compile(&pc, &dir, src, "ps", "ps_6_5"),
+            compile(&pc, dir, src, vs, "vs_6_5"),
+            compile(&pc, dir, src, "ps", "ps_6_5"),
         );
         // SAFETY: the PC container carries its root signature.
         let root_p: ID3D12RootSignature =
@@ -903,7 +914,6 @@ fn translated_shaders_draw_as_pc_ones() {
             failures.push(format!("{name}: {worst:?}"));
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
@@ -920,8 +930,8 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
             return;
         }
     };
-    let dir = std::env::temp_dir().join(format!("victory-diff-ms-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = scratch_dir();
+    let dir = scratch.path();
     let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
     let draw = |roots, mesh_groups| Draw {
         roots,
@@ -938,7 +948,7 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
         .iter()
         .filter(|c| only.as_ref().is_none_or(|o| o == c.0))
     {
-        let console_ms = compile(&console, &dir, src, "ms", "ms_6_5");
+        let console_ms = compile(&console, dir, src, "ms", "ms_6_5");
         let ms_c = match translate(&console_ms) {
             Ok(s) => s,
             Err(e) => {
@@ -946,11 +956,12 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
                 continue;
             }
         };
-        let ps_c = translate(&compile(&console, &dir, src, "mps", "ps_6_5")).unwrap();
+        let ps_c = translate(&compile(&console, dir, src, "mps", "ps_6_5")).unwrap();
         if let Ok(out) = std::env::var("VICTORY_EMIT_DUMP") {
             let stem = name.replace([' ', ','], "_");
-            std::fs::write(format!("{out}/{stem}.ms.cdxil"), &console_ms).unwrap();
-            std::fs::write(format!("{out}/{stem}.ms.dxil"), &ms_c.dxil).unwrap();
+            let out = Path::new(&out);
+            write_dump(&out.join(format!("{stem}.ms.cdxil")), &console_ms);
+            write_dump(&out.join(format!("{stem}.ms.dxil")), &ms_c.dxil);
         }
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
@@ -973,8 +984,8 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
             )
             .unwrap();
         let (ms_p, ps_p) = (
-            compile(&pc, &dir, src, "ms", "ms_6_5"),
-            compile(&pc, &dir, src, "mps", "ps_6_5"),
+            compile(&pc, dir, src, "ms", "ms_6_5"),
+            compile(&pc, dir, src, "mps", "ps_6_5"),
         );
         // SAFETY: the PC container carries its root signature.
         let root_p: ID3D12RootSignature =
@@ -1013,7 +1024,6 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
             failures.push(format!("{name}: {worst:?}"));
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
@@ -1040,8 +1050,8 @@ fn float_semantics_are_the_consoles() {
             return;
         }
     };
-    let dir = std::env::temp_dir().join(format!("victory-float-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = scratch_dir();
+    let dir = scratch.path();
     let src = r#"[RootSignature(RS)] [numthreads(4, 1, 1)]
         void cs(uint i : SV_GroupIndex) {
             float x = i == 0 ? k.x : i == 1 ? -k.x : i == 2 ? k.y : k.z;
@@ -1054,7 +1064,7 @@ fn float_semantics_are_the_consoles() {
                     : i == 2 ? k.w - 3.14159274 : k.w + 1.57079637;
             outb.Store(64 + 4 * i, asuint(i == 3 ? cos(r) : sin(r)));
         }"#;
-    let cs = translate(&compile(&console, &dir, src, "cs", "cs_6_5")).unwrap();
+    let cs = translate(&compile(&console, dir, src, "cs", "cs_6_5")).unwrap();
     let (root, pso) = host.compute_pipeline(&cs).unwrap();
     // 1e30, NaN, 3.5, 0.
     let k = [1e30f32.to_bits(), 0x7FC0_0000, 3.5f32.to_bits(), 0];
@@ -1079,7 +1089,6 @@ fn float_semantics_are_the_consoles() {
             },
         )
         .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(
         out[0][..16],
         [
@@ -1132,8 +1141,8 @@ fn translated_compute_matches_pc() {
             return;
         }
     };
-    let dir = std::env::temp_dir().join(format!("victory-diff-cs-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = scratch_dir();
+    let dir = scratch.path();
     let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
     let texels: Vec<[f32; 4]> = (0..16)
         .map(|i| [i as f32 / 16.0, (i % 4) as f32 * 0.3, 0.5, 1.0])
@@ -1228,10 +1237,13 @@ fn translated_compute_matches_pc() {
         .filter(|c| only.as_ref().is_none_or(|o| o == c.0))
         .filter(|c| warp || !c.0.starts_with("terminates"))
     {
-        let console_cs = compile(&console, &dir, src, "cs", "cs_6_5");
+        let console_cs = compile(&console, dir, src, "cs", "cs_6_5");
         if let Ok(out) = std::env::var("VICTORY_EMIT_DUMP") {
             let stem = name.replace([' ', ','], "_");
-            std::fs::write(format!("{out}/{stem}.cs.cdxil"), &console_cs).unwrap();
+            write_dump(
+                &Path::new(&out).join(format!("{stem}.cs.cdxil")),
+                &console_cs,
+            );
         }
         let cs_c = match translate(&console_cs) {
             Ok(s) => s,
@@ -1242,7 +1254,7 @@ fn translated_compute_matches_pc() {
         };
         if let Ok(out) = std::env::var("VICTORY_EMIT_DUMP") {
             let stem = name.replace([' ', ','], "_");
-            std::fs::write(format!("{out}/{stem}.cs.dxil"), &cs_c.dxil).unwrap();
+            write_dump(&Path::new(&out).join(format!("{stem}.cs.dxil")), &cs_c.dxil);
         }
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
@@ -1312,7 +1324,7 @@ fn translated_compute_matches_pc() {
             continue;
         }
         let ours = ours.unwrap();
-        let cs_p = compile(&pc, &dir, src, "cs", "cs_6_5");
+        let cs_p = compile(&pc, dir, src, "cs", "cs_6_5");
         // SAFETY: the PC container carries its root signature.
         let root_p: ID3D12RootSignature =
             unsafe { host.device.CreateRootSignature(0, &cs_p) }.unwrap();
@@ -1360,6 +1372,5 @@ fn translated_compute_matches_pc() {
             )),
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "{failures:#?}");
 }

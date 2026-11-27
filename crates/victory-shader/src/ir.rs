@@ -495,9 +495,9 @@ fn unspill(
             }
         } else {
             let mut of: HashMap<(u8, u32), usize> = HashMap::new();
-            for (i, first) in first.iter_mut().enumerate() {
+            for (i, first_store) in first.iter_mut().enumerate() {
                 if let Some(s) = slot(i) {
-                    *first = *of.entry(s).or_insert(i);
+                    *first_store = *of.entry(s).or_insert(i);
                 }
             }
         }
@@ -512,10 +512,10 @@ fn unspill(
             .collect();
         (of, stores.into_iter().map(|s| s.0).collect())
     };
-    type ParkingPlan = (Vec<usize>, Vec<(usize, usize)>, Vec<u8>);
+    type SpillPlan = (Vec<usize>, Vec<(usize, usize)>, Vec<u8>);
     // The stores that move as pairs (lower, upper) and every store's code;
     // none if the spare codes do not suffice.
-    let plan = |split: bool| -> Option<ParkingPlan> {
+    let plan = |split: bool| -> Option<SpillPlan> {
         let (mut of, stores) = stores_of(split);
         let mut pairs: Vec<(usize, usize)> = Vec::new();
         for (n, &(reg, lane)) in stores.iter().enumerate() {
@@ -600,7 +600,7 @@ fn unspill(
     let Some(mut chosen) = plan(false) else {
         return Vec::new();
     };
-    let lonely = |(of, pairs, _): &ParkingPlan| {
+    let lonely = |(of, pairs, _): &SpillPlan| {
         (0..list.len()).any(|i| {
             parks[i].is_some_and(|p| p.0)
                 && partner(i).is_some()
@@ -627,8 +627,7 @@ fn unspill(
         0xBE80_0000 | field(dst) << 16 | (3 + u32::from(wide)) << 8 | field(src)
     };
     const NOP: u32 = 0xBF80_0000;
-    type ParkingEdit = (usize, Option<(bool, u8, u8)>);
-    let mut edits = Vec::<ParkingEdit>::new();
+    let mut edits = Vec::new();
     for i in 0..list.len() {
         let Some((save, _, code, _)) = parks[i] else {
             continue;

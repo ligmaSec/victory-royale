@@ -160,6 +160,14 @@ impl Host {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
+                let desc = adapter
+                    .cast::<IDXGIAdapter1>()
+                    .map_err(err)?
+                    .GetDesc1()
+                    .map_err(err)?;
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                    return Err("DXGI returned hardware instead of WARP".into());
+                }
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
                 let filter = std::env::var("VICTORY_ADAPTER")
@@ -607,94 +615,6 @@ impl Host {
     }
 }
 
-/// A pass-through position from the test draw's vertex buffer.
-#[cfg(test)]
-pub(super) fn position_vs() -> HostShader {
-    use super::lower;
-    use crate::native::{HwStage, NativeProgram, StageIo, Usage, VsInput};
-    use crate::{io, ir, resource, structure};
-
-    // Pass-through VS: POSITION0 (v4..v7) -> SV_Position.
-    let vs_code: Vec<u8> = [
-        0xF800_08CFu32, // exp pos0 v4, v5, v6, v7 done
-        0x0706_0504,
-        0xF800_0200, // exp param0 off, off, off, off
-        0,
-        0xBF81_0000, // s_endpgm
-    ]
-    .iter()
-    .flat_map(|w| w.to_le_bytes())
-    .collect();
-    let vs_native = NativeProgram {
-        stage: HwStage::Vs,
-        wave64: false,
-        vgprs: 8,
-        layout: Vec::new(),
-        used: Vec::new(),
-        io: StageIo::Vs {
-            inputs: vec![VsInput {
-                usage: Usage::Generic,
-                row: 0,
-                vgpr: 4,
-                mask: 0xF,
-            }],
-            outputs: Vec::new(),
-        },
-        code: vs_code,
-    };
-    let vs_in = vec![SigElement {
-        name: "POSITION".into(),
-        index: 0,
-        kind: 0,
-        comp: 9,
-        interp: 0,
-        row: Some(0),
-        col: 0,
-        cols: 4,
-        usage: 0xF,
-        half: false,
-    }];
-    let vs_out = vec![SigElement {
-        name: "SV_Position".into(),
-        index: 0,
-        kind: 3,
-        comp: 9,
-        interp: 4,
-        row: Some(0),
-        col: 0,
-        cols: 4,
-        usage: 0xF,
-        half: false,
-    }];
-    let vp = ir::build(&vs_native.code, false, vs_native.vgprs).expect("vs ir");
-    let vst = structure::structure(&vp).expect("vs structure");
-    let vres = resource::track(&vp, &vs_native.layout, HwStage::Vs, Some(&vst)).expect("vs res");
-    let vio = io::raise(&vp, &vs_native).expect("vs io");
-    let vlow = lower::lower(&lower::Parts {
-        native: &vs_native,
-        p: &vp,
-        st: &vst,
-        io: &vio,
-        res: &vres,
-        inputs: vs_in,
-        outputs: vs_out,
-        prims: Vec::new(),
-        mesh_stride: 0,
-    })
-    .expect("vs lower");
-    HostShader {
-        stage: HwStage::Vs,
-        dxil: vlow.dxil,
-        user_data: vlow.user_data,
-        samplers: Vec::new(),
-        static_samplers: Vec::new(),
-        root_cbvs: Vec::new(),
-        root_srvs: Vec::new(),
-        root_uavs: Vec::new(),
-        root_indexed_views: Vec::new(),
-    }
-}
-
 /// A vertex shader that feeds `ps`'s inputs (zeros) and a position.
 pub fn stub_vs(ps: &HostShader) -> Result<HostShader, String> {
     let inputs = sig(&ps.dxil, FourCC::ISG1)?;
@@ -824,16 +744,6 @@ pub struct Draw<'a> {
     pub mesh_groups: u32,
 }
 
-/// Input command for the synthetic three-vertex render fixture.
-#[cfg(test)]
-#[derive(Clone, Copy)]
-pub(super) enum TriangleDraw {
-    Direct,
-    TwoTriangles,
-    Indexed,
-    IndirectIndexed,
-}
-
 #[cfg(test)]
 impl Host {
     /// Draws one triangle into an RGBA32F target and returns its texels.
@@ -842,16 +752,6 @@ impl Host {
         root: &ID3D12RootSignature,
         pso: &ID3D12PipelineState,
         d: &Draw,
-    ) -> Result<Vec<[f32; 4]>, String> {
-        self.draw_triangle(root, pso, d, TriangleDraw::Direct)
-    }
-
-    pub(super) fn draw_triangle(
-        &self,
-        root: &ID3D12RootSignature,
-        pso: &ID3D12PipelineState,
-        d: &Draw,
-        command: TriangleDraw,
     ) -> Result<Vec<[f32; 4]>, String> {
         let dev = &self.device;
         let (w, h) = d.size;
@@ -1089,61 +989,11 @@ impl Host {
                     }]),
                 );
             }
-            // An offset and negative base exercise the same addressing in both
-            // indexed calls. The indirect arguments follow the index data in the same buffer.
-            let mut signature: Option<ID3D12CommandSignature> = None;
-            if matches!(
-                command,
-                TriangleDraw::Indexed | TriangleDraw::IndirectIndexed
-            ) {
-                let words = [0u32, 2, 3, 4, 3, 1, 1, (-2i32) as u32, 0];
-                let bytes = std::mem::size_of_val(&words);
-                let buf = make(
-                    D3D12_HEAP_TYPE_UPLOAD,
-                    &buf_desc(bytes as u64),
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                )?;
-                let mut mapped = std::ptr::null_mut();
-                buf.Map(0, None, Some(&mut mapped)).map_err(err)?;
-                std::ptr::copy_nonoverlapping(words.as_ptr(), mapped.cast(), words.len());
-                buf.Unmap(0, None);
-                list.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
-                    BufferLocation: buf.GetGPUVirtualAddress(),
-                    SizeInBytes: 16,
-                    Format: DXGI_FORMAT_R32_UINT,
-                }));
-                if matches!(command, TriangleDraw::IndirectIndexed) {
-                    let arg = D3D12_INDIRECT_ARGUMENT_DESC {
-                        Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED,
-                        ..Default::default()
-                    };
-                    dev.CreateCommandSignature(
-                        &D3D12_COMMAND_SIGNATURE_DESC {
-                            ByteStride: 20,
-                            NumArgumentDescs: 1,
-                            pArgumentDescs: &arg,
-                            NodeMask: 0,
-                        },
-                        None::<&ID3D12RootSignature>,
-                        &mut signature,
-                    )
-                    .map_err(err)?;
-                    list.ExecuteIndirect(signature.as_ref().unwrap(), 1, &buf, 16, None, 0);
-                } else {
-                    list.DrawIndexedInstanced(3, 1, 1, -2, 0);
-                }
-                keep.push(buf);
-            } else if d.mesh_groups > 0 {
+            if d.mesh_groups > 0 {
                 let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
                 list6.DispatchMesh(d.mesh_groups, 1, 1);
             } else {
-                let count = if matches!(command, TriangleDraw::TwoTriangles) {
-                    6
-                } else {
-                    3
-                };
-                list.DrawInstanced(count, 1, 0, 0);
+                list.DrawInstanced(3, 1, 0, 0);
             }
             list.ResourceBarrier(&[transition(
                 &target,

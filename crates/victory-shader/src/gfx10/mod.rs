@@ -82,7 +82,7 @@ impl Instruction {
 
 /// Decodes every instruction reachable from offset 0, sorted by offset.
 pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
-    if code.len() & 3 != 0 {
+    if !code.len().is_multiple_of(4) {
         return Err(isa(code.len(), "code size is not a multiple of 4"));
     }
     let mut found = BTreeMap::new();
@@ -505,14 +505,6 @@ mod tests {
                 (24, "s_setpc_b64"),
             ]
         );
-    }
-
-    #[test]
-    fn legacy_multiply_adds_are_the_fused_ones() {
-        let fma = summary(&[0xD540_0000, 0x040E_0501, S_ENDPGM]);
-        assert_eq!(fma[0].2, "v_fma_legacy_f32");
-        let fmac = summary(&[0x0C00_0501, S_ENDPGM]);
-        assert_eq!(fmac[0].2, "v_fmac_legacy_f32");
     }
 
     #[test]

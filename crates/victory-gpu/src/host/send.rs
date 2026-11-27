@@ -204,15 +204,11 @@ pub(super) struct Own {
 /// Runs whose pairs are one piece of work.
 const RUNS_AT_A_TIME: usize = 4096;
 
-/// A dirty shadow and the byte ranges to upload, as start/end offsets.
+/// A shadow and the dirty offset ranges to send to its card copy.
 pub(super) type DirtyCopy = (std::sync::Arc<Shadow>, Vec<(usize, usize)>);
 
-/// A batch that packs short runs from one shadow into the submission's upload memory.
-struct WordBatch<'a> {
-    from: usize,
-    ranges: &'a [(usize, usize)],
-    to: usize,
-}
+/// The CPU mapping address, a batch of ranges, and the destination of its word pairs.
+type ScatterWork<'a> = (usize, &'a [(usize, usize)], usize);
 
 /// Takes what `dirty` sends up out of the CPU sides.
 pub(super) fn take(host: &Host, dirty: &[DirtyCopy]) -> Option<Own> {
@@ -245,7 +241,7 @@ pub(super) fn take(host: &Host, dirty: &[DirtyCopy]) -> Option<Own> {
     }
     let memory = memory(host, at)?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
-    let mut work = Vec::new();
+    let mut work: Vec<ScatterWork<'_>> = Vec::new();
     for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
         let from = shadow.card_data() as usize;
         moves.extend(
@@ -262,13 +258,13 @@ pub(super) fn take(host: &Host, dirty: &[DirtyCopy]) -> Option<Own> {
                 .map(|r| (r.1 - r.0) / 4)
                 .sum();
             if words > 0 {
-                work.push(WordBatch { from, ranges, to });
+                work.push((from, ranges, to));
                 to += words * 8;
             }
         }
     }
     let one = |i: usize| {
-        let WordBatch { from, ranges, to } = work[i];
+        let (from, ranges, to) = work[i];
         let mut to = to as *mut [u32; 2];
         for &(a, b) in ranges.iter().filter(|r| short(r)) {
             for offset in (a..b).step_by(4) {

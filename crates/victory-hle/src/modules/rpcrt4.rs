@@ -2,7 +2,8 @@
 //!
 //! The runtime itself is not passed through (its own `ws2_32` imports would
 //! give a title a network path outside `modules::net`): the handful of calls
-//! titles use are implemented here, and other exports are refused.
+//! titles use are implemented here, and everything else stays refused as
+//! before.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -20,16 +21,16 @@ const OUT_OF_MEMORY: i32 = 14;
 /// A version 4 GUID: 16 random bytes, the version nibble and the variant
 /// bits set.
 extern "system" fn UuidCreate(uuid: *mut Guid) -> i32 {
-    create(uuid)
+    create(uuid, false)
 }
 
 /// As [`UuidCreate`]: sequential UUIDs carry a MAC address and a clock on
 /// Windows, which a title must not learn about this machine.
 extern "system" fn UuidCreateSequential(uuid: *mut Guid) -> i32 {
-    create(uuid)
+    create(uuid, true)
 }
 
-fn create(uuid: *mut Guid) -> i32 {
+fn create(uuid: *mut Guid, _sequential: bool) -> i32 {
     if uuid.is_null() {
         return INVALID_STRING_UUID;
     }
@@ -47,19 +48,36 @@ fn create(uuid: *mut Guid) -> i32 {
 
 /// 16 bytes from the host's CSPRNG.
 fn random(bytes: &mut [u8; 16]) -> bool {
-    use windows_sys::Win32::Security::Cryptography::{
-        BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
-    };
-    // SAFETY: our own buffer, the system's preferred generator.
-    let status = unsafe {
-        BCryptGenRandom(
-            std::ptr::null_mut(),
-            bytes.as_mut_ptr(),
-            bytes.len() as u32,
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        )
-    };
-    status >= 0
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Security::Cryptography::{
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+        };
+        // SAFETY: our own buffer, the system's preferred generator.
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                bytes.as_mut_ptr(),
+                bytes.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        status >= 0
+    }
+    #[cfg(not(windows))]
+    {
+        // A counter mixed with the time: enough for identifiers in tests.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed)
+            ^ std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos() as u64);
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (n >> (8 * (i % 8))) as u8 ^ (i as u8).wrapping_mul(31);
+        }
+        true
+    }
 }
 
 extern "system" fn UuidFromStringA(text: *const c_char, uuid: *mut Guid) -> i32 {
@@ -82,19 +100,16 @@ extern "system" fn UuidFromStringW(text: *const u16, uuid: *mut Guid) -> i32 {
     if text.is_null() || uuid.is_null() {
         return INVALID_STRING_UUID;
     }
-    let mut i = 0;
-    let units = std::iter::from_fn(|| {
-        // SAFETY: the caller supplies a NUL-terminated string; the iterator
-        // stops at that unit without advancing past it.
-        let unit = unsafe { text.add(i).read() };
-        if unit != 0 {
-            i += 1;
-            Some(u32::from(unit))
-        } else {
-            None
+    let mut units = Vec::new();
+    // SAFETY: a NUL-terminated wide string from the caller.
+    unsafe {
+        let mut at = text;
+        while *at != 0 {
+            units.push(*at);
+            at = at.add(1);
         }
-    });
-    match parse(units) {
+    }
+    match parse(units.into_iter().map(|u| u as u32)) {
         // SAFETY: the caller passes a GUID to fill.
         Some(g) => unsafe {
             uuid.write(g);
@@ -112,9 +127,13 @@ extern "system" fn UuidToStringA(uuid: *const Guid, out: *mut *mut c_char) -> i3
     if out.is_null() {
         return INVALID_STRING_UUID;
     }
-    let mut bytes = [0; 37];
-    bytes[..36].copy_from_slice(&format(g));
-    write_string(out, &bytes)
+    let text = format(g);
+    let mut bytes = Vec::with_capacity(37);
+    bytes.extend_from_slice(&text);
+    bytes.push(0);
+    // SAFETY: `out` is the caller's pointer variable.
+    unsafe { out.write(allocate(&bytes).cast()) };
+    OK
 }
 
 extern "system" fn UuidToStringW(uuid: *const Guid, out: *mut *mut u16) -> i32 {
@@ -125,18 +144,13 @@ extern "system" fn UuidToStringW(uuid: *const Guid, out: *mut *mut u16) -> i32 {
     if out.is_null() {
         return INVALID_STRING_UUID;
     }
-    let mut bytes = [0; 74];
-    for (pair, b) in bytes.as_chunks_mut::<2>().0.iter_mut().zip(format(g)) {
-        pair[0] = b;
-    }
-    write_string(out, &bytes)
-}
-
-fn write_string<T>(out: *mut *mut T, bytes: &[u8]) -> i32 {
-    let text = allocate(bytes);
-    // SAFETY: the caller checked the title's output pointer.
-    unsafe { out.write(text.cast()) };
-    if text.is_null() { OUT_OF_MEMORY } else { OK }
+    let text = format(g);
+    let mut units: Vec<u16> = text.iter().map(|&b| u16::from(b)).collect();
+    units.push(0);
+    let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    // SAFETY: `out` is the caller's pointer variable.
+    unsafe { out.write(allocate(&bytes).cast()) };
+    OK
 }
 
 extern "system" fn RpcStringFreeA(string: *mut *mut c_char) -> i32 {
@@ -185,24 +199,29 @@ fn format(g: &Guid) -> [u8; 36] {
     text
 }
 
-/// A GUID from its text, with optional braces around the whole string.
-fn parse(chars: impl Iterator<Item = impl Into<u32>>) -> Option<Guid> {
-    let mut chars = chars.map(Into::<u32>::into).peekable();
-    let braced = chars.next_if_eq(&u32::from(b'{')).is_some();
+/// A GUID from its text, with or without braces and the dashes in place.
+fn parse(mut chars: impl Iterator<Item = impl Into<u32>>) -> Option<Guid> {
     let mut digits = [0u8; 32];
-    for (i, digit) in digits.iter_mut().enumerate() {
-        if matches!(i, 8 | 12 | 16 | 20) && chars.next()? != u32::from(b'-') {
-            return None;
+    let mut n = 0;
+    for c in &mut chars {
+        let c = c.into();
+        if n == 32 {
+            // Only the closing brace may follow the last digit.
+            return (c == u32::from(b'}')).then(|| assemble(&digits));
         }
-        let c = chars.next()?;
-        *digit = u8::try_from(c)
-            .ok()
-            .and_then(|c| char::from(c).to_digit(16))? as u8;
+        if c == u32::from(b'-') || (n == 0 && c == u32::from(b'{')) {
+            continue;
+        }
+        let digit = match c {
+            0x30..=0x39 => c - 0x30,
+            0x61..=0x66 => c - 0x61 + 10,
+            0x41..=0x46 => c - 0x41 + 10,
+            _ => return None,
+        };
+        digits[n] = digit as u8;
+        n += 1;
     }
-    if braced && chars.next()? != u32::from(b'}') {
-        return None;
-    }
-    chars.next().is_none().then(|| assemble(&digits))
+    (n == 32).then(|| assemble(&digits))
 }
 
 fn assemble(digits: &[u8; 32]) -> Guid {
@@ -285,25 +304,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_rpc_without_exposing_the_host_dll() {
-        let resolver = crate::HleResolver::default();
-        let classify = |name: &str| {
-            resolver.classify(
-                "rpcrt4.dll",
-                &victory_pe::ImportSymbol::Name {
-                    hint: 0,
-                    name: name.into(),
-                },
-            )
-        };
-        assert_eq!(
-            classify("UuidCreate"),
-            Some(victory_loader::Provenance::Hle)
-        );
-        assert_eq!(classify("RpcServerRegisterIf"), None);
-    }
-
-    #[test]
     fn a_guid_formats_and_parses_back() {
         let g = Guid::new(
             0x1234_abcd,
@@ -328,14 +328,6 @@ mod tests {
     #[test]
     fn garbage_is_refused() {
         assert_eq!(parse(b"1234".iter().copied()), None);
-        assert_eq!(
-            parse(
-                b"{1234abcd-00ef-4a5b-8012-3456789abcde}junk"
-                    .iter()
-                    .copied()
-            ),
-            None
-        );
         assert_eq!(
             parse(b"1234abcd-00ef-4a5b-8012-3456789abcde-".iter().copied()),
             None

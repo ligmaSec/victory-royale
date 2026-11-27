@@ -90,7 +90,7 @@ fn buddies(a: u64, b: u64) -> bool {
         (first.is_multiple_of(n) && s >> first == (1u64 << n) - 1).then_some(first)
     };
     match (run(a), run(b)) {
-        (Some(x), Some(y)) => x.min(y).is_multiple_of(2 * n) && x.abs_diff(y) == n,
+        (Some(x), Some(y)) => x.min(y) % (2 * n) == 0 && x.abs_diff(y) == n,
         _ => false,
     }
 }

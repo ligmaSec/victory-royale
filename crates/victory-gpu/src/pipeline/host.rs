@@ -35,6 +35,13 @@ pub(crate) struct GraphicsState {
     pub(super) samples: DXGI_SAMPLE_DESC,
 }
 
+// SAFETY: the input elements' name pointers address the CString allocations
+// owned by this state. They are set while reading the stream and used only
+// by readers once the state is passed to pipeline compilation workers.
+unsafe impl Send for GraphicsState {}
+// SAFETY: those allocations and the input elements are immutable when shared.
+unsafe impl Sync for GraphicsState {}
+
 impl Default for GraphicsState {
     fn default() -> Self {
         let target = D3D12_RENDER_TARGET_BLEND_DESC {
@@ -529,6 +536,7 @@ impl HostPipeline {
                     // address and its fault notes.
                     let ours = if uav {
                         slot == victory_shader::emit::SLOT_FAULTS
+                            || slot == victory_shader::emit::SLOT_MEET
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_TABLE_STRIDES

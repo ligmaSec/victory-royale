@@ -507,7 +507,9 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// default, none): one buffer (`D3D12_HEAP_TYPE_GPU_UPLOAD`), no CPU's side, no
 /// copy to send and no list of changes, unlike [`window_card_most`]. The CPU
 /// only writes them, as no shader is declared to write a window; if one were,
-/// its snapshot and compare would read through the bus, right but slow.
+/// its snapshot and compare would read through the bus, right but slow. In a
+/// captured frame the lists take 26 ms of the card instead of 29, the frame 32
+/// instead of 36; filling them costs the CPU what it did.
 ///
 /// Windows go there while a fifth of the card's budget is free, as with
 /// [`window_room_for`], which this comes before.
@@ -551,7 +553,9 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
 
 /// Whether windows outside buffers have two sides too, so that submissions
 /// in the air read the bytes they were prepared with (`VICTORY_WINDOWS_OWN=1`;
-/// off by default because the second side costs additional GPU memory).
+/// off by default: it takes the windows' bytes again, 3.3 GB in capture
+/// replay2, and what changes in them under submissions in the air is what the
+/// title's CPU writes, which it does not while they read it).
 fn windows_own() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOWS_OWN").is_some_and(|v| v == "1"))
@@ -632,6 +636,8 @@ impl SentRuns {
 #[derive(Default)]
 struct CardUploads(Mutex<Vec<Weak<Shadow>>>);
 
+pub(crate) type ShadowRanges = Vec<(Arc<Shadow>, Vec<(usize, usize)>)>;
+
 impl CardUploads {
     fn note(&self, card: &Card, runs: impl Iterator<Item = (usize, usize)>) {
         let mut runs = runs.filter(|r| r.0 < r.1).peekable();
@@ -656,7 +662,7 @@ impl CardUploads {
         }
     }
 
-    fn take(&self, sent: Option<(u64, u64)>) -> Vec<CardUpload> {
+    fn take(&self, sent: Option<(u64, u64)>) -> ShadowRanges {
         let mut queued = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::with_capacity(queued.len());
         out.extend(
@@ -682,8 +688,6 @@ impl CardUploads {
     }
 }
 
-type CardUpload = (Arc<Shadow>, Vec<(usize, usize)>);
-
 /// The copies in the card's memory whose CPU side changed since they were
 /// last asked: each with the changed offsets, in order and joined where
 /// they touch. The ranges are taken: the caller copies them to the card's
@@ -695,11 +699,11 @@ type CardUpload = (Arc<Shadow>, Vec<(usize, usize)>);
 /// that send knows the card did not hold these bytes yet
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
-pub(crate) fn card_dirty(sent_as: u64) -> Vec<CardUpload> {
+pub(crate) fn card_dirty(sent_as: u64) -> ShadowRanges {
     CARD_UPLOADS.take(relay().then(|| (sent_as, RELAY_FETCHED.load(Ordering::Acquire))))
 }
 
-type StalePageReport<'a> = dyn FnMut(&Shadow, usize, usize, (usize, u32, u32)) + 'a;
+pub(crate) type StalePageReporter<'a> = dyn FnMut(&Shadow, usize, usize, (usize, u32, u32)) + 'a;
 
 /// Diagnostics (`crate::host::upcheck`, nothing in the air): copies whose
 /// pages the write watch and the guards hold for unchanged since they were
@@ -707,7 +711,7 @@ type StalePageReport<'a> = dyn FnMut(&Shadow, usize, usize, (usize, u32, u32)) +
 /// the copy, the title address of a page that is not the same, the words that
 /// differ and the first of them (its address, the copy's value, title
 /// memory's). Returns the bytes compared.
-pub(crate) fn stale_pages(most: usize, say: &mut StalePageReport<'_>) -> usize {
+pub(crate) fn stale_pages(most: usize, say: &mut StalePageReporter<'_>) -> usize {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut all: Vec<Arc<Shadow>> = buffers_read()
         .values()
@@ -982,7 +986,7 @@ mod card_tests {
             PIECE - 16,
             PIECE,
             3 * PIECE + 0x1f00,
-            0x12_3456_dd00,
+            0xd_b790_df00,
         ] {
             let len = 5 * PIECE + 4096;
             for (from, to) in [
@@ -1015,7 +1019,7 @@ mod card_tests {
     /// What is fetched of a piece to hash it is what the shader hashes.
     #[test]
     fn a_piece_is_hashed_here_as_on_the_card() {
-        for start in [0usize, 0x10_0000, 0x12_3456_c680, 0x12_3456_7008] {
+        for start in [0usize, 0x10_0000, 0xd_5edb_c780, 0x12_3456_7008] {
             for size in [1usize << 16, 5 << 16, 0x20_0000] {
                 let span = card_span_of(start, 0, size);
                 for i in 0..span.pieces {
@@ -1342,7 +1346,9 @@ mod relay_tests {
             (title[8], title[9], title[20], title[50]),
             (0x77, 0x77, 0x77, 0x77)
         );
-        assert_eq!(title[32..36], [0xb0; 4], "B's bytes so far");
+        for (offset, &byte) in title[32..36].iter().enumerate() {
+            assert_eq!(byte, 0xb0, "B's byte so far at {}", 32 + offset);
+        }
         // The card finishes B: 36..44.
         copy[36..44].fill(0xb1);
         // The title's CPU writes 40 after B's shader did: found against
@@ -1361,7 +1367,9 @@ mod relay_tests {
             title[b.0..b.1].copy_from_slice(&t);
         }
         // B's results are there, never replaced by A's older ones.
-        assert_eq!(title[32..36], [0xb0; 4]);
+        for &byte in &title[32..36] {
+            assert_eq!(byte, 0xb0);
+        }
         for at in (36..40).chain(41..44) {
             assert_eq!(title[at], 0xb1, "B's byte at {at}");
         }
@@ -2094,7 +2102,7 @@ mod wide_tests {
         let (data, before) = (now.as_ptr() as usize, old.as_ptr() as usize);
         let mut scans = Vec::new();
         let mut wanted = Vec::new();
-        for start in [0usize, 4096, PIECE - 16, 0x12_3456_dd00] {
+        for start in [0usize, 4096, PIECE - 16, 0xd_b790_df00] {
             for (from, to) in [
                 (0, len),
                 (0, 1),
@@ -2165,7 +2173,9 @@ fn back_piece(
     // two searches above this was 44 ms a frame for 970 pieces.)
     // Where the shader and the title both changed a byte while the GPU ran,
     // the title's stays: the shader computed its byte from the copy's older
-    // data, which may belong to a record the title has already replaced.
+    // data (one cleared a bit of a record the title had already replaced,
+    // and copying it back broke the title's object: an access violation
+    // through 0xffffffff00000000; PalmVIDev e0b70476, VIctory f39c6c2).
     mask.clear();
     mask.resize(n, 0);
     let mut differs = 0u8;
@@ -2675,10 +2685,10 @@ mod merge_tests {
         wait.recv().unwrap();
         put_changed(at, &[0; 64], &[1; 64]);
         change.join().unwrap();
-        // SAFETY: the joined thread committed the first page; our reservation is
-        // still live and `put_changed` initialized these 64 bytes.
-        let actual = unsafe { std::slice::from_raw_parts(at as *const u8, 64) };
-        assert_eq!(actual, [1; 64]);
+        // SAFETY: the joined worker committed the first page, `put_changed`
+        // wrote these 64 bytes, and the test still owns the reservation.
+        let landed = unsafe { std::slice::from_raw_parts(at as *const u8, 64) };
+        assert_eq!(landed, [1; 64]);
         // SAFETY: our reservation.
         unsafe { VirtualFree(at as _, 0, MEM_RELEASE) };
     }
@@ -4849,6 +4859,49 @@ impl Shadow {
         }
     }
 
+    /// The walls trace (`crate::host::walls_trace`): a piece of `fetched`
+    /// bytes of this copy came back from the card and `written` of them
+    /// went into title memory. Summed per buffer and logged once a frame:
+    /// which shader-written buffers the title's CPU could see fresh in
+    /// that frame, and how much of each changed.
+    pub(crate) fn walls_merged(&self, fetched: usize, written: usize) {
+        if !crate::host::walls_trace() {
+            return;
+        }
+        type BufferMergeStats = (u64, u32, u64, u64);
+        static SEEN: Mutex<(u64, BTreeMap<u64, BufferMergeStats>)> =
+            Mutex::new((0, BTreeMap::new()));
+        let frame = crate::frame::current();
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.0 != frame {
+            let buffers: Vec<String> = seen
+                .1
+                .iter()
+                .map(|(at, v)| {
+                    format!(
+                        "{at:#x}+{:#x}: {} pieces, {} fetched, {} written",
+                        v.0, v.1, v.2, v.3
+                    )
+                })
+                .take(32)
+                .collect();
+            if !buffers.is_empty() {
+                tracing::info!(
+                    frame = seen.0,
+                    count = seen.1.len(),
+                    buffers = ?buffers,
+                    "walls trace: shader-written card buffers merged into title memory in this frame"
+                );
+            }
+            seen.1.clear();
+            seen.0 = frame;
+        }
+        let entry = seen.1.entry(self.start).or_insert((self.len, 0, 0, 0));
+        entry.1 += 1;
+        entry.2 += fetched as u64;
+        entry.3 += written as u64;
+    }
+
     /// After a submission, for a copy in the card's memory: `gpu` is what
     /// the card's side holds at offset `at` on, in a piece the compare
     /// found differing. The bytes shaders wrote (those that differ from the
@@ -5096,6 +5149,7 @@ impl Shadow {
                     self,
                 )
             };
+            self.walls_merged(hi - lo, merged as usize);
             if merged > 0 {
                 self.note_landing(lo, hi);
             }
@@ -5170,52 +5224,6 @@ impl Shadow {
             *at = (*at).max(now);
         }
         held
-    }
-}
-
-#[cfg(test)]
-mod copy_back_tests {
-    use super::{Shadow, take_snapshots};
-
-    #[test]
-    fn later_gpu_write_range_keeps_the_titles_newer_bytes() {
-        let Some(host) = crate::host::host() else {
-            assert!(!crate::switch::on("VICTORY_D3D12_WARP"), "WARP unavailable");
-            return;
-        };
-        const PAGE: usize = crate::watch::PAGE;
-        let mut title = vec![0u8; 2 * PAGE];
-        let start = title.as_mut_ptr() as usize;
-        let edge = (start + 2).next_multiple_of(PAGE);
-        let offset = edge - 2 - start;
-        let (buffer, data) = host
-            .shared_buffer(title.len() as u64)
-            .expect("mapped shadow buffer");
-        let copy = Shadow::new(buffer, data, 0, start as u64, title.len() as u64);
-        copy.update(start, title.len());
-        copy.writing(edge - 2, 1);
-        copy.writing(edge + 1, 1);
-
-        // Each newly declared byte uses the baseline from its own refresh,
-        // even when a larger overlapping declaration crosses a page boundary.
-        title[offset + 1..offset + 3].copy_from_slice(&[0x44, 0x45]);
-        copy.update(edge - 1, 2);
-        // SAFETY: the live shared buffer spans `title.len()` bytes and the
-        // synchronous update initialized these two bytes inside it.
-        let actual = unsafe { std::slice::from_raw_parts(data.add(offset + 1), 2) };
-        assert_eq!(actual, &[0x44, 0x45]);
-        copy.writing(edge - 2, 4);
-        take_snapshots();
-        title[offset + 1..offset + 3].copy_from_slice(&[0x55, 0x56]);
-        // SAFETY: inside the test's own mapping; simulates the GPU's write.
-        unsafe { data.add(offset + 3).write(0xaa) };
-        copy.copy_back(edge - 2, 4);
-        copy.copy_back_done(&[
-            (edge - 2, edge - 1),
-            (edge + 1, edge + 2),
-            (edge - 2, edge + 2),
-        ]);
-        assert_eq!(&title[offset..offset + 4], &[0, 0x55, 0x56, 0xaa]);
     }
 }
 
@@ -5731,13 +5739,11 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 "large buffer copied to the host"
             );
         } else {
-            if cfg!(feature = "diagnostics") {
-                tracing::debug!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "buffer copied to the host"
-                );
-            }
+            tracing::debug!(
+                start = format_args!("{:#x}", key.0),
+                len,
+                "buffer copied to the host"
+            );
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
@@ -6066,13 +6072,11 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    if cfg!(feature = "diagnostics") {
-        tracing::debug!(
-            start = format_args!("{start:#x}"),
-            len,
-            "loose memory copied to the host"
-        );
-    }
+    tracing::debug!(
+        start = format_args!("{start:#x}"),
+        len,
+        "loose memory copied to the host"
+    );
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;
@@ -6369,4 +6373,50 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod write_merge_test {
+    use super::*;
+
+    #[test]
+    fn later_gpu_write_range_keeps_the_titles_newer_bytes() {
+        let Some(host) = crate::host::host() else {
+            assert!(!crate::switch::on("VICTORY_D3D12_WARP"), "WARP unavailable");
+            return;
+        };
+        const PAGE: usize = crate::watch::PAGE;
+        let mut title = vec![0u8; 2 * PAGE];
+        let start = title.as_mut_ptr() as usize;
+        let edge = (start + 2).next_multiple_of(PAGE);
+        let offset = edge - 2 - start;
+        let (buffer, data) = host
+            .shared_buffer(title.len() as u64)
+            .expect("mapped shadow buffer");
+        let copy = Shadow::new(buffer, data, 0, start as u64, title.len() as u64);
+        copy.update(start, title.len());
+        copy.writing(edge - 2, 1);
+        copy.writing(edge + 1, 1);
+
+        // Each newly declared byte uses the baseline from its own refresh,
+        // even when a larger overlapping declaration crosses a page boundary.
+        title[offset + 1..offset + 3].copy_from_slice(&[0x44, 0x45]);
+        copy.update(edge - 1, 2);
+        // SAFETY: the live shared buffer spans `title.len()` bytes and the
+        // synchronous update initialized these two bytes inside it.
+        let actual = unsafe { std::slice::from_raw_parts(data.add(offset + 1), 2) };
+        assert_eq!(actual, &[0x44, 0x45]);
+        copy.writing(edge - 2, 4);
+        take_snapshots();
+        title[offset + 1..offset + 3].copy_from_slice(&[0x55, 0x56]);
+        // SAFETY: inside the test's own mapping; simulates the GPU's write.
+        unsafe { data.add(offset + 3).write(0xaa) };
+        copy.copy_back(edge - 2, 4);
+        copy.copy_back_done(&[
+            (edge - 2, edge - 1),
+            (edge + 1, edge + 2),
+            (edge - 2, edge + 2),
+        ]);
+        assert_eq!(&title[offset..offset + 4], &[0, 0x55, 0x56, 0xaa]);
+    }
 }

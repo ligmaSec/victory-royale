@@ -656,9 +656,7 @@ pub(crate) extern "system" fn create_list_x(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    if cfg!(feature = "diagnostics") {
-        tracing::debug!(?desc, "console command list");
-    }
+    tracing::debug!(?desc, "console command list");
     new_list(desc.kind, allocator, pipeline, iid, out)
 }
 
@@ -674,9 +672,7 @@ fn new_list(
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    if cfg!(feature = "diagnostics") {
-        tracing::debug!(kind, "command list");
-    }
+    tracing::debug!(kind, "command list");
     #[cfg(windows)]
     if thin::on() {
         let mut list = boxed(kind, pipeline, true);
@@ -773,7 +769,6 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     }
     let _called = crate::timeline::span("the title's list Reset");
     // A wait recorded and never submitted goes with the recording.
-    #[cfg(windows)]
     VALUE_WAITS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2115,7 +2110,6 @@ pub(crate) fn take_counts() -> (u64, u64) {
 
 /// A GPU wait for a memory value: the list's commands after it run when
 /// the 32 or 64 bits at `address` compare as asked with `reference`.
-#[cfg(windows)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ValueWait {
     address: u64,
@@ -2124,7 +2118,6 @@ pub(crate) struct ValueWait {
     wide: bool,
 }
 
-#[cfg(windows)]
 impl ValueWait {
     /// Whether the memory holds what is waited for now.
     /// shortcut: the comparison codes are taken to be the comparison
@@ -2203,7 +2196,6 @@ impl ValueWait {
 }
 
 /// The waits lists recorded since their last reset, by list.
-#[cfg(windows)]
 static VALUE_WAITS: std::sync::Mutex<Vec<(usize, ValueWait)>> = std::sync::Mutex::new(Vec::new());
 
 /// The waits of the submitted `lists` that are not met yet (taken from
@@ -2214,7 +2206,6 @@ static VALUE_WAITS: std::sync::Mutex<Vec<(usize, ValueWait)>> = std::sync::Mutex
 /// buffer and nothing was lit).
 /// shortcut: a wait holds its whole list (and submission) back, not only
 /// the commands after it.
-#[cfg(windows)]
 pub(crate) fn unmet_waits(lists: &[This]) -> Vec<ValueWait> {
     let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
     let mut unmet = Vec::new();
@@ -2249,47 +2240,42 @@ pub(crate) fn waits_by_list(lists: &[This]) -> Vec<Vec<ValueWait>> {
 }
 
 fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: bool) {
-    #[cfg(windows)]
-    {
-        let wait = ValueWait {
-            address,
+    let wait = ValueWait {
+        address,
+        comparison,
+        reference,
+        wide,
+    };
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+        tracing::info!(
+            address = format_args!("{address:#x}"),
             comparison,
             reference,
             wide,
-        };
-        static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
-            tracing::info!(
-                address = format_args!("{address:#x}"),
-                comparison,
-                reference,
-                wide,
-                met = wait.met(),
-                "a list waits for a memory value"
-            );
-        }
-        #[cfg(feature = "diagnostics")]
-        if let Some(host) = host_list(this) {
-            crate::capture::op(std::ptr::from_ref(host) as usize, || {
-                format!(
-                    "WAIT VALUE at {address:#x} comparison {comparison} reference {reference:#x} wide {wide} met {}",
-                    wait.met()
-                )
-            });
-        }
-        // The list is cut here, and the wait stands before what follows.
-        if crate::queue::cuts() {
-            cut(this, wait);
-            return;
-        }
-        VALUE_WAITS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((this as usize, wait));
+            met = wait.met(),
+            "a list waits for a memory value"
+        );
     }
-    // There is no host GPU queue to record a wait on outside Windows.
-    #[cfg(not(windows))]
-    let _ = (this, address, comparison, reference, wide);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(host) = host_list(this) {
+        crate::capture::op(std::ptr::from_ref(host) as usize, || {
+            format!(
+                "WAIT VALUE at {address:#x} comparison {comparison} reference {reference:#x} wide {wide} met {}",
+                wait.met()
+            )
+        });
+    }
+    // The list is cut here, and the wait stands before what follows.
+    #[cfg(windows)]
+    if crate::queue::cuts() {
+        cut(this, wait);
+        return;
+    }
+    VALUE_WAITS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((this as usize, wait));
 }
 extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u64) {
     wait_for(this, address, comparison, reference, false);
@@ -2622,7 +2608,7 @@ mod tests {
             "not a power of two"
         );
         assert_eq!(reset(list, allocator, null), S_OK);
-        // SAFETY: the list was created above and remains alive across reset.
+        // SAFETY: `create_list` returned this live `List`; it is released below.
         let uploads = unsafe { &(*list.cast::<List>()).uploads };
         assert!(uploads.lock().unwrap().is_empty());
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);

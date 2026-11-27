@@ -19,8 +19,11 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
 mod presentation;
-use self::presentation::PresenterState;
+use self::presentation::Presenter;
 pub use self::presentation::{HdrDisplayInfo, display_hdr_info};
+
+#[cfg(test)]
+include!("host/donor_tests.rs");
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -57,7 +60,7 @@ pub(crate) struct Host {
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
-    presenter: Mutex<PresenterState>,
+    presenter: Mutex<Option<Presenter>>,
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
@@ -222,7 +225,9 @@ fn vram_idle_for(video_memory: Option<[u64; 4]>, keep: bool) -> u64 {
 /// mapping into the card's address space is work of the system's that runs
 /// later: only lists sent after it wait for it. Lists sent before run on,
 /// and read our descriptor heaps as they are: a slot that shows a texture
-/// in a new block can fault until that block is mapped.
+/// in a new block is a page fault for them until the block is mapped. The
+/// device losses of the night of 2026-11-25 were that (run n08: the fault
+/// lay in a texture made in the same tenth of a second, in a new block).
 fn wait_resident() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT").is_none_or(|v| v != "0"))
@@ -253,8 +258,9 @@ unsafe impl Send for Aside {}
 /// New memory of the card is mapped into its address space when this
 /// returns: a copy of a few bytes is sent to a queue of ours after the
 /// memory was made, which the system starts only when all mappings asked
-/// for so far are done, and waited for. `MakeResident` alone does not wait
-/// for those mappings. Keep this synchronization off hot paths.
+/// for so far are done, and waited for. (`MakeResident` came back before
+/// that: run n11 was lost as n08 was with it alone.) Best done off a hot
+/// path: a tenth of a millisecond to some.
 pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
     static ASIDE: Mutex<Option<Aside>> = Mutex::new(None);
     if !wait_resident() {
@@ -1074,26 +1080,10 @@ fn create() -> windows::core::Result<Host> {
                     D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
                 }
             }
-        }
-        let device = device.ok_or_else(windows::core::Error::empty)?;
-        #[cfg(feature = "diagnostics")]
-        if debug
-            && crate::switch::on("VICTORY_D3D12_GBV")
-            && let Some(mode) =
-                parse_eager_gbv(std::env::var_os("VICTORY_D3D12_GBV_EAGER").as_deref())
-        {
-            match configure_eager_gbv(&device, mode) {
-                Ok(()) => tracing::info!(
-                    guarded = matches!(mode, EagerGbv::Guarded),
-                    "GPU validation pipeline patching front-loaded"
-                ),
-                Err(e) if matches!(mode, EagerGbv::Guarded) => return Err(e),
-                Err(e) => tracing::warn!(error = %e, "could not front-load GPU validation"),
-            }
-        }
-        if chosen.is_some() {
+            // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
+        let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
         // for minutes after pipelines were made or loaded) is switched off.
@@ -1190,7 +1180,7 @@ fn create() -> windows::core::Result<Host> {
             next_dsv: AtomicU32::new(0),
             messages,
             next_rtv: AtomicU32::new(0),
-            presenter: Mutex::new(PresenterState::new()),
+            presenter: Mutex::new(None),
             adapter,
             fallback_view: OnceLock::new(),
             fallback_sampler: OnceLock::new(),
@@ -1321,182 +1311,6 @@ fn adapter_caps(device: &ID3D12Device) -> crate::adapter::Caps {
             && options.ResourceBindingTier.0 >= D3D12_RESOURCE_BINDING_TIER_3.0,
         mesh_shaders: options7_ok
             && options7.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED,
-    }
-}
-
-#[cfg(feature = "diagnostics")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EagerGbv {
-    Current,
-    Guarded,
-}
-
-#[cfg(feature = "diagnostics")]
-fn parse_eager_gbv(value: Option<&std::ffi::OsStr>) -> Option<EagerGbv> {
-    let value = value?;
-    if value.is_empty() || value == "0" {
-        return None;
-    }
-    if value == "guarded" {
-        Some(EagerGbv::Guarded)
-    } else {
-        Some(EagerGbv::Current)
-    }
-}
-
-#[cfg(feature = "diagnostics")]
-fn front_load_flag_for(
-    mode: D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE,
-) -> windows::core::Result<D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAGS> {
-    match mode {
-        D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_UNGUARDED_VALIDATION => Ok(
-            D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_UNGUARDED_VALIDATION_SHADERS,
-        ),
-        D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_GUARDED_VALIDATION => Ok(
-            D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_GUARDED_VALIDATION_SHADERS,
-        ),
-        D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_STATE_TRACKING_ONLY => Ok(
-            D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_TRACKING_ONLY_SHADERS,
-        ),
-        _ => Err(windows::core::Error::from_hresult(
-            windows::Win32::Foundation::E_INVALIDARG,
-        )),
-    }
-}
-
-/// Requests validation shader compilation at PSO creation rather than first
-/// bind, preserving unrelated flags and verifying read-back settings before any
-/// pipelines are built.
-#[cfg(feature = "diagnostics")]
-fn configure_eager_gbv(device: &ID3D12Device, mode: EagerGbv) -> windows::core::Result<()> {
-    let debug = device.cast::<ID3D12DebugDevice1>()?;
-    let kind = D3D12_DEBUG_DEVICE_PARAMETER_GPU_BASED_VALIDATION_SETTINGS;
-    let size = size_of::<D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS>() as u32;
-    let mut settings = D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS::default();
-    // SAFETY: `kind` takes `D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS` of exact `size`.
-    unsafe { debug.GetDebugParameter(kind, (&raw mut settings).cast(), size)? };
-    let prior_flags = settings.PipelineStateCreateFlags.0;
-    if mode == EagerGbv::Guarded {
-        settings.DefaultShaderPatchMode =
-            D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_GUARDED_VALIDATION;
-    }
-    let flag = front_load_flag_for(settings.DefaultShaderPatchMode)?;
-    settings.PipelineStateCreateFlags.0 |= flag.0;
-    let mut observed = D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS::default();
-    // SAFETY: both structs are stack-owned for the synchronous COM calls.
-    unsafe {
-        debug.SetDebugParameter(kind, (&raw const settings).cast(), size)?;
-        debug.GetDebugParameter(kind, (&raw mut observed).cast(), size)?;
-    }
-    if observed.DefaultShaderPatchMode != settings.DefaultShaderPatchMode
-        || observed.PipelineStateCreateFlags.0 & flag.0 == 0
-        || observed.PipelineStateCreateFlags.0 & prior_flags != prior_flags
-    {
-        return Err(windows::core::Error::from_hresult(
-            windows::Win32::Foundation::E_FAIL,
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(all(test, feature = "diagnostics"))]
-mod eager_gbv_tests {
-    use super::*;
-    use std::ffi::OsStr;
-
-    #[test]
-    fn parse_eager_gbv_respects_off_current_and_guarded_values() {
-        assert_eq!(parse_eager_gbv(None), None);
-        assert_eq!(parse_eager_gbv(Some(OsStr::new(""))), None);
-        assert_eq!(parse_eager_gbv(Some(OsStr::new("0"))), None);
-        assert_eq!(
-            parse_eager_gbv(Some(OsStr::new("1"))),
-            Some(EagerGbv::Current)
-        );
-        assert_eq!(
-            parse_eager_gbv(Some(OsStr::new("guarded"))),
-            Some(EagerGbv::Guarded)
-        );
-    }
-
-    #[test]
-    fn front_load_flag_matches_patch_mode() {
-        assert_eq!(
-            front_load_flag_for(
-                D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_GUARDED_VALIDATION
-            ),
-            Ok(
-                D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_GUARDED_VALIDATION_SHADERS
-            )
-        );
-        assert_eq!(
-            front_load_flag_for(
-                D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_UNGUARDED_VALIDATION
-            ),
-            Ok(
-                D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_UNGUARDED_VALIDATION_SHADERS
-            )
-        );
-        assert_eq!(
-            front_load_flag_for(
-                D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_STATE_TRACKING_ONLY
-            ),
-            Ok(
-                D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_TRACKING_ONLY_SHADERS
-            )
-        );
-    }
-
-    #[test]
-    #[ignore = "requires an isolated process with the D3D12 debug layer and a WARP software adapter"]
-    fn eager_gbv_round_trips_and_preserves_unrelated_flags_on_warp() -> windows::core::Result<()> {
-        // SAFETY: runs only in an isolated test process with debug layer and WARP.
-        unsafe {
-            let mut layer: Option<ID3D12Debug> = None;
-            D3D12GetDebugInterface(&mut layer)?;
-            let layer = layer.ok_or_else(windows::core::Error::empty)?;
-            layer.EnableDebugLayer();
-            layer
-                .cast::<ID3D12Debug1>()?
-                .SetEnableGPUBasedValidation(true);
-            let adapter = warp_adapter()?;
-            let mut device: Option<ID3D12Device> = None;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-            let device = device.ok_or_else(windows::core::Error::empty)?;
-
-            let debug = device.cast::<ID3D12DebugDevice1>()?;
-            let kind = D3D12_DEBUG_DEVICE_PARAMETER_GPU_BASED_VALIDATION_SETTINGS;
-            let size = size_of::<D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS>() as u32;
-            let mut settings = D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS::default();
-            debug.GetDebugParameter(kind, (&raw mut settings).cast(), size)?;
-            // Turn on an unrelated create flag (`FRONT_LOAD_CREATE_TRACKING_ONLY_SHADERS`)
-            // and verify eager configuration preserves it alongside the added front-load bit.
-            let preserved =
-                D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_TRACKING_ONLY_SHADERS;
-            settings.PipelineStateCreateFlags.0 |= preserved.0;
-            debug.SetDebugParameter(kind, (&raw const settings).cast(), size)?;
-
-            configure_eager_gbv(&device, EagerGbv::Current)?;
-            let mut after_current = D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS::default();
-            debug.GetDebugParameter(kind, (&raw mut after_current).cast(), size)?;
-            assert_ne!(after_current.PipelineStateCreateFlags.0 & preserved.0, 0);
-
-            configure_eager_gbv(&device, EagerGbv::Guarded)?;
-            let mut after_guarded = D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS::default();
-            debug.GetDebugParameter(kind, (&raw mut after_guarded).cast(), size)?;
-            assert_eq!(
-                after_guarded.DefaultShaderPatchMode,
-                D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_GUARDED_VALIDATION
-            );
-            assert_ne!(
-                after_guarded.PipelineStateCreateFlags.0
-                    & D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_GUARDED_VALIDATION_SHADERS
-                        .0,
-                0
-            );
-            assert_ne!(after_guarded.PipelineStateCreateFlags.0 & preserved.0, 0);
-            Ok(())
-        }
     }
 }
 
@@ -1742,8 +1556,7 @@ fn plane_pass() -> Option<&'static PlanePass> {
     .as_ref()
 }
 
-/// Compiles one of our own shader helpers. The distribution embeds these
-/// shaders so Wine does not need a separately installed native compiler.
+/// Compiles a host-owned helper using the package fallback when needed.
 pub(crate) fn compile(
     source: &str,
     entry: &std::ffi::CStr,
@@ -2126,7 +1939,7 @@ fn timing() -> bool {
 }
 
 /// Names a host object for the device-removed report, which names the
-/// allocations a page fault hit (only with device-removed data on), or for
+/// allocations a page fault hit when its diagnostics are enabled.
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
     #[cfg(feature = "diagnostics")]
     if crate::book::on()
@@ -2551,8 +2364,10 @@ static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 /// byte just outside the range costs a fetch that finds nothing.
 ///
 /// A piece's 64 threads walk it side by side, each every 64th 16 bytes, and
-/// one of them reduces the 64 hashes; this avoids the serial walk of the
-/// whole piece.
+/// one of them hashes their 64 hashes: 64 steps after one another. One thread
+/// walked the piece before, 4,096 steps; the passes took 24.8 ms of a frame's
+/// 82 on the card (capture replay1, 405 of them), most of it waiting for
+/// those steps.
 pub(crate) const CARD_COMPARE: &str = include_str!("../shaders/card_compare.hlsl");
 
 /// The hash [`CARD_COMPARE`] gives of a piece with its flag.
@@ -3193,14 +3008,14 @@ struct Flight {
 /// One thing in the line of what waits for the card, in order.
 #[expect(
     clippy::large_enum_variant,
-    reason = "keep flights in the queue allocation instead of allocating per submission"
+    reason = "keep each in-flight submission inline in the ordered queue without another allocation"
 )]
 enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
     Write(usize, crate::queue::Written, usize),
-    /// A retained fence signalled behind the flights before it.
-    Signal(crate::fence::FenceRef, u64),
+    /// A fence (its address) signalled behind the flights before it.
+    Signal(usize, u64),
 }
 
 struct Line {
@@ -3365,24 +3180,22 @@ fn fill_is_titles(src: usize, len: usize) -> bool {
 /// in (start, bytes).
 #[cfg(feature = "diagnostics")]
 type Blamed = (&'static str, &'static str, usize, usize, usize);
-#[cfg(feature = "diagnostics")]
-type WaitAttribution = std::collections::HashMap<Blamed, (u64, u64, usize)>;
-
 /// How often and how long, and the address the last one read.
 #[cfg(feature = "diagnostics")]
-static BLAME: Mutex<Option<WaitAttribution>> = Mutex::new(None);
+type BlameLog = std::collections::HashMap<Blamed, (u64, u64, usize)>;
+#[cfg(feature = "diagnostics")]
+static BLAME: Mutex<Option<BlameLog>> = Mutex::new(None);
 /// What the wait that comes next is for, and why not on the card.
 #[cfg(feature = "diagnostics")]
 static BLAMED: Mutex<(Option<(Blamed, usize)>, &'static str)> = Mutex::new((None, ""));
-
-#[cfg(feature = "diagnostics")]
-type WideWriteReport = std::collections::HashMap<(usize, usize, usize), (u64, String)>;
 
 /// Diagnostics: shader writes declared over a megabyte or more: the range
 /// (from, to) and what declares it ([`wide_write`]): how often, and its
 /// shaders.
 #[cfg(feature = "diagnostics")]
-static WIDE_WRITES: Mutex<Option<WideWriteReport>> = Mutex::new(None);
+type WideWriteLog = std::collections::HashMap<(usize, usize, usize), (u64, String)>;
+#[cfg(feature = "diagnostics")]
+static WIDE_WRITES: Mutex<Option<WideWriteLog>> = Mutex::new(None);
 
 /// Diagnostics: a draw or dispatch declares that it writes `len` bytes at
 /// `address`, through a root view of `pipeline`, a view in a table (0) or a
@@ -3812,10 +3625,7 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     if line.line.is_empty() && !line.settling {
         return false;
     }
-    line.line.push(Late::Signal(
-        crate::fence::FenceRef::new(fence as crate::object::This),
-        value,
-    ));
+    line.line.push(Late::Signal(fence, value));
     LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
     drop(line);
     // A signal alone (behind a settle under way) has no flight to wake
@@ -4475,6 +4285,22 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     back
 }
 
+/// The walls trace (`VICTORY_WALLS_TRACE=1` or `2`; off by default): log
+/// lines that say what the title's CPU was given while it decided whether
+/// the camera is in a room. The values of the small read-backs
+/// ([`read_backs`]), the frame's main pass by scissor rectangle with its
+/// culling dispatches (`draw.rs`, `walls_census`), the shader-written
+/// buffers merged into title memory (`shadow.rs`, `walls_merged`), host
+/// copies found stale after their refresh (`shadow.rs`; only with
+/// `VICTORY_REFRESH_CHECK=1` as well: it costs about 100 ms a frame), and, in the
+/// runtime, the read requests that fail (with 2: every request).
+pub(crate) fn walls_trace() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_WALLS_TRACE").is_some_and(|v| v == "1" || v == "2")
+    })
+}
+
 /// After `list` has run: the texels its read-backs copied into host
 /// buffers of ours go to the title's memory (`HostList::defer_read_back`).
 ///
@@ -4501,6 +4327,23 @@ fn read_backs(list: &HostList) {
                         from.add(line * row.next_multiple_of(256)),
                         (*at as *mut u8).add(line * pitch),
                         *row,
+                    );
+                }
+                // The walls trace: what the title is handed (one row of at
+                // most 24 values: its 5x1 and 1x1 float targets).
+                if walls_trace() && *rows == 1 && *row <= 96 {
+                    let mut values = [0f32; 24];
+                    std::ptr::copy_nonoverlapping(
+                        from,
+                        values.as_mut_ptr().cast::<u8>(),
+                        *row & !3,
+                    );
+                    tracing::info!(
+                        frame = crate::frame::current(),
+                        to = format_args!("{:#x}", *at),
+                        bytes = *row,
+                        values = ?&values[..*row / 4],
+                        "walls trace: a read-back lands in title memory"
                     );
                 }
                 buffer.Unmap(0, None);
@@ -4628,7 +4471,7 @@ impl Host {
             let Some(adapter) = &self.adapter else {
                 return false;
             };
-            // SAFETY: the host retains this adapter for the whole query.
+            // SAFETY: the retained DXGI adapter returns its description by value.
             unsafe { adapter.GetDesc() }.is_ok_and(|desc| desc.VendorId == 0x1414)
         })
     }
@@ -4844,7 +4687,7 @@ impl Host {
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
         unsafe {
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes.as_ref())?;
+            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, &bytes)?;
             let pso: ID3D12PipelineState =
                 self.device
                     .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
@@ -4855,8 +4698,6 @@ impl Host {
                         },
                         ..Default::default()
                     })?;
-            #[cfg(feature = "diagnostics")]
-            name(&pso, || "card compare".into());
             Ok(CardWork {
                 sync: vec![list()?],
                 check: vec![list()?],
@@ -5627,6 +5468,7 @@ impl Host {
                     std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo)
                 };
                 let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                shadow.walls_merged(gpu.len(), merged);
                 written += merged as u64;
             }
         }
@@ -5756,7 +5598,7 @@ impl Host {
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
                 Late::Signal(fence, value) => {
-                    crate::fence::set(fence.get(), value);
+                    crate::fence::set(fence as crate::object::This, value);
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
             };
@@ -5942,6 +5784,7 @@ impl Host {
                                     )
                                 };
                                 let merged = shadow.card_merge(lo, gpu, &mut title);
+                                shadow.walls_merged(gpu.len(), merged);
                                 counts[i].fetch_add(merged, Ordering::Relaxed);
                             }
                         }) as Box<dyn FnOnce() + Send>
@@ -5960,6 +5803,7 @@ impl Host {
                         std::slice::from_raw_parts((*data + at as usize) as *const u8, hi - lo)
                     };
                     let merged = plan.ranges[i].shadow.card_merge(lo, gpu, &mut title);
+                    plan.ranges[i].shadow.walls_merged(gpu.len(), merged);
                     written[i] += merged;
                 }
             }
@@ -6295,7 +6139,9 @@ impl Host {
                         landed.push((flight.lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                    Late::Signal(fence, value) => crate::fence::set(fence.get(), value),
+                    Late::Signal(fence, value) => {
+                        crate::fence::set(fence as crate::object::This, value)
+                    }
                 }
             }
             if last > 0 {
@@ -8937,8 +8783,6 @@ fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)>
                 given[i] = part;
             }
             Touch::Part => part += 1,
-            #[cfg(test)]
-            Touch::Title => break,
             Touch::Nothing => {}
         }
     }
@@ -9072,13 +8916,16 @@ fn join_keys<'a>(
     spans
 }
 
-/// [`join_keys`] of the lists' parts, with their copies.
-fn join_fronts(
-    fronts: &[ListFront],
+/// Keep the list prefix through its first title-memory write and join its shadow refreshes.
+fn join_front_prefix(
+    fronts: &mut Vec<ListFront>,
     parts: &[usize],
 ) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    if let Some(end) = fronts.iter().position(|front| front.title_write) {
+        fronts.truncate(end + 1);
+    }
     let mut shadows: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
-    for front in fronts {
+    for front in fronts.iter() {
         for (key, shadow) in &front.shadows {
             shadows.entry(*key).or_insert_with(|| shadow.clone());
         }
@@ -9095,9 +8942,6 @@ enum Touch {
     Refresh(usize, usize, usize),
     /// The copy is given to shaders.
     Write(usize),
-    /// Synthetic prefix boundary; production stops scanning at the write.
-    #[cfg(test)]
-    Title,
     Nothing,
     /// Another part of the submission begins.
     Part,
@@ -9122,8 +8966,6 @@ fn written_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize
                     span.2 = true;
                 }
             }
-            #[cfg(test)]
-            Touch::Title => break,
             Touch::Nothing | Touch::Part => {}
         }
     }
@@ -9256,17 +9098,16 @@ impl Batch {
     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
         let mut planning = crate::timeline::span("refreshes in front: the steps gathered");
         let mut due = Vec::new();
-        // Renderer port #6: each list's part made on the threads beside, and
-        // joined here in order (`list_front`, `join_fronts`): one submission
-        // a frame has most of the frame's steps, 3-6 ms of this alone (run
-        // guard-4).
+        // Renderer port #6: fold wide submissions beside the submitting thread, then join
+        // the title-write-bounded prefix in list order.
         let steps: usize = runs.iter().map(|list| list.deferred().copies.len()).sum();
         if crate::watch::port_guard_plan() && runs.len() >= 2 && steps >= WIDE_PLAN_STEPS {
             #[derive(Clone, Copy)]
             struct Lists(*const *const HostList, usize);
-            // SAFETY: the pointers and lists outlive the joining call below.
+            // SAFETY: the lists outlive the call, which waits for every job.
             unsafe impl Send for Lists {}
-            // SAFETY: workers access shared lists and lock their deferred steps.
+            // SAFETY: the array is shared read-only; accesses to each list's deferred
+            // steps take that list's lock, and the jobs join before the array is dropped.
             unsafe impl Sync for Lists {}
             let lists: Vec<*const HostList> =
                 runs.iter().map(|&list| std::ptr::from_ref(list)).collect();
@@ -9298,9 +9139,7 @@ impl Batch {
                         .unwrap_or_default()
                 })
                 .collect();
-            if let Some(end) = fronts.iter().position(|front| front.title_write) {
-                fronts.truncate(end + 1);
-            }
+            let spans = join_front_prefix(&mut fronts, parts);
             for front in &fronts {
                 for staging in &front.textures {
                     if self.texture_due(staging) {
@@ -9308,7 +9147,6 @@ impl Batch {
                     }
                 }
             }
-            let spans = join_fronts(&fronts, parts);
             self.refresh_spans(spans, due, planning);
             return;
         }
@@ -9717,9 +9555,9 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let at = src.wrapping_add(offset);
         let to = dst.wrapping_add(offset);
         let remaining = len - offset;
-        // SAFETY: the structure's integer and pointer fields admit zero.
+        // SAFETY: the query inspects an address and fills a local structure.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: the query inspects a virtual address and fills the local buffer.
+        // SAFETY: VirtualQuery only inspects `at` and writes at most `info`'s size.
         let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
         let n = (info.BaseAddress as usize)
             .saturating_add(info.RegionSize)
@@ -10060,6 +9898,29 @@ impl Host {
             }
         }
     }
+}
+
+/// A visible top-level window of this process: the one the title made, if
+/// it made one.
+fn title_window() -> Option<HWND> {
+    extern "system" fn visit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
+        let mut process = 0;
+        // SAFETY: a window handle from the enumeration; `found` is ours.
+        unsafe {
+            GetWindowThreadProcessId(hwnd, Some(&mut process));
+            if process == windows::Win32::System::Threading::GetCurrentProcessId()
+                && IsWindowVisible(hwnd).as_bool()
+            {
+                *(found.0 as *mut Option<HWND>) = Some(hwnd);
+                return false.into();
+            }
+        }
+        true.into()
+    }
+    let mut found: Option<HWND> = None;
+    // SAFETY: the callback only writes `found`, which outlives the call.
+    let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut found as isize)) };
+    found
 }
 
 /// `state` without the bits the host texture's flags forbid: the console
@@ -10504,6 +10365,206 @@ fn in_flight(
     text
 }
 
+struct DefragCounter {
+    gpu: ID3D12Resource,
+    upload: ID3D12Resource,
+    readback: ID3D12Resource,
+    va: u64,
+    /// The zeroing copy has been recorded on some list.
+    armed: bool,
+}
+
+static DEFRAG_COUNTER: Mutex<Option<DefragCounter>> = Mutex::new(None);
+
+fn defrag_buffer(
+    device: &ID3D12Device,
+    kind: D3D12_HEAP_TYPE,
+    flags: D3D12_RESOURCE_FLAGS,
+    state: D3D12_RESOURCE_STATES,
+) -> windows::core::Result<ID3D12Resource> {
+    let mut made: Option<ID3D12Resource> = None;
+    // SAFETY: a 16-byte buffer. The caller keeps it.
+    unsafe {
+        device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES {
+                Type: kind,
+                ..Default::default()
+            },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 16,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            },
+            state,
+            None,
+            &mut made,
+        )?;
+    }
+    made.ok_or_else(windows::core::Error::empty)
+}
+
+/// The face-relocation counter buffer. The first list to bind it copies zeros
+/// in before the dispatch, on that same list.
+pub(crate) fn bind_defrag_counter(list: &ID3D12GraphicsCommandList) -> Option<u64> {
+    let host = host()?;
+    let mut slot = DEFRAG_COUNTER.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
+        let gpu = defrag_buffer(
+            &host.device,
+            D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )
+        .ok()?;
+        let upload = defrag_buffer(
+            &host.device,
+            D3D12_HEAP_TYPE_UPLOAD,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+        )
+        .ok()?;
+        let readback = defrag_buffer(
+            &host.device,
+            D3D12_HEAP_TYPE_READBACK,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )
+        .ok()?;
+        // SAFETY: the upload mapping covers the 16 bytes just created.
+        unsafe {
+            let mut data = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut data)).ok()?;
+            std::ptr::write_bytes(data, 0, 16);
+            upload.Unmap(0, None);
+        }
+        // SAFETY: `gpu` is a live D3D12 buffer resource kept in the counter.
+        let va = unsafe { gpu.GetGPUVirtualAddress() };
+        *slot = Some(DefragCounter {
+            gpu,
+            upload,
+            readback,
+            va,
+            armed: false,
+        });
+    }
+    let counter = slot.as_mut()?;
+    if !counter.armed {
+        // SAFETY: the list is open and records this before the dispatch that adds.
+        unsafe {
+            list.CopyBufferRegion(&counter.gpu, 0, &counter.upload, 0, 16);
+            list.ResourceBarrier(&[transition(
+                &counter.gpu,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+        }
+        counter.armed = true;
+    }
+    Some(counter.va)
+}
+
+/// Reads the face-relocation counters after the queue has finished what it
+/// already submitted, and logs them with the host's dispatch counts.
+pub fn log_defrag_counters() {
+    let (dispatches, groups, indirect) = crate::draw::defrag_counts();
+    let sites = victory_shader::emit::defrag_meet_sites();
+    let (lds_reads, lds_writes) = victory_shader::emit::defrag_lds_sites();
+    let Some(host) = host() else {
+        tracing::info!(
+            dispatches,
+            groups,
+            indirect,
+            sites,
+            lds_reads,
+            lds_writes,
+            "heap defragmentation counters, no device to read the waits"
+        );
+        return;
+    };
+    let read = host.read_defrag_counters();
+    let (meetings, polls, atomics) = read.unwrap_or((0, 0, 0));
+    let per_group = if groups == 0 {
+        0.0
+    } else {
+        meetings as f64 / groups as f64
+    };
+    let per_meet = if meetings == 0 {
+        0.0
+    } else {
+        polls as f64 / meetings as f64
+    };
+    tracing::info!(
+        dispatches,
+        groups,
+        indirect,
+        sites,
+        lds_reads,
+        lds_writes,
+        meetings,
+        wait_iterations = polls,
+        wait_atomics = atomics,
+        meetings_per_group = format!("{per_group:.2}"),
+        iterations_per_meeting = format!("{per_meet:.2}"),
+        "heap defragmentation counters"
+    );
+}
+
+impl Host {
+    fn read_defrag_counters(&self) -> Option<(u64, u64, u64)> {
+        let slot = DEFRAG_COUNTER.lock().unwrap_or_else(|e| e.into_inner());
+        let counter = slot.as_ref()?;
+        if !counter.armed {
+            return Some((0, 0, 0));
+        }
+        // SAFETY: objects this process owns. The fence waits for the copy.
+        unsafe {
+            let allocator: ID3D12CommandAllocator = self
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .ok()?;
+            let list: ID3D12GraphicsCommandList = self
+                .device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .ok()?;
+            list.ResourceBarrier(&[transition(
+                &counter.gpu,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.CopyBufferRegion(&counter.readback, 0, &counter.gpu, 0, 16);
+            list.Close().ok()?;
+            self.queue.ExecuteCommandLists(&[Some(list.cast().ok()?)]);
+            let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+            self.queue.Signal(&fence, 1).ok()?;
+            if fence.GetCompletedValue() < 1 {
+                let event = CreateEventW(None, false, false, None).ok()?;
+                fence.SetEventOnCompletion(1, event).ok()?;
+                WaitForSingleObject(event, INFINITE);
+            }
+            let mut data = std::ptr::null_mut();
+            counter.readback.Map(0, None, Some(&mut data)).ok()?;
+            let words = std::slice::from_raw_parts(data as *const u32, 4);
+            let out = (
+                u64::from(words[0]),
+                u64::from(words[1]),
+                u64::from(words[2]),
+            );
+            counter.readback.Unmap(0, None);
+            Some(out)
+        }
+    }
+}
+
 pub(crate) fn transition(
     resource: &ID3D12Resource,
     before: D3D12_RESOURCE_STATES,
@@ -10602,6 +10663,3 @@ fn pump() {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

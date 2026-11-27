@@ -174,7 +174,8 @@ fn take(device: &ID3D12Device, count: u32) -> Option<TakenTiles> {
                 Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
             };
             let mut made: Option<ID3D12Heap> = None;
-            // SAFETY: the heap description and writable output slot live through the call.
+            // SAFETY: `desc` is a fully initialized input, and `made` is a
+            // writable slot for the requested interface on this live device.
             let result = unsafe { device.CreateHeap::<ID3D12Heap>(&raw const desc, &raw mut made) };
             if let Err(e) = result {
                 tracing::warn!(error = %e, "no heap for texture levels given on demand: those levels stay empty");

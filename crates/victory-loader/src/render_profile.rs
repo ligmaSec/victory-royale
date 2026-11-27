@@ -4,8 +4,9 @@
 use anyhow::{Context, Result, ensure};
 use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-    PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READWRITE, VirtualProtect, VirtualQuery,
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ,
+    PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE,
+    PAGE_WRITECOPY, VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -19,7 +20,44 @@ struct Patch<'a> {
     replacement: &'a [u8],
 }
 
-/// Override the render scale and/or the title's frame-rate setting.
+const OUTPUT_RVA: usize = 0x224352b;
+const OUTPUT_LEN: usize = 0x2243568 - OUTPUT_RVA;
+const NATIVE_RENDER_PAGES: u32 = 0x5400;
+const GRAPHICS_HEADROOM: u64 = 1024 << 20;
+
+/// Generate the requested settings writes, then invoke the title's existing
+/// size setter and height-change notification. No executable block is stored.
+fn output_code(width: u32, height: u32) -> [u8; OUTPUT_LEN] {
+    fn rel(target: usize, end: usize) -> [u8; 4] {
+        ((target as i64 - (OUTPUT_RVA + end) as i64) as i32).to_le_bytes()
+    }
+    let mut code = [0xcc; OUTPUT_LEN];
+    code[0] = 0xb8; // mov eax, width
+    code[1..5].copy_from_slice(&width.to_le_bytes());
+    code[5..11].copy_from_slice(&[0x89, 0x86, 4, 2, 0, 0]); // save width
+    code[11] = 0xbf; // mov edi, height
+    code[12..16].copy_from_slice(&height.to_le_bytes());
+    code[16..22].copy_from_slice(&[0x89, 0xbe, 8, 2, 0, 0]); // save height
+    code[22..24].copy_from_slice(&[0x8b, 0x2d]); // get previous screen height
+    code[24..28].copy_from_slice(&rel(0xa9438d0, 28));
+    code[28..33].copy_from_slice(&[0x89, 0xc1, 0x89, 0xfa, 0xe8]); // set size
+    code[33..37].copy_from_slice(&rel(0x2478130, 37));
+    code[37..44].copy_from_slice(&[0x39, 0xfd, 0x74, (OUTPUT_LEN - 41) as u8, 0xb1, 1, 0xe8]);
+    code[44..48].copy_from_slice(&rel(0xd8c3a0, 48)); // notify on changed height
+    code[48..50].copy_from_slice(&[0xeb, (OUTPUT_LEN - 50) as u8]);
+    code
+}
+
+fn patch<'a>(rva: usize, signature: &'a [u8], offset: usize, replacement: &'a [u8]) -> Patch<'a> {
+    Patch {
+        rva,
+        signature,
+        offset,
+        replacement,
+    }
+}
+
+/// Override the title's output, own upscaler scale, or frame-rate setting.
 ///
 /// # Safety
 /// The image at `base` must be the mapped copy of `hash`. Imports have been
@@ -28,6 +66,7 @@ pub(crate) unsafe fn apply(
     base: usize,
     size: usize,
     hash: blake3::Hash,
+    output: Option<(u32, u32)>,
     scale: Option<f32>,
     fps: Option<u32>,
 ) -> Result<()> {
@@ -36,13 +75,48 @@ pub(crate) unsafe fn apply(
         "render overrides are only supported for the Series 1.0.2.1 executable"
     );
     ensure!(
-        scale.is_none_or(|scale| (0.5..=2.0 / 3.0).contains(&scale)),
-        "render scale must be between one half and the stock two thirds"
+        scale.is_none_or(|scale| (0.5..=1.0).contains(&scale)),
+        "render scale must be between one half and one"
     );
     ensure!(
         fps.is_none_or(|fps| fps <= 1000),
         "title frame rate exceeds 1000"
     );
+    const MODES: [(u32, u32); 5] = [
+        (1280, 720),
+        (1664, 936),
+        (1920, 1080),
+        (2560, 1440),
+        (3840, 2160),
+    ];
+    ensure!(
+        output.is_none_or(|mode| MODES.contains(&mode)),
+        "unsupported output mode"
+    );
+    ensure!(
+        scale.is_none_or(|scale| scale <= 2.0 / 3.0) || output.is_some(),
+        "render scales above stock require an explicit output size"
+    );
+    let native = output == Some((3840, 2160)) && scale.is_some_and(|s| s > 2.0 / 3.0);
+    let output_bytes = output.map_or([0; OUTPUT_LEN], |(w, h)| output_code(w, h));
+    let output_site = output.map(|_| {
+        patch(
+            OUTPUT_RVA,
+            &[0x8b, 0x0d, 0x9b, 0x03, 0x70, 0x08],
+            0,
+            &output_bytes,
+        )
+    });
+    // The donor retains the stock back-buffer allocation. For smaller known
+    // modes only, skip its assertion about surplus space, not a capacity check.
+    let surplus = output.filter(|&mode| mode != (3840, 2160)).map(|_| {
+        patch(
+            0x247af25,
+            &[0x48, 0x3d, 0xff, 0xff, 0x1f, 0, 0x76, 1, 0xcc],
+            6,
+            &[0xeb],
+        )
+    });
 
     let scale_bytes = scale.unwrap_or_default().to_le_bytes();
     let [a, b, c, d] = fps.unwrap_or_default().to_le_bytes();
@@ -78,8 +152,89 @@ pub(crate) unsafe fn apply(
         ]
     });
     let [first, second, third] = fps.map_or([None, None, None], |fps| fps.map(Some));
-    // SAFETY: all patches are for the mapped build and it is not running.
-    unsafe { install(base, size, [scale, first, second, third]) }
+    if !native {
+        // SAFETY: all sites are in the exact mapped build, before execution.
+        return unsafe {
+            install(
+                base,
+                size,
+                [output_site, surplus, scale, first, second, third],
+            )
+        };
+    }
+
+    // Only the Series X reservation and its reported total grow. Each of the
+    // four users of the old inline page array must move to the new table.
+    const TOTAL: u64 = 13312 << 20;
+    const GRAPHICS_HEAP: u64 = 2199 << 20;
+    let original_total = TOTAL.to_le_bytes();
+    let original_heap = GRAPHICS_HEAP.to_le_bytes();
+    let total = (TOTAL + GRAPHICS_HEADROOM).to_le_bytes();
+    let heap = (GRAPHICS_HEAP + GRAPHICS_HEADROOM).to_le_bytes();
+    let pages = NATIVE_RENDER_PAGES.to_le_bytes();
+    // SAFETY: private committed, zeroed memory for the title's page numbers.
+    let table = unsafe {
+        VirtualAlloc(
+            std::ptr::null(),
+            NATIVE_RENDER_PAGES as usize * size_of::<usize>(),
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        )
+    };
+    ensure!(
+        !table.is_null(),
+        "could not allocate the native 4K render-page table"
+    );
+    let pointer = (table as usize).to_le_bytes();
+    let patches = [
+        output_site,
+        scale,
+        first,
+        second,
+        third,
+        Some(patch(0x61862a0, &original_total, 0, &total)),
+        Some(patch(0x61862b8, &original_heap, 0, &heap)),
+        Some(patch(0x1d488b1, &[0xbe, 0x60, 0x2c, 0, 0], 1, &pages)),
+        Some(patch(0x75eaee0, &[0; 8], 0, &pointer)),
+        Some(patch(
+            0x2473fa1,
+            &[0x4c, 0x8d, 0x1d, 0x38, 0x6f, 0x17, 5],
+            1,
+            &[0x8b],
+        )),
+        Some(patch(
+            0x2474079,
+            &[0x4c, 0x8d, 0x1d, 0x60, 0x6e, 0x17, 5],
+            1,
+            &[0x8b],
+        )),
+        Some(patch(
+            0x24740ec,
+            &[0x4c, 0x8d, 0x1d, 0xed, 0x6d, 0x17, 5],
+            1,
+            &[0x8b],
+        )),
+        Some(patch(
+            0x5eb278d,
+            &[0x4c, 0x8d, 5, 0x4c, 0x87, 0x73, 1],
+            1,
+            &[0x8b],
+        )),
+    ];
+    // SAFETY: checks all sites and permissions before writing the profile.
+    let applied = unsafe { install(base, size, patches) };
+    if applied.is_err() {
+        // SAFETY: the run aborts without entering any code from this image.
+        unsafe { VirtualFree(table, 0, MEM_RELEASE) };
+    } else {
+        // The title owns the table until the process exits, as with its static array.
+        tracing::info!(
+            pool_mib = NATIVE_RENDER_PAGES / 16,
+            heap_extra_mib = GRAPHICS_HEADROOM >> 20,
+            "native render reservations installed"
+        );
+    }
+    applied
 }
 
 #[derive(Clone, Copy)]
@@ -131,14 +286,15 @@ unsafe fn install<const N: usize>(
 ) -> Result<()> {
     for patch in patches.iter().flatten() {
         let rva = patch.rva;
+        let span = patch.signature.len().max(
+            patch
+                .offset
+                .checked_add(patch.replacement.len())
+                .context("render profile replacement overflow")?,
+        );
         ensure!(
-            rva.checked_add(patch.signature.len())
-                .is_some_and(|end| end <= size)
-                && patch
-                    .offset
-                    .checked_add(patch.replacement.len())
-                    .is_some_and(|end| end <= patch.signature.len()),
-            "render profile site {rva:#x} is outside the image or the replacement is too long"
+            rva.checked_add(span).is_some_and(|end| end <= size),
+            "render profile site {rva:#x} is outside the image"
         );
         let at = base
             .checked_add(rva)
@@ -155,12 +311,17 @@ unsafe fn install<const N: usize>(
                 && page.Protect & PAGE_GUARD == 0
                 && matches!(
                     page.Protect & 0xff,
-                    PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+                    PAGE_EXECUTE_READ
+                        | PAGE_EXECUTE_READWRITE
+                        | PAGE_EXECUTE_WRITECOPY
+                        | PAGE_READONLY
+                        | PAGE_READWRITE
+                        | PAGE_WRITECOPY
                 )
                 && at
-                    .checked_add(patch.signature.len())
+                    .checked_add(span)
                     .is_some_and(|end| { mapped_end.is_some_and(|mapped_end| end <= mapped_end) }),
-            "render profile site {rva:#x} is not in readable image code"
+            "render profile site {rva:#x} is not in readable image memory"
         );
         // SAFETY: the whole signature is in a committed, readable region of the mapped image.
         let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, patch.signature.len()) };
@@ -205,6 +366,22 @@ unsafe fn install<const N: usize>(
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, VirtualAlloc, VirtualFree};
+
+    #[test]
+    fn native_output_code_keeps_both_existing_calls_and_the_continuation() {
+        let code = output_code(3840, 2160);
+        assert_eq!(u32::from_le_bytes(code[1..5].try_into().unwrap()), 3840);
+        assert_eq!(u32::from_le_bytes(code[12..16].try_into().unwrap()), 2160);
+        let target = |end| {
+            let disp = i32::from_le_bytes(code[end - 4..end].try_into().unwrap());
+            (OUTPUT_RVA + end).wrapping_add_signed(disp as isize)
+        };
+        assert_eq!(target(28), 0xa9438d0);
+        assert_eq!(target(37), 0x2478130);
+        assert_eq!(target(48), 0xd8c3a0);
+        assert_eq!(41 + usize::from(code[40]), OUTPUT_LEN);
+        assert_eq!(50 + usize::from(code[49]), OUTPUT_LEN);
+    }
 
     #[test]
     fn no_setting_changes_if_any_signature_differs() {

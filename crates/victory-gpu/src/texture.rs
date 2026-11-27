@@ -672,12 +672,12 @@ pub(crate) fn host_written(resource: This) {
     }
 }
 
-type WrittenTexture = (u64, u32, u32, u32, u32, usize);
+type HostWrittenTexture = (u64, u32, u32, u32, u32, usize);
 
 /// The title memory of textures the host copied into, by address: bytes
 /// and description words 4, 6, 7 and 8 (width, height, layers and levels,
 /// format).
-static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, WrittenTexture>> =
+static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, HostWrittenTexture>> =
     Mutex::new(std::collections::BTreeMap::new());
 
 /// A texture the title placed at `address` (description words `desc`) was
@@ -2045,9 +2045,7 @@ fn staging(
             (None, buffer, 0, data)
         }
     };
-    if cfg!(feature = "diagnostics") {
-        tracing::debug!(?desc, total, "texture contents uploaded from title memory");
-    }
+    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
@@ -2093,12 +2091,10 @@ mod title_memory_tests {
         if crate::host::host().is_none() {
             return;
         }
-        // Synthetic 16x4, single-mip R16G16B16A16_FLOAT texture. This
-        // exercises the title ABI's linear layout and 128-byte first row.
-        let words = [
-            3u32, 0, 0, 0, 16, 0, 4, 0x1_0001, 10, 1, 0, 256, 0x30_0000, 0,
+        let desc = [
+            3u32, 0, 0, 0, 16, 0, 4, 0x1_0001, 10, 1, 0, 256, 3_145_728, 0,
         ];
-        let bytes = crate::resource::placed_bytes(&words).unwrap() as usize;
+        let bytes = crate::resource::placed_bytes(&desc).unwrap() as usize;
         // SAFETY: committed memory owned by this test.
         let at = unsafe {
             VirtualAlloc(
@@ -2110,13 +2106,12 @@ mod title_memory_tests {
         }
         .cast::<u8>();
         assert!(!at.is_null());
-        // SAFETY: these 14 initialized words match the console resource ABI.
-        let desc =
-            unsafe { std::mem::transmute::<[u32; 14], crate::resource::ResourceDesc>(words) };
-        let fill = |value| {
-            // SAFETY: the test owns the committed allocation until cleanup below.
-            unsafe { at.write_bytes(value, bytes) }
-        };
+        // SAFETY: ResourceDesc's C layout is 56 bytes, and each field accepts
+        // every bit pattern of its integer type.
+        let desc = unsafe { std::mem::transmute::<[u32; 14], crate::resource::ResourceDesc>(desc) };
+        // SAFETY: the test owns `bytes` committed writable bytes at `at` and
+        // fills them only before synchronous reads and before releasing them.
+        let fill = |value| unsafe { at.write_bytes(value, bytes) };
         fill(0x35);
         let mut resource = std::ptr::null();
         assert_eq!(

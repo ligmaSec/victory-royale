@@ -1,5 +1,6 @@
-//! Associates device-loss breadcrumbs with indirect executions even when
-//! lightweight DRED collects command kinds but omits markers.
+//! Per-command-list indirect executions for device-removed reports.
+//! Breadcrumbs without markers report that an indirect command stopped,
+//! but cannot identify its pipeline or bindings without this history.
 //!
 //! Per list, in the order recorded: the pipeline (by its host object, whose
 //! name is kept once) and the first root constants (user data) it had. The
@@ -120,11 +121,10 @@ pub(crate) fn before<T>(history: &[T], at: usize, is: impl Fn(&T) -> bool) -> us
 pub(crate) fn slots(words: &[u32], count: u32, table: u32) -> Vec<(usize, u32)> {
     let mut out = Vec::new();
     for (i, &word) in words.iter().enumerate() {
-        let aligned = word.is_multiple_of(32);
-        if word > 0 && word < count && !aligned {
+        if word > 0 && word < count && word % 32 != 0 {
             out.push((i, word));
         }
-        if aligned && word / 32 > 16 && word / 32 < count {
+        if word % 32 == 0 && word / 32 > 16 && word / 32 < count {
             out.extend(
                 (0..table)
                     .map(|k| (i, word / 32 + k))
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn an_indirect_execution_is_found_by_its_place_in_the_history() {
         let mut all = Indirects::default();
-        all.note(1, "[compute a]", 2, 1, &[21 * 32, 0x20, 0x11]);
+        all.note(1, "[compute a]", 2, 1, &[0x1fc0, 0x20, 0x11]);
         all.note(2, "[compute b]", 2, 1, &[7; 20]);
         all.note(1, "another name of the same is not taken", 10, 4, &[]);
         // dispatch, indirect, barrier, indirect, indirect
@@ -180,8 +180,16 @@ mod tests {
     /// is no multiple of a descriptor's bytes names its own slot.
     #[test]
     fn user_data_names_slots() {
-        let words = [0, 21 * 32, 32, 17, 37, u32::MAX];
-        let slots = slots(&words, 64, 2);
-        assert_eq!(slots, [(1, 21), (1, 22), (3, 17), (4, 37)]);
+        let words = [0, 0x1fc0, 0x20, 0x11, 0x261, u32::MAX];
+        let slots = slots(&words, 1024, 2);
+        assert_eq!(
+            slots,
+            [
+                (1, 0x1fc0 / 32),
+                (1, 0x1fc0 / 32 + 1),
+                (3, 0x11),
+                (4, 0x261)
+            ]
+        );
     }
 }

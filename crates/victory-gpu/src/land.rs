@@ -456,8 +456,7 @@ pub(crate) fn jobs(pieces: &[(usize, usize)]) -> Vec<std::ops::Range<usize>> {
     out
 }
 
-/// For each (copy, block), the range of bytes brought up to date.
-type Fetched = std::collections::HashMap<(u64, usize), (usize, usize)>;
+type FetchedPieces = std::collections::HashMap<(u64, usize), (usize, usize)>;
 
 /// What earlier fetches brought, for as long as a flight they ran behind
 /// has not landed: per fetch, the value the host's fence had been given
@@ -472,7 +471,7 @@ type Fetched = std::collections::HashMap<(u64, usize), (usize, usize)>;
 /// (Bytes left out of that merge, the title's that went up behind the
 /// fetch, went up behind that flight too, and stand over what it wrote.)
 #[derive(Default)]
-pub(crate) struct Had(Vec<(u64, Fetched)>);
+pub(crate) struct Had(Vec<(u64, FetchedPieces)>);
 
 impl Had {
     /// Flights from the one behind which `fence` is signalled on are landed
@@ -599,11 +598,6 @@ impl Notes {
     }
 }
 
-struct MergeMode {
-    take: bool,
-    beside: bool,
-}
-
 /// Lands one piece: `parts` (offsets from and to) of the bytes at `now`,
 /// which the card wrote, go into title memory from `title` on and into
 /// `held` ([`crate::safecopy::merge`] says how, and what `take` is). The
@@ -621,25 +615,21 @@ pub(crate) unsafe fn piece(
     notes: &mut Notes,
     copy: *const crate::shadow::Shadow,
 ) -> u64 {
-    let mode = MergeMode {
-        take,
-        beside: beside_on(),
-    };
-    // SAFETY: the caller provides the buffers under `piece_at`'s contract.
-    unsafe { piece_at(title, now, held, parts, mode, notes, copy) }
+    // SAFETY: the caller's.
+    unsafe { piece_at(title, (now, held), parts, take, notes, beside_on(), copy) }
 }
 
-/// [`piece`], with an explicit view-selection mode.
+/// [`piece`], and whether a view of ours is looked for.
 ///
 /// # Safety
-/// Same buffer and range requirements as [`piece`].
+/// [`piece`]'s.
 unsafe fn piece_at(
     title: usize,
-    now: *const u8,
-    held: *mut u8,
+    (now, held): (*const u8, *mut u8),
     parts: &[(usize, usize)],
-    MergeMode { take, beside }: MergeMode,
+    take: bool,
     notes: &mut Notes,
+    beside: bool,
     copy: *const crate::shadow::Shadow,
 ) -> u64 {
     let Some(end) = parts.last().map(|p| p.1) else {

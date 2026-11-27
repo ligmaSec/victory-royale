@@ -602,7 +602,8 @@ pub(crate) unsafe fn texture(
     let mut info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
     if info.SizeInBytes == u64::MAX || info.Alignment != d.Alignment {
         d.Alignment = 0;
-        // SAFETY: the live device reads the revised resource description only during the call.
+        // SAFETY: `device` is live and the one-element slice supplies the
+        // caller's description with default alignment for this query.
         info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
     }
     if info.SizeInBytes == u64::MAX {

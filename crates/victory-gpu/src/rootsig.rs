@@ -11,6 +11,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 /// One root parameter, as a root signature string names it.
 #[derive(Clone, Copy)]
 pub(crate) enum Param {
+    /// `RootConstants(num32BitConstants=count, b<register>)`.
+    Constants { register: u32, count: u32 },
     /// `UAV(u<register>)`: a root descriptor.
     Uav(u32),
     /// `DescriptorTable(SRV(t<register>, numDescriptors=count))`.
@@ -19,6 +21,8 @@ pub(crate) enum Param {
         count: u32,
         visibility: D3D12_SHADER_VISIBILITY,
     },
+    /// `DescriptorTable(UAV(u<register>, numDescriptors=count))`.
+    UavTable { register: u32, count: u32 },
 }
 
 /// The root signature of `params`, without static samplers.
@@ -39,6 +43,12 @@ pub(crate) fn make(
                     register,
                     count,
                     D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE,
+                ),
+                Param::UavTable { register, count } => (
+                    D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                    register,
+                    count,
+                    D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
                 ),
                 _ => (
                     D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
@@ -61,6 +71,17 @@ pub(crate) fn make(
         .iter()
         .zip(&ranges)
         .map(|(p, range)| match *p {
+            Param::Constants { register, count } => D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: register,
+                        RegisterSpace: 0,
+                        Num32BitValues: count,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
             Param::Uav(register) => D3D12_ROOT_PARAMETER1 {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
@@ -72,7 +93,7 @@ pub(crate) fn make(
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             },
-            Param::SrvTable { visibility, .. } => D3D12_ROOT_PARAMETER1 {
+            Param::SrvTable { .. } | Param::UavTable { .. } => D3D12_ROOT_PARAMETER1 {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
@@ -80,7 +101,10 @@ pub(crate) fn make(
                         pDescriptorRanges: range,
                     },
                 },
-                ShaderVisibility: visibility,
+                ShaderVisibility: match *p {
+                    Param::SrvTable { visibility, .. } => visibility,
+                    _ => D3D12_SHADER_VISIBILITY_ALL,
+                },
             },
         })
         .collect();

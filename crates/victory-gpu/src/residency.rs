@@ -9,12 +9,11 @@ static PRESSURED: AtomicBool = AtomicBool::new(false);
 static HEADROOM: AtomicU64 = AtomicU64::new(u64::MAX);
 
 fn memory_status() -> Option<MEMORYSTATUSEX> {
-    // SAFETY: all fields of MEMORYSTATUSEX are integers, so zeroing is valid.
+    // SAFETY: an all-zero MEMORYSTATUSEX is valid (all integer fields).
     let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    // SAFETY: status is writable and dwLength gives its exact size.
-    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
-    (ok != 0).then_some(status)
+    // SAFETY: `status` is writable and dwLength contains its exact size.
+    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(status)
 }
 
 // The texture sweep may run for seconds inside a single submitted frame.

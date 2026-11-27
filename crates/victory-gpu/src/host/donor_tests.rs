@@ -1,6 +1,8 @@
-use super::*;
+// Synthetic host GPU fixtures from the donor. Included by the host so
+// fixtures see the same private state that the runtime uses.
 
-mod device_tests {
+#[cfg(test)]
+mod tests {
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -145,6 +147,7 @@ mod device_tests {
     }
 }
 
+#[cfg(test)]
 mod readback_pool_tests {
     use super::*;
 
@@ -358,6 +361,7 @@ mod readback_pool_tests {
     }
 }
 
+#[cfg(test)]
 mod compare_coalescing_tests {
     use super::*;
 
@@ -445,7 +449,7 @@ mod compare_coalescing_tests {
         unsafe {
             std::ptr::write_bytes(data, 0, 65536);
         }
-        let a = shadow(1 << 16); // Synthetic piece-aligned address; never dereferenced.
+        let a = shadow(0x7c10_0000);
         let mut ranges = vec![
             range(&a, 64, 80, false, true),
             range(&a, 4096, 4112, false, true),
@@ -522,8 +526,8 @@ mod compare_coalescing_tests {
         };
         execute(0);
         // Both disjoint declared ranges are changed after the baseline ran.
-        // SAFETY: both offsets are inside the upload mapping, and `execute`
-        // waits for the GPU before returning.
+        // SAFETY: both offsets are inside the live upload mapping and `execute`
+        // waited for the GPU reads to finish.
         unsafe {
             data.add(68).write(0x5a);
             data.add(4100).write(0xa5);
@@ -536,14 +540,14 @@ mod compare_coalescing_tests {
         );
         // Every byte of a piece participates, including a byte outside the
         // declared ranges. Readback bounds remain the original byte ranges.
-        // SAFETY: this offset is in the same live mapping; the GPU is done reading it.
+        // SAFETY: the byte is in the 64 KiB upload mapping and the GPU is done with it.
         unsafe {
             data.add(60000).write(0x44);
         }
         assert!(torn::flagged(execute(2)));
         assert_eq!(ranges[0].declared, (64, 80));
         assert_eq!(ranges[1].declared, (4096, 4112));
-        // SAFETY: querying the status of the live D3D12 device.
+        // SAFETY: a status query on the live D3D12 device.
         unsafe {
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
@@ -561,7 +565,8 @@ mod compare_coalescing_tests {
         let hashes = host.uav_buffer(u64::from(SIZE / 65536) * 16).unwrap();
         let back = host.read_back_buffer(256).unwrap();
         let mut stamps: Option<ID3D12QueryHeap> = None;
-        // SAFETY: a valid timestamp heap description and writable output slot.
+        // SAFETY: the descriptor is initialized and `stamps` is a live output slot;
+        // both timestamp query indices used below fit the heap.
         unsafe {
             host.device
                 .CreateQueryHeap(
@@ -575,13 +580,13 @@ mod compare_coalescing_tests {
                 .unwrap();
         }
         let stamps = stamps.unwrap();
-        // SAFETY: the upload is mapped for SIZE bytes and not yet in GPU use.
+        // SAFETY: this is the whole live upload mapping, before any GPU reads of it.
         unsafe {
             std::ptr::write_bytes(data, 0x5a, SIZE as usize);
         }
         let fill = host.new_list().unwrap();
-        // SAFETY: the open list copies SIZE bytes between live buffers of
-        // that size, with the destination transitioned around the copy.
+        // SAFETY: the list is open and both live buffers hold `SIZE` bytes.
+        // The destination is transitioned for the copy, then for shader reads.
         unsafe {
             fill.list.ResourceBarrier(&[transition(
                 &source,
@@ -599,7 +604,7 @@ mod compare_coalescing_tests {
         }
         host.execute_sync_internal(&fill);
         let a = crate::shadow::Shadow::unbacked(
-            128 << 20, // Synthetic piece-aligned address; never dereferenced.
+            0x7d10_0000,
             std::ptr::null_mut(),
             u64::from(SIZE),
             false,
@@ -621,12 +626,13 @@ mod compare_coalescing_tests {
             })
             .collect();
         let (joined, _) = compact_card_compares(&mut ranges, 0);
-        // SAFETY: querying the timestamp frequency of the live direct queue.
+        // SAFETY: a timestamp-frequency query on the live command queue.
         let frequency = unsafe { host.queue.GetTimestampFrequency() }.unwrap();
         let measure = |runs: &[CardCompareRun], initialize: bool| {
             let list = host.new_list().unwrap();
-            // SAFETY: the open list binds live buffers sized for the runs.
-            // The private query heap has two slots and `back` can hold both timestamps.
+            // SAFETY: the list is open and the root bindings name the live buffers
+            // sized for the input and the runs. Both query slots and the 16-byte
+            // resolve range fit the heap and the readback buffer, respectively.
             unsafe {
                 if initialize {
                     list.list.ResourceBarrier(&[
@@ -661,8 +667,8 @@ mod compare_coalescing_tests {
             }
             host.execute_sync_internal(&list);
             let mut data = std::ptr::null_mut();
-            // SAFETY: the GPU has finished resolving two u64 timestamps.
-            // The mapped readback range holds both and is used before unmapping.
+            // SAFETY: the submitted list has finished writing the two timestamps;
+            // the readback mapping holds both aligned u64s until Unmap below.
             unsafe {
                 back.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }), Some(&mut data))
                     .unwrap();
@@ -694,13 +700,14 @@ mod compare_coalescing_tests {
             old[4],
             new[4]
         );
-        // SAFETY: querying the status of the live D3D12 device.
+        // SAFETY: a status query on the live D3D12 device.
         unsafe {
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
     }
 }
 
+#[cfg(test)]
 mod relay_tests {
     use super::{flagged_pieces, landable};
 
@@ -747,6 +754,7 @@ mod relay_tests {
     }
 }
 
+#[cfg(test)]
 mod late_tests {
     use super::{continues, join_ranges, touches};
 
@@ -814,9 +822,10 @@ mod late_tests {
             });
             let (upload, _, _) = list.scratch_at(16).unwrap();
             let from = list.fill_scratch(source.as_ptr(), 16).unwrap();
-            // Read what the GPU saw, not only the recording's deduplication set.
-            // SAFETY: the list is open and both scratch allocations fit in the
-            // first upload chunk. The readback holds all 16 bytes.
+            // Both allocations fit in the first chunk; read what the GPU
+            // saw rather than testing only the recording's deduplication set.
+            // SAFETY: the list is open and retains the scratch upload; the
+            // reserved 16-byte source and the readback destination fit their buffers.
             unsafe {
                 let offset = from.checked_sub(upload.GetGPUVirtualAddress()).unwrap();
                 list.list
@@ -900,6 +909,7 @@ mod late_tests {
     }
 }
 
+#[cfg(test)]
 mod wide_refresh_tests {
     use super::wide_refresh_enabled;
 
@@ -915,6 +925,7 @@ mod wide_refresh_tests {
     }
 }
 
+#[cfg(test)]
 mod front_tests {
     use super::{Touch, fold_touches, front_spans, join_keys};
 
@@ -964,12 +975,13 @@ mod front_tests {
     }
 }
 
+#[cfg(test)]
 mod written_spans_tests {
-    use super::{Touch, front_spans, split, written_spans};
+    use super::{Step, Touch, front_spans, join_front_prefix, list_front, split, written_spans};
 
     #[test]
-    fn front_refresh_stops_at_title_writes_and_tracks_each_parts_gpu_writes() {
-        use Touch::{Nothing, Part, Refresh, Title, Write};
+    fn front_refresh_tracks_each_parts_gpu_writes() {
+        use Touch::{Nothing, Part, Refresh, Write};
         let found = front_spans(
             [
                 Refresh(1, 10, 20),
@@ -987,14 +999,30 @@ mod written_spans_tests {
                 Refresh(1, 30, 40),
                 Write(4),
                 Refresh(4, 0, 9),
-                Title,
-                Refresh(5, 100, 200),
-                Part,
-                Refresh(1, 200, 300),
             ]
             .into_iter(),
         );
         assert_eq!(found, [(1, 10, 40), (2, 0, 5), (4, 7, 9)]);
+    }
+
+    #[test]
+    fn a_title_copy_stops_refresh_hoisting_in_this_and_later_lists() {
+        let at = 0x7d20_0000;
+        let shadow = crate::shadow::Shadow::unbacked(at as u64, std::ptr::null_mut(), 65536, false);
+        let front = list_front(
+            &[
+                Step::Refresh(shadow.clone(), at + 16, 16),
+                Step::Copy(at, at + 128, 16),
+                Step::Refresh(shadow.clone(), at + 64, 16),
+            ],
+            false,
+        );
+        let later = list_front(&[Step::Refresh(shadow, at + 96, 16)], false);
+        let ranges: Vec<_> = join_front_prefix(&mut vec![front, later], &[])
+            .into_iter()
+            .map(|(_, from, to)| (from, to))
+            .collect();
+        assert_eq!(ranges, [(at + 16, at + 32)]);
     }
 
     #[test]
@@ -1013,8 +1041,8 @@ mod written_spans_tests {
     }
 
     #[test]
-    fn what_is_written_is_refreshed_ahead_up_to_its_write_and_to_title_writes() {
-        use Touch::{Nothing, Refresh, Title, Write};
+    fn written_buffer_ranges_only_include_refreshes_before_the_first_gpu_write() {
+        use Touch::{Nothing, Refresh, Write};
         let mut found = written_spans(
             [
                 Refresh(1, 10, 20),
@@ -1027,8 +1055,6 @@ mod written_spans_tests {
                 Refresh(3, 1, 2),
                 Refresh(4, 7, 9),
                 Write(4),
-                Title,
-                Write(2),
             ]
             .into_iter(),
         );
@@ -1037,6 +1063,7 @@ mod written_spans_tests {
     }
 }
 
+#[cfg(test)]
 mod trail {
     /// The trail keeps the newest things, and the report made when the
     /// host device is removed says them and the pipeline library's state
@@ -1057,6 +1084,7 @@ mod trail {
     }
 }
 
+#[cfg(test)]
 mod spare {
     use super::{SPARE_KEPT, SPARE_MOST, Spare, spare_limit};
 
@@ -1100,6 +1128,7 @@ mod spare {
     }
 }
 
+#[cfg(test)]
 mod refresh_tests {
     use super::Batch;
     use crate::shadow::Shadow;
@@ -1197,17 +1226,15 @@ mod refresh_tests {
 
     fn memory(len: usize) -> *mut u8 {
         // SAFETY: a plain allocation.
-        let data = unsafe {
+        unsafe {
             VirtualAlloc(
                 std::ptr::null(),
                 len,
                 MEM_RESERVE | MEM_COMMIT,
                 PAGE_READWRITE,
             )
-            .cast::<u8>()
-        };
-        assert!(!data.is_null(), "test memory allocation failed");
-        data
+            .cast()
+        }
     }
 
     struct Random(u64);
@@ -1268,9 +1295,11 @@ mod refresh_tests {
                 ));
             }
         }
-        // SAFETY: callers pass offsets within this test's mapped regions,
-        // with no concurrent writes.
-        let byte = |at: usize| unsafe { (at as *const u8).read_volatile() };
+        let byte = |at: usize| {
+            // SAFETY: callers supply addresses in the initialized test title regions
+            // and read only when no refresh workers are running.
+            unsafe { (at as *const u8).read_volatile() }
+        };
         for round in 0..600 {
             for _ in 0..random.below(4) {
                 let at = regions[random.below(2)] + random.below(LEN - 64);
@@ -1296,8 +1325,8 @@ mod refresh_tests {
                     continue;
                 }
                 for i in 0..n {
-                    // SAFETY: `at + i` is within a test region and this thread
-                    // writes it before starting the refresh.
+                    // SAFETY: the offset stays in the test's committed title memory,
+                    // and this thread alone accesses it between submissions.
                     unsafe { ((at + i) as *mut u8).write_volatile(random.below(256) as u8) };
                 }
             }
@@ -1329,8 +1358,8 @@ mod refresh_tests {
             for (shadow, at, n) in &ranges {
                 let data = copies.iter().find(|c| Arc::ptr_eq(&c.0, shadow)).unwrap().1;
                 let start = shadow.span().0 as usize;
-                // SAFETY: each range fits both its title mapping and its copy,
-                // and all refresh workers have finished writing.
+                // SAFETY: the range was selected within both the test title region
+                // and the corresponding CPU copy. The refresh workers have finished.
                 let same = unsafe {
                     std::slice::from_raw_parts(*at as *const u8, *n)
                         == std::slice::from_raw_parts(data.add(at - start), *n)
@@ -1367,9 +1396,10 @@ mod refresh_tests {
         crate::watch::wrote(title + PAGE, 1);
         batch.add(&shadow, title, size);
         batch.flush();
-        // SAFETY: the refresh has returned and both locations are mapped.
-        let bytes = unsafe { (data.read(), data.add(PAGE).read()) };
-        assert_eq!(bytes, (0x42, 0x71));
+        // SAFETY: the refresh workers have finished, and both initialized bytes
+        // are within the test's two-page CPU copy.
+        let found = unsafe { (data.read(), data.add(PAGE).read()) };
+        assert_eq!(found, (0x42, 0x71));
     }
 
     /// A copy in the card's memory, with the card's side and the sends to it
@@ -1449,10 +1479,11 @@ mod refresh_tests {
             .and_then(|v| v.parse().ok())
             .unwrap_or(120);
         let region = title(LEN, true);
-        // SAFETY: the view is page-aligned and live for all scoped threads.
-        // Offsets name aligned dwords; title writers use atomics on their own
-        // words, and the landing thread reads its words after updating them.
-        let dword = |at: usize| unsafe { &*((region + at) as *const AtomicU32) };
+        let dword = |at: usize| {
+            // SAFETY: callers use aligned dword offsets within the committed test
+            // region and access these words atomically while the threads are active.
+            unsafe { &*((region + at) as *const AtomicU32) }
+        };
         let carded = [
             Carded::new(region, LEN, 3),
             Carded::new(region + 4 * PAGE + 1000, LEN - 6 * PAGE - 4, 5),
@@ -1681,30 +1712,32 @@ mod refresh_tests {
         });
     }
 
-    /// Measure putting title bytes under overlapping shader writes in a
-    /// synthetic copy. Run with `--ignored --nocapture`, and with
+    /// The title's bytes put in under shader writes, for a copy of 174 MB
+    /// whose shader writes were declared as 40 ranges that overlap, with 12
+    /// pages written since. Run with `--ignored --nocapture`, and with
     /// `VICTORY_LIGHT_REFRESH=0` for the way it was.
     #[test]
     #[ignore]
     fn bytes_under_overlapping_ranges() {
-        const BIG: usize = 192 << 20;
-        const STRIDE: usize = PAGE / 8 - 32;
+        const BIG: usize = 174 << 20;
         let big = title(BIG, true);
-        // SAFETY: `big` is a writable mapping of BIG bytes owned by the test.
+        // SAFETY: the test owns this committed `BIG`-byte title region.
         unsafe { std::ptr::write_bytes(big as *mut u8, 1, BIG) };
         let copy = Shadow::unbacked(big as u64, memory(BIG), BIG as u64, true);
         copy.update(big, BIG);
         copy.take_dirty();
-        for i in 0..48 {
-            copy.writing(big + i * STRIDE, BIG - i * STRIDE);
+        for i in 0..40 {
+            copy.writing(big + i * 5920, BIG - i * 5920);
         }
         let mut best = f64::MAX;
         for round in 0..30 {
-            for i in 0..16 {
-                let offset = (i * 211 + round) % (BIG / PAGE) * PAGE + 64;
-                // SAFETY: `offset` selects a byte within the live test mapping;
-                // no refresh runs until these writes are done.
-                unsafe { (big as *mut u8).add(offset).write_volatile(round as u8) };
+            for i in 0..12 {
+                // SAFETY: the selected page offset is inside the committed title
+                // region, which only this thread writes between merges.
+                unsafe {
+                    ((big + (i * 211 + round) % 2700 * PAGE + 64) as *mut u8)
+                        .write_volatile(round as u8)
+                };
             }
             let started = std::time::Instant::now();
             let mut runs = usize::MAX;
@@ -1956,6 +1989,7 @@ mod refresh_tests {
     }
 }
 
+#[cfg(test)]
 mod batch {
     // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;

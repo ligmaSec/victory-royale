@@ -12,7 +12,7 @@ use super::record::{kernel, on, standing, stood_at, ticks, waited, woken};
 type Handle = *mut c_void;
 
 macro_rules! wrapped {
-    ($($index:literal $name:ident ($($arg:ident: $type:ty),*) $(-> $result:ty)? => |$forward:ident| $body:expr;)*) => {
+    ($($index:literal $name:ident ($($arg:ident: $type:ty),*) $(-> $result:ty)? => |$call:ident| $body:expr;)*) => {
         /// The functions wrapped, by name: their own addresses, ours.
         static TABLE: [(&str, AtomicUsize, usize); [$($index),*].len()] = [
             $((stringify!($name), AtomicUsize::new(0), $index)),*
@@ -30,22 +30,21 @@ macro_rules! wrapped {
             use super::*;
             $(
                 pub(super) unsafe extern "system" fn $name($($arg: $type),*) $(-> $result)? {
-                    let address = TABLE[$index].1.load(Ordering::Relaxed);
-                    // SAFETY: only the address of the matching system export
-                    // or resolved import is installed before using this wrapper.
-                    let real = unsafe {
-                        std::mem::transmute::<
-                            usize,
-                            unsafe extern "system" fn($($type),*) $(-> $result)?,
-                        >(address)
-                    };
-                    let $forward = || {
-                        // SAFETY: forward the original arguments unchanged;
-                        // the wrapper's caller must uphold the original API's contract.
+                    let real: unsafe extern "system" fn($($type),*) $(-> $result)? =
+                        // SAFETY: each index identifies the same name in TABLE and wrapper().
+                        // arm() resolves the original exports once. Our import slots are
+                        // patched only for populated entries; import() fills any unresolved
+                        // slot from the title's resolved import before returning the wrapper.
+                        // Only wrapped entries reach this code; their targets remain loaded
+                        // and use the entry's declared system calling convention and signature.
+                        unsafe { std::mem::transmute(TABLE[$index].1.load(Ordering::Relaxed)) };
+                    let $call = || {
+                        // SAFETY: entry through the original import requires its caller to
+                        // satisfy the original function's argument contract. We forward unchanged.
                         unsafe { real($($arg),*) }
                     };
                     if !on() {
-                        return $forward();
+                        return $call();
                     }
                     $body
                 }
@@ -98,23 +97,14 @@ fn real(name: &str) -> usize {
 
 /// `take(lock)`, a try that does not wait, then `wait`.
 fn lock_of(name: &'static str, lock: Handle, take: &str, call: impl FnOnce()) {
-    let address = real(take);
-    if address != 0 {
-        let taken = if take == "TryEnterCriticalSection" {
-            // SAFETY: this export takes the caller's critical section and returns BOOL.
-            unsafe {
-                std::mem::transmute::<usize, unsafe extern "system" fn(Handle) -> i32>(address)(
-                    lock,
-                ) != 0
-            }
-        } else {
-            // SAFETY: the SRW exports take the caller's SRW lock and return BOOLEAN.
-            unsafe {
-                std::mem::transmute::<usize, unsafe extern "system" fn(Handle) -> u8>(address)(lock)
-                    != 0
-            }
+    let take = real(take);
+    if take != 0 {
+        // SAFETY: `TryEnterCriticalSection` or a `TryAcquireSRWLock` call:
+        // one pointer, a truth value (one byte of it for the latter).
+        let taken = unsafe {
+            std::mem::transmute::<usize, unsafe extern "system" fn(Handle) -> u8>(take)(lock)
         };
-        if taken {
+        if taken != 0 {
             return;
         }
     }
@@ -128,108 +118,115 @@ fn released(name: &'static str, object: Handle) {
 }
 
 wrapped! {
-    0 WaitForSingleObject(object: Handle, ms: u32) -> u32 => |forward| {
-        wait("WaitForSingleObject", object as u64, forward)
+    0 WaitForSingleObject(object: Handle, ms: u32) -> u32 => |call| {
+        wait("WaitForSingleObject", object as u64, call)
     };
-    1 WaitForSingleObjectEx(object: Handle, ms: u32, alertable: i32) -> u32 => |forward| {
-        wait("WaitForSingleObjectEx", object as u64, forward)
+    1 WaitForSingleObjectEx(object: Handle, ms: u32, alertable: i32) -> u32 => |call| {
+        wait("WaitForSingleObjectEx", object as u64, call)
     };
-    2 Sleep(ms: u32) => |forward| {
-        wait("Sleep", 0, forward)
+    2 Sleep(ms: u32) => |call| {
+        wait("Sleep", 0, call)
     };
-    3 SleepEx(ms: u32, alertable: i32) -> u32 => |forward| {
-        wait("SleepEx", 0, forward)
+    3 SleepEx(ms: u32, alertable: i32) -> u32 => |call| {
+        wait("SleepEx", 0, call)
     };
-    4 SetEvent(object: Handle) -> i32 => |forward| {
+    4 SetEvent(object: Handle) -> i32 => |call| {
         woken("SetEvent", object as u64);
-        forward()
+        call()
     };
-    5 ReleaseSemaphore(object: Handle, count: i32, before: *mut i32) -> i32 => |forward| {
+    5 ReleaseSemaphore(object: Handle, count: i32, before: *mut i32) -> i32 => |call| {
         woken("ReleaseSemaphore", object as u64);
-        forward()
+        call()
     };
-    6 ReleaseMutex(object: Handle) -> i32 => |forward| {
+    6 ReleaseMutex(object: Handle) -> i32 => |call| {
         woken("ReleaseMutex", object as u64);
-        forward()
+        call()
     };
-    7 EnterCriticalSection(lock: Handle) => |forward| {
-        lock_of("EnterCriticalSection", lock, "TryEnterCriticalSection", forward)
+    7 EnterCriticalSection(lock: Handle) => |call| {
+        lock_of("EnterCriticalSection", lock, "TryEnterCriticalSection", call)
     };
-    8 LeaveCriticalSection(lock: Handle) => |forward| {
+    8 LeaveCriticalSection(lock: Handle) => |call| {
         released("LeaveCriticalSection", lock);
-        forward()
+        call()
     };
-    9 AcquireSRWLockExclusive(lock: Handle) => |forward| {
-        lock_of("AcquireSRWLockExclusive", lock, "TryAcquireSRWLockExclusive", forward)
+    9 AcquireSRWLockExclusive(lock: Handle) => |call| {
+        lock_of("AcquireSRWLockExclusive", lock, "TryAcquireSRWLockExclusive", call)
     };
-    10 ReleaseSRWLockExclusive(lock: Handle) => |forward| {
+    10 ReleaseSRWLockExclusive(lock: Handle) => |call| {
         released("ReleaseSRWLockExclusive", lock);
-        forward()
+        call()
     };
-    11 AcquireSRWLockShared(lock: Handle) => |forward| {
-        lock_of("AcquireSRWLockShared", lock, "TryAcquireSRWLockShared", forward)
+    11 AcquireSRWLockShared(lock: Handle) => |call| {
+        lock_of("AcquireSRWLockShared", lock, "TryAcquireSRWLockShared", call)
     };
-    12 ReleaseSRWLockShared(lock: Handle) => |forward| {
+    12 ReleaseSRWLockShared(lock: Handle) => |call| {
         released("ReleaseSRWLockShared", lock);
-        forward()
+        call()
     };
-    13 WaitOnAddress(at: Handle, compare: Handle, size: usize, ms: u32) -> i32 => |forward| {
-        wait("WaitOnAddress", at as u64, forward)
+    13 WaitOnAddress(at: Handle, compare: Handle, size: usize, ms: u32) -> i32 => |call| {
+        wait("WaitOnAddress", at as u64, call)
     };
-    14 WakeByAddressSingle(at: Handle) => |forward| {
+    14 WakeByAddressSingle(at: Handle) => |call| {
         released("WakeByAddressSingle", at);
-        forward()
+        call()
     };
-    15 WakeByAddressAll(at: Handle) => |forward| {
+    15 WakeByAddressAll(at: Handle) => |call| {
         released("WakeByAddressAll", at);
-        forward()
+        call()
     };
-    16 SleepConditionVariableSRW(at: Handle, lock: Handle, ms: u32, flags: u32) -> i32 => |forward| {
-        wait("SleepConditionVariableSRW", at as u64, forward)
+    16 SleepConditionVariableSRW(at: Handle, lock: Handle, ms: u32, flags: u32) -> i32 => |call| {
+        wait("SleepConditionVariableSRW", at as u64, call)
     };
-    17 SleepConditionVariableCS(at: Handle, lock: Handle, ms: u32) -> i32 => |forward| {
-        wait("SleepConditionVariableCS", at as u64, forward)
+    17 SleepConditionVariableCS(at: Handle, lock: Handle, ms: u32) -> i32 => |call| {
+        wait("SleepConditionVariableCS", at as u64, call)
     };
-    18 WakeConditionVariable(at: Handle) => |forward| {
+    18 WakeConditionVariable(at: Handle) => |call| {
         released("WakeConditionVariable", at);
-        forward()
+        call()
     };
-    19 WakeAllConditionVariable(at: Handle) => |forward| {
+    19 WakeAllConditionVariable(at: Handle) => |call| {
         released("WakeAllConditionVariable", at);
-        forward()
+        call()
     };
-    20 WaitForMultipleObjects(count: u32, objects: *const Handle, all: i32, ms: u32) -> u32 => |forward| {
-        // A multi-wait has no single object; let Win32 read and validate the array.
-        wait("WaitForMultipleObjects", 0, forward)
+    20 WaitForMultipleObjects(count: u32, objects: *const Handle, all: i32, ms: u32) -> u32 => |call| {
+        // Name the wait by its first handle, if present.
+        let first = if count > 0 && !objects.is_null() {
+            // SAFETY: the caller's wait-array contract guarantees that `objects`
+            // points to `count` initialized, aligned handles readable during this call.
+            (unsafe { *objects }) as u64
+        } else {
+            0
+        };
+        wait("WaitForMultipleObjects", first, call)
     };
-    21 GetWriteWatch(flags: u32, at: Handle, size: usize, found: Handle, count: Handle, granularity: Handle) -> u32 => |forward| {
-        measured("GetWriteWatch", size, forward)
+    21 GetWriteWatch(flags: u32, at: Handle, size: usize, found: Handle, count: Handle, granularity: Handle) -> u32 => |call| {
+        measured("GetWriteWatch", size, call)
     };
-    22 VirtualProtect(at: Handle, size: usize, new: u32, old: Handle) -> i32 => |forward| {
-        measured("VirtualProtect", size, forward)
+    22 VirtualProtect(at: Handle, size: usize, new: u32, old: Handle) -> i32 => |call| {
+        measured("VirtualProtect", size, call)
     };
-    23 ReadProcessMemory(process: Handle, at: Handle, to: Handle, size: usize, done: Handle) -> i32 => |forward| {
-        measured("ReadProcessMemory", size, forward)
+    23 ReadProcessMemory(process: Handle, at: Handle, to: Handle, size: usize, done: Handle) -> i32 => |call| {
+        measured("ReadProcessMemory", size, call)
     };
-    24 VirtualQuery(at: Handle, info: Handle, size: usize) -> usize => |forward| {
-        measured("VirtualQuery", 0, forward)
+    24 VirtualQuery(at: Handle, info: Handle, size: usize) -> usize => |call| {
+        measured("VirtualQuery", 0, call)
     };
-    25 VirtualAlloc(at: Handle, size: usize, kind: u32, protect: u32) -> Handle => |forward| {
-        measured("VirtualAlloc", size, forward)
+    25 VirtualAlloc(at: Handle, size: usize, kind: u32, protect: u32) -> Handle => |call| {
+        measured("VirtualAlloc", size, call)
     };
-    26 VirtualFree(at: Handle, size: usize, kind: u32) -> i32 => |forward| {
-        measured("VirtualFree", size, forward)
+    26 VirtualFree(at: Handle, size: usize, kind: u32) -> i32 => |call| {
+        measured("VirtualFree", size, call)
     };
-    27 _Mtx_lock(lock: Handle) -> i32 => |forward| {
-        wait("_Mtx_lock", lock as u64, forward)
+    27 _Mtx_lock(lock: Handle) -> i32 => |call| {
+        wait("_Mtx_lock", lock as u64, call)
     };
-    28 _Mtx_unlock(lock: Handle) -> i32 => |forward| {
+    28 _Mtx_unlock(lock: Handle) -> i32 => |call| {
         released("_Mtx_unlock", lock);
-        forward()
+        call()
     };
-    29 TryEnterCriticalSection(lock: Handle) -> i32 => |forward| forward();
-    30 TryAcquireSRWLockExclusive(lock: Handle) -> u8 => |forward| forward();
-    31 TryAcquireSRWLockShared(lock: Handle) -> u8 => |forward| forward();
+    29 TryEnterCriticalSection(lock: Handle) -> u8 => |call| call();
+    30 TryAcquireSRWLockExclusive(lock: Handle) -> u8 => |call| call();
+    31 TryAcquireSRWLockShared(lock: Handle) -> u8 => |call| call();
 }
 
 /// The wrappers from here on are there for their real functions only.

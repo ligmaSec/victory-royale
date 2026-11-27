@@ -1,5 +1,5 @@
-//! Build-time shader bytecode for the renderer's own helpers. Development
-//! builds without a build-time DXC use the system compiler or runtime DXC.
+//! Compile host-owned shaders with the system compiler where possible,
+//! then use the package's matching embedded helper or runtime DXC.
 //! Some Wine compilers omit the root signature even on success; where the
 //! helper needs it embedded, that output is not usable.
 
@@ -26,10 +26,10 @@ pub(crate) fn compile_stage(
     root: bool,
 ) -> windows::core::Result<Cow<'static, [u8]>> {
     #[cfg(victory_bundled_hlsl)]
-    if let Some(code) = bundled_shader(source, entry.to_bytes(), profile.to_bytes(), 0) {
-        return Ok(Cow::Borrowed(code));
-    }
-    compile_runtime(name, source, entry, profile, root).map(Cow::Owned)
+    let bundled = bundled_shader(source, entry.to_bytes(), profile.to_bytes(), 0);
+    #[cfg(not(victory_bundled_hlsl))]
+    let bundled = None;
+    compile_runtime(name, source, entry, profile, root, bundled)
 }
 
 pub(crate) fn compile_clamp(
@@ -38,19 +38,26 @@ pub(crate) fn compile_clamp(
     rest: u32,
 ) -> windows::core::Result<Cow<'static, [u8]>> {
     #[cfg(victory_bundled_hlsl)]
-    if let Some(variant) = match (width, rest) {
+    let bundled = match (width, rest) {
         (65_535, 0) => Some(1),
         (65_535, 1) => Some(2),
         (1_048_576, 0) => Some(3),
         (1_048_576, 1) => Some(4),
         _ => None,
-    } && let Some(code) = bundled_shader(source, b"main", b"cs_5_1", variant)
-    {
-        return Ok(Cow::Borrowed(code));
     }
+    .and_then(|variant| bundled_shader(source, b"main", b"cs_5_1", variant));
+    #[cfg(not(victory_bundled_hlsl))]
+    let bundled = None;
     let source = format!("#define WIDEST {width}u\n#define REST {rest}\n{source}");
-    // The clamp's layout is created in Rust and does not need a shader root signature.
-    compile_runtime("argument clamp", &source, c"main", c"cs_5_1", false).map(Cow::Owned)
+    // The list supplies the clamp's root signature.
+    compile_runtime(
+        "argument clamp",
+        &source,
+        c"main",
+        c"cs_5_1",
+        false,
+        bundled,
+    )
 }
 
 fn has_root_signature(code: &[u8]) -> bool {
@@ -64,13 +71,18 @@ fn compile_runtime(
     entry: &CStr,
     profile: &CStr,
     root: bool,
-) -> windows::core::Result<Vec<u8>> {
+    bundled: Option<&'static [u8]>,
+) -> windows::core::Result<Cow<'static, [u8]>> {
+    // Preserve the donor's native compiler output where it is usable.
     match system_compile(name, source, entry, profile) {
-        Ok(code) if !root || has_root_signature(&code) => return Ok(code),
-        Ok(_) => tracing::info!("{name}: system compiler omitted the root signature"),
+        Ok(code) if !root || has_root_signature(&code) => return Ok(Cow::Owned(code)),
+        Ok(_) => tracing::debug!(helper = name, "system compiler omitted the root signature"),
         Err((e, text)) => {
-            tracing::debug!(error = %e, "{name}: system compiler refused it ({})", text.trim())
+            tracing::debug!(error = %e, helper = name, "system compiler refused it ({})", text.trim());
         }
+    }
+    if let Some(code) = bundled {
+        return Ok(Cow::Borrowed(code));
     }
     let code = dxc_compile(name, source, entry, profile)
         .inspect_err(|e| tracing::warn!(error = %e, "{name}: DXC failed"))?;
@@ -79,7 +91,7 @@ fn compile_runtime(
             windows::Win32::Foundation::E_FAIL,
         ));
     }
-    Ok(code)
+    Ok(Cow::Owned(code))
 }
 
 fn system_compile(

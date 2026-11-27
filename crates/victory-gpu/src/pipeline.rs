@@ -20,16 +20,14 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::mem::offset_of;
-#[cfg(windows)]
-use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(any(feature = "diagnostics", test))]
 use crate::object::E_NOTIMPL;
-use crate::object::{
-    self, E_FAIL, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, S_OK, Table, This, guid,
-};
+use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
+
+const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 
 const PIPELINE_IIDS: [Iid; 4] = [
     guid(
@@ -70,6 +68,14 @@ pub(crate) struct Shader {
     pub(crate) hash: String,
     container: Vec<u8>,
     #[cfg(windows)]
+    pub(crate) roles: roles::Roles,
+    /// Optional visual workarounds may decline known modules.
+    #[cfg(windows)]
+    disabled: bool,
+    /// Its part in the stand-in for the indirect light.
+    #[cfg(windows)]
+    pub(crate) ambient: Option<crate::ambient::Role>,
+    #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
 
@@ -106,6 +112,14 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
+#[cfg(windows)]
+fn disabled(roles: Roles) -> bool {
+    static HAIR_OFF: OnceLock<bool> = OnceLock::new();
+    roles.has(Role::Hair)
+        && *HAIR_OFF.get_or_init(|| std::env::var_os("VICTORY_HAIR").is_some_and(|v| v == "0"))
+        || roles.has(Role::ProbeActivation) && !victory_shader::emit::rays()
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
@@ -116,10 +130,20 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(windows)]
+            let roles = roles::get(&full);
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                roles,
+                #[cfg(windows)]
+                disabled: disabled(roles),
+                #[cfg(windows)]
+                ambient: (stage == "compute")
+                    .then(|| crate::ambient::role(roles))
+                    .flatten(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -155,8 +179,11 @@ impl Shader {
                 let done = translate(&self.container);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
-                if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
-                    let dir = std::path::PathBuf::from(dir);
+                #[cfg(feature = "diagnostics")]
+                if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE")
+                    .map(std::path::PathBuf::from)
+                    .filter(|path| victory_core::ensure_outside_repo(path).is_ok())
+                {
                     let _ = std::fs::create_dir_all(&dir);
                     let stem = format!("{}.{}", self.hash, self.stage);
                     let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
@@ -302,6 +329,21 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
         .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
 }
 
+/// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
+/// stays in the host's copies and is not copied back into title memory. A
+/// check for a first run of the whole builder: a stage that stores where
+/// it should not can then not reach the title's own objects (run 98), and
+/// the programs that walk the structures read the host's copies anyway.
+/// shortcut: not a way to run: the title also reads results back (sizes,
+/// counters) and gets none, and a copy's pages are overwritten from title
+/// memory when the title writes them.
+#[cfg(windows)]
+pub(crate) fn builder_quarantined(this: This) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    is_builder(this)
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {
@@ -326,9 +368,7 @@ pub(crate) fn builder_rests(why: &'static str) {
 #[cfg(windows)]
 fn builder_allowed() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
-    cfg!(feature = "diagnostics")
-        && *ALLOWED
-            .get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
 }
 
 /// Snapshot for the overlay. Never waits for or starts a pipeline build.
@@ -486,11 +526,7 @@ pub(crate) fn bound(this: This) {
 /// use starts that, see [`make`]).
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
-    if this.is_null() {
-        return None;
-    }
-    #[cfg(feature = "diagnostics")]
-    if is_skipped(this) {
+    if this.is_null() || is_skipped(this) {
         return None;
     }
     make::ready(&pipeline(this).host)
@@ -508,7 +544,7 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<Cow<'static, str>, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -528,7 +564,7 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
@@ -537,11 +573,11 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     });
     p.shaders
         .iter()
-        .find(|shader| hashes.contains(&shader.hash))
+        .find(|shader| shader.disabled || !hashes.is_empty() && hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
@@ -603,10 +639,10 @@ fn hand_out(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    #[cfg(feature = "diagnostics")]
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    #[cfg(windows)]
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
@@ -673,6 +709,9 @@ pub(crate) extern "system" fn create_compute(
     )
 }
 
+/// Device method 0x1f0: the plain compute description plus console
+/// extensions `(desc, extension count, extensions, iid, out)`.
+/// shortcut: the extensions (console shader settings) are ignored, as is
 /// What an FSPX compute module says about itself, for the logs.
 #[derive(Debug, PartialEq, Eq)]
 struct FspxSummary {
@@ -966,6 +1005,10 @@ static FUNCTIONS: Table<24> = {
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
+mod roles;
+#[cfg(windows)]
+pub(crate) use roles::{Role, Roles};
+#[cfg(windows)]
 mod library;
 #[cfg(windows)]
 mod make;
@@ -1010,33 +1053,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::object::slot;
-
-    /// The slice a title's stream (or a pre-build's) is in need not be
-    /// 8-aligned: its bytecode is read as it lies.
-    #[test]
-    fn a_stream_of_any_alignment_is_read() {
-        let vs = [1u8, 2, 3];
-        let mut backing = [0u64; 5];
-        // SAFETY: the 40 bytes of `backing`, one off its (aligned) start.
-        let stream =
-            unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>().add(1), 32) };
-        stream[..4].copy_from_slice(&1u32.to_le_bytes()); // vertex shader
-        stream[8..16].copy_from_slice(&(vs.as_ptr() as usize).to_le_bytes());
-        stream[16..24].copy_from_slice(&vs.len().to_le_bytes());
-        assert_ne!(stream.as_ptr() as usize % 8, 0);
-        let desc = StreamDesc {
-            size: 24,
-            stream: stream.as_ptr(),
-        };
-        let mut out = std::ptr::null();
-        assert_eq!(
-            create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut out),
-            S_OK
-        );
-        assert_eq!(shaders(out), vec![("vertex", vs.to_vec())]);
-        crate::object::release_boxed::<Pipeline>(out);
-    }
+    use crate::object::{S_OK, slot};
 
     #[test]
     fn slot67_result_names_parse() {
@@ -1181,6 +1198,32 @@ mod tests {
         assert_eq!(hr, S_OK);
         assert_eq!(shaders(p), [("compute", module)]);
         object::release_boxed::<Pipeline>(p);
+    }
+
+    /// The slice a title's stream (or a pre-build's) is in need not be
+    /// 8-aligned: its bytecode is read as it lies.
+    #[test]
+    fn a_stream_of_any_alignment_is_read() {
+        let vs = [1u8, 2, 3];
+        let mut backing = [0u64; 5];
+        // SAFETY: the 40 bytes of `backing`, one off its (aligned) start.
+        let stream =
+            unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>().add(1), 32) };
+        stream[..4].copy_from_slice(&1u32.to_le_bytes()); // vertex shader
+        stream[8..16].copy_from_slice(&(vs.as_ptr() as usize).to_le_bytes());
+        stream[16..24].copy_from_slice(&vs.len().to_le_bytes());
+        assert_ne!(stream.as_ptr() as usize % 8, 0);
+        let desc = StreamDesc {
+            size: 24,
+            stream: stream.as_ptr(),
+        };
+        let mut out = std::ptr::null();
+        assert_eq!(
+            create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut out),
+            S_OK
+        );
+        assert_eq!(shaders(out), vec![("vertex", vs.to_vec())]);
+        crate::object::release_boxed::<Pipeline>(out);
     }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {

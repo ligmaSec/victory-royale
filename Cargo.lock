@@ -1329,10 +1329,10 @@ dependencies = [
 name = "victory-hle"
 version = "0.1.0"
 dependencies = [
- "miniz_oxide",
  "opus-pure",
  "tempfile",
  "tracing",
+ "victory-core",
  "victory-formats",
  "victory-gpu",
  "victory-loader",
@@ -1394,6 +1394,7 @@ dependencies = [
  "memchr",
  "tempfile",
  "thiserror",
+ "victory-core",
  "windows",
  "windows-sys",
  "zlib-rs",

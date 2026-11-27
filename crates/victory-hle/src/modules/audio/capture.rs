@@ -149,6 +149,7 @@ fn write_zeros(writer: &mut impl std::io::Write, mut bytes: u64) -> std::io::Res
 }
 
 fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    victory_core::ensure_outside_repo(path)?;
     // SAFETY: COM calls with parameters built here; buffers are used only
     // between `GetBuffer` and `ReleaseBuffer`.
     unsafe {

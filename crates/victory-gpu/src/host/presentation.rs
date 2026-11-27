@@ -1,105 +1,6 @@
-//! Swap-chain lifecycle, two-plane output, and successful-present measurements.
+//! Donor swap-chain lifecycle, two-plane output and successful-present telemetry.
 
 use super::*;
-use windows::Win32::Foundation::DXGI_STATUS_OCCLUDED;
-use windows::core::HRESULT;
-
-/// A presenter that could not be made, and when to try again. Without this,
-/// a run behind a locked screen or a sleeping display retried every frame:
-/// 1,654 `no swap chain` lines in 60 seconds, and one DXGI call per frame,
-/// which buries the log and costs a submission's worth of work each time.
-struct Retry {
-    attempts: u32,
-    /// The next attempt is due at (or after) this instant; `None` with
-    /// `attempts == 0` means nothing has failed.
-    next: Option<std::time::Instant>,
-}
-
-impl Retry {
-    const fn new() -> Self {
-        Retry {
-            attempts: 0,
-            next: None,
-        }
-    }
-
-    /// Whether an attempt is due at `now`.
-    fn due(&self, now: std::time::Instant) -> bool {
-        self.next.is_none_or(|at| now >= at)
-    }
-
-    /// Records a failed attempt at `now` and when the next one may run.
-    fn failed(&mut self, now: std::time::Instant) {
-        self.attempts = self.attempts.saturating_add(1);
-        self.next = Some(now + retry_delay(self.attempts));
-    }
-
-    /// Clears the failure state after an attempt worked, returning how many
-    /// attempts had failed before it.
-    fn reset(&mut self) -> u32 {
-        let attempts = self.attempts;
-        *self = Retry::new();
-        attempts
-    }
-}
-
-/// How long to wait before retry number `attempts`: 100 ms, doubling, up to
-/// one second, so a state that clears still recovers within a second.
-fn retry_delay(attempts: u32) -> std::time::Duration {
-    const FIRST_MS: u64 = 100;
-    const MOST_MS: u64 = 1_000;
-    let doubling = FIRST_MS << attempts.saturating_sub(1).min(4);
-    std::time::Duration::from_millis(doubling.min(MOST_MS))
-}
-
-/// Which step of making a presenter failed, so the log says whether the
-/// window, the swap chain or its command list was refused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PresentStep {
-    Window,
-    Factory,
-    SwapChain,
-    List,
-}
-
-impl PresentStep {
-    fn name(self) -> &'static str {
-        match self {
-            PresentStep::Window => "window",
-            PresentStep::Factory => "DXGI factory",
-            PresentStep::SwapChain => "swap chain",
-            PresentStep::List => "copy list",
-        }
-    }
-}
-
-pub(super) struct PresenterState {
-    current: Option<Presenter>,
-    retry: Retry,
-}
-
-impl PresenterState {
-    pub(super) const fn new() -> Self {
-        Self {
-            current: None,
-            retry: Retry::new(),
-        }
-    }
-}
-
-/// The swap chain formats a presented texture can be copied into: its own
-/// family's.
-fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
-    Some(match format.0 {
-        27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
-        87 | 90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
-        23..=25 => DXGI_FORMAT_R10G10B10A2_UNORM,
-        9..=14 => DXGI_FORMAT_R16G16B16A16_FLOAT,
-        _ => return None,
-    })
-}
-
-const BUFFERS: u32 = 2;
 
 /// Luminance bounds of the host display when HDR (HDR10 / PQ) is active on
 /// Windows.
@@ -157,7 +58,22 @@ fn desired_color_space(format: DXGI_FORMAT, hdr_active: bool) -> DXGI_COLOR_SPAC
     }
 }
 
-struct Presenter {
+/// The swap chain formats a presented texture can be copied into: its own
+/// family's.
+fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+    Some(match format.0 {
+        27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
+        87 | 90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
+        23..=25 => DXGI_FORMAT_R10G10B10A2_UNORM,
+        9..=14 => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        _ => return None,
+    })
+}
+
+const BUFFERS: u32 = 2;
+
+pub(super) struct Presenter {
+    last_present_issue: Option<windows::core::HRESULT>,
     swap_chain: IDXGISwapChain3,
     width: u32,
     height: u32,
@@ -171,47 +87,6 @@ struct Presenter {
     meter: Meter,
     composer: Option<crate::compose::Composer>,
     panel: panel::Panel,
-    color_space: DXGI_COLOR_SPACE_TYPE,
-    last_present_issue: Option<HRESULT>,
-}
-
-/// A successful DXGI status may still mean nothing was presented.
-fn present_result(status: HRESULT) -> windows::core::Result<bool> {
-    status.ok()?;
-    Ok(status != DXGI_STATUS_OCCLUDED)
-}
-
-impl Presenter {
-    fn sync_color_space(&mut self, hdr_active: bool) {
-        let wanted = desired_color_space(self.format, hdr_active);
-        if self.color_space == wanted {
-            return;
-        }
-        // SAFETY: `self.swap_chain` is a live `IDXGISwapChain3`.
-        let supported = unsafe { self.swap_chain.CheckColorSpaceSupport(wanted) }.unwrap_or(0);
-        if supported & (DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32) == 0 {
-            tracing::debug!(
-                color_space = wanted.0,
-                supported,
-                "swap chain color space unsupported on host output"
-            );
-            return;
-        }
-        // SAFETY: `wanted` is supported for presentation on `self.swap_chain`.
-        match unsafe { self.swap_chain.SetColorSpace1(wanted) } {
-            Ok(()) => {
-                self.color_space = wanted;
-                tracing::info!(
-                    format = self.format.0,
-                    color_space = wanted.0,
-                    "swap chain color space set"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, color_space = wanted.0, "SetColorSpace1 failed");
-            }
-        }
-    }
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -306,6 +181,8 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
         );
         crate::shadow::exact_line(frames);
+        #[cfg(feature = "diagnostics")]
+        crate::watch::alone_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
         crate::queue::behind_line(frames);
@@ -512,6 +389,18 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            let (defrag_dispatches, defrag_groups, defrag_indirect) = crate::draw::defrag_counts();
+            if defrag_dispatches > 0 || defrag_indirect > 0 {
+                tracing::info!(
+                    dispatches = defrag_dispatches,
+                    groups = defrag_groups,
+                    indirect = defrag_indirect,
+                    sites = victory_shader::emit::defrag_meet_sites(),
+                    lds_reads = victory_shader::emit::defrag_lds_sites().0,
+                    lds_writes = victory_shader::emit::defrag_lds_sites().1,
+                    "heap defragmentation since start"
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 let put = [0, 1, 2, 3]
@@ -570,31 +459,6 @@ impl Meter {
     }
 }
 
-// Presentation moves at most three resources at a time. Keep those barriers
-// on the stack and never emit an identity transition.
-fn barriers<const N: usize>(
-    list: &ID3D12GraphicsCommandList,
-    states: [(
-        &ID3D12Resource,
-        D3D12_RESOURCE_STATES,
-        D3D12_RESOURCE_STATES,
-    ); N],
-) {
-    let mut barriers: [D3D12_RESOURCE_BARRIER; N] = std::array::from_fn(|_| Default::default());
-    let mut count = 0;
-    for (resource, from, to) in states {
-        if from != to {
-            barriers[count] = transition(resource, from, to);
-            count += 1;
-        }
-    }
-    if count != 0 {
-        // SAFETY: the presentation list is recording; callers keep every
-        // transitioned resource alive and supply its current state.
-        unsafe { list.ResourceBarrier(&barriers[..count]) };
-    }
-}
-
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
@@ -636,34 +500,27 @@ impl Host {
         };
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
-        let now = std::time::Instant::now();
-        if !presenter.retry.due(now) {
-            return None;
-        }
-        if presenter.current.is_none() {
-            match self.presenter(width, height, format) {
-                Ok(p) => {
-                    let attempts = presenter.retry.reset();
-                    if attempts > 0 {
-                        tracing::info!(attempts, "swap chain created after the failed attempts");
-                    }
-                    presenter.current = Some(p);
-                }
-                Err((step, e)) => {
-                    presenter.retry.failed(now);
-                    if presenter.retry.attempts == 1 {
-                        tracing::warn!(error = %e, step = step.name(), width, height,
-                            format = format.0, "no swap chain; the next attempt waits for the backoff");
-                    } else {
-                        tracing::debug!(error = %e, step = step.name(), attempts = presenter.retry.attempts, "no swap chain");
-                    }
+        if presenter.is_none() {
+            *presenter = match self.presenter(width, height, format) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no swap chain");
                     return None;
+                }
+            };
+        }
+        let state_u32 = state;
+        let p = presenter.as_mut()?;
+        if planes.is_some() && p.composer.is_none() {
+            match crate::compose::Composer::new(self, format) {
+                Ok(c) => p.composer = Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "two-plane composer not made; showing base plane only");
+                    drop(presenter);
+                    return self.present_planes(texture, state_u32, None, frame);
                 }
             }
         }
-        let PresenterState { current, retry } = &mut *presenter;
-        let state_u32 = state;
-        let p = current.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
@@ -674,7 +531,6 @@ impl Host {
             };
             match resized {
                 Ok(()) => {
-                    retry.reset();
                     if p.format != format {
                         p.composer = None;
                     }
@@ -689,12 +545,7 @@ impl Host {
                     self.log_video_memory("right after the swap chain's buffers were made again");
                 }
                 Err(e) => {
-                    retry.failed(now);
-                    if retry.attempts == 1 {
-                        tracing::warn!(error = %e, width, height, "swap chain not resized; the next attempt waits for the backoff");
-                    } else {
-                        tracing::debug!(error = %e, attempts = retry.attempts, "swap chain not resized");
-                    }
+                    tracing::warn!(error = %e, width, height, "swap chain not resized");
                     return None;
                 }
             }
@@ -709,11 +560,6 @@ impl Host {
                 }
             }
         }
-        let hdr_active = matches!(format, DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R16G16B16A16_FLOAT)
-            // SAFETY: the swap chain is live. Both calls are plain output queries.
-            && unsafe { p.swap_chain.GetContainingOutput().and_then(|output| output.cast::<IDXGIOutput6>()).and_then(|output| output.GetDesc1()) }
-                .is_ok_and(|desc| desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
-        p.sync_color_space(hdr_active);
         let state = D3D12_RESOURCE_STATES(state_u32 as i32);
         // SAFETY: our swap chain, list and live source texture(s).
         unsafe {
@@ -756,19 +602,27 @@ impl Host {
             let composed = if let Some((over, over_state, base_fmt, over_fmt)) = planes {
                 copy.keep(over);
                 if let Some(composer) = p.composer.as_mut() {
-                    let pixel_read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-                    barriers(
-                        list,
-                        [
-                            (texture, state, pixel_read),
-                            (over, over_state, pixel_read),
-                            (
-                                &back,
-                                D3D12_RESOURCE_STATE_PRESENT,
-                                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                            ),
-                        ],
-                    );
+                    let mut pre = Vec::with_capacity(3);
+                    if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                        pre.push(transition(
+                            texture,
+                            state,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        ));
+                    }
+                    if over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                        pre.push(transition(
+                            over,
+                            over_state,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        ));
+                    }
+                    pre.push(transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    ));
+                    list.ResourceBarrier(&pre);
                     let compose_slot = slot.map_or(0, |i| i + 1);
                     if let Err(err) = composer.record(
                         self,
@@ -796,18 +650,27 @@ impl Host {
                             "display output: compositing two planes (overlay active)"
                         );
                     }
-                    barriers(
-                        list,
-                        [
-                            (texture, pixel_read, state),
-                            (over, pixel_read, over_state),
-                            (
-                                &back,
-                                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                            ),
-                        ],
-                    );
+                    let mut post = Vec::with_capacity(3);
+                    if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                        post.push(transition(
+                            texture,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                            state,
+                        ));
+                    }
+                    if over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                        post.push(transition(
+                            over,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                            over_state,
+                        ));
+                    }
+                    post.push(transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ));
+                    list.ResourceBarrier(&post);
                     true
                 } else {
                     false
@@ -816,17 +679,16 @@ impl Host {
                 false
             };
             if !composed {
-                barriers(
-                    list,
-                    [
-                        (texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                        (
-                            &back,
-                            D3D12_RESOURCE_STATE_PRESENT,
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                        ),
-                    ],
-                );
+                let mut pre = Vec::with_capacity(2);
+                if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                    pre.push(transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
+                }
+                pre.push(transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                ));
+                list.ResourceBarrier(&pre);
                 #[cfg(feature = "diagnostics")]
                 let shown = crate::capture::show(list, &back, texture);
                 #[cfg(not(feature = "diagnostics"))]
@@ -892,21 +754,24 @@ impl Host {
                     D3D12_RESOURCE_STATE_PRESENT,
                 )]);
             } else {
-                barriers(
-                    list,
-                    [
-                        (texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                        (
-                            &back,
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                            D3D12_RESOURCE_STATE_PRESENT,
-                        ),
-                    ],
-                );
+                let mut post = Vec::with_capacity(2);
+                if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                    post.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
+                }
+                post.push(transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                ));
+                list.ResourceBarrier(&post);
             }
             copy.close();
             let flown = match slot {
-                Some(_) => self.execute_own(copy),
+                Some(i) => {
+                    let flown = self.execute_own(copy);
+                    p.ahead[i].1 = flown;
+                    flown
+                }
                 None => {
                     self.execute(&[copy]);
                     0
@@ -924,42 +789,22 @@ impl Host {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let mut showing = crate::timeline::span("the host's Present");
-            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            let result = present_result(status);
-            if let Err(error) = &result
-                && self.device.GetDeviceRemovedReason().is_err()
-            {
-                fail(format_args!(
-                    "host GPU device removed during Present: {error}{}{}",
-                    self.removal_data(&[copy]),
-                    last_notes(&[copy])
-                ));
-            }
-            // The command list was submitted irrespective of the DXGI result.
-            if let Some(i) = slot {
-                p.ahead[i].1 = flown;
-            }
-            match result {
-                Ok(false) => {
-                    if p.last_present_issue.replace(status) != Some(status) {
+            let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if result == windows::Win32::Foundation::DXGI_STATUS_OCCLUDED || result.is_err() {
+                p.meter.frame_times.interrupted();
+                if p.last_present_issue.replace(result) != Some(result) {
+                    if result == windows::Win32::Foundation::DXGI_STATUS_OCCLUDED {
                         tracing::info!(frame, "DXGI reports the window is occluded");
+                    } else {
+                        tracing::warn!(frame, error = %windows::core::Error::from_hresult(result), "swap chain present failed");
                     }
-                    return None;
                 }
-                Err(error) => {
-                    if p.last_present_issue.replace(status) != Some(status) {
-                        tracing::warn!(%error, frame, "swap chain present failed");
-                    }
-                    return None;
-                }
-                Ok(true) => {
-                    if p.last_present_issue.take().is_some() {
-                        p.meter.frame_times.interrupted();
-                        tracing::info!(frame, "DXGI resumed presenting frames");
-                    }
-                    p.panel.presented(true);
-                }
+                return None;
             }
+            if p.last_present_issue.take().is_some() {
+                tracing::info!(frame, "DXGI resumed presenting frames");
+            }
+            p.panel.presented(true);
             showing.next("the frame meter");
             p.meter.frame(p.hwnd);
             showing.end();
@@ -975,16 +820,15 @@ impl Host {
         width: u32,
         height: u32,
         format: DXGI_FORMAT,
-    ) -> Result<Presenter, (PresentStep, windows::core::Error)> {
+    ) -> windows::core::Result<Presenter> {
         let hwnd = match title_window() {
             Some(hwnd) => hwnd,
-            None => window(width, height).map_err(|e| (PresentStep::Window, e))?,
+            None => window(width, height)?,
         };
         self.log_video_memory("right before the swap chain is made");
         // SAFETY: plain object creation for our window.
         unsafe {
-            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
-                .map_err(|e| (PresentStep::Factory, e))?;
+            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -999,14 +843,36 @@ impl Host {
                 ..Default::default()
             };
             let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)
-                .and_then(|chain| chain.cast::<IDXGISwapChain3>())
-                .map_err(|e| (PresentStep::SwapChain, e))?;
-            let copy = self.new_list().map_err(|e| (PresentStep::List, e))?;
+                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
+                .cast::<IDXGISwapChain3>()?;
+            // Leave SDR output unchanged; tag an HDR/scRGB swap chain only
+            // if the actual output currently advertises the corresponding mode.
+            if matches!(
+                format,
+                DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R16G16B16A16_FLOAT
+            ) {
+                let hdr = swap_chain
+                    .GetContainingOutput()
+                    .and_then(|output| output.cast::<IDXGIOutput6>())
+                    .and_then(|output| output.GetDesc1())
+                    .is_ok_and(|desc| {
+                        desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+                    });
+                let space = desired_color_space(format, hdr);
+                if swap_chain.CheckColorSpaceSupport(space).unwrap_or(0)
+                    & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32
+                    != 0
+                    && let Err(error) = swap_chain.SetColorSpace1(space)
+                {
+                    tracing::warn!(%error, color_space = space.0, "SetColorSpace1 failed");
+                }
+            }
+            let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
+                last_present_issue: None,
                 swap_chain,
                 width,
                 height,
@@ -1017,128 +883,7 @@ impl Host {
                 meter: Meter::new(),
                 composer: None,
                 panel: panel::Panel::new(crate::switch::on("VICTORY_PANEL")),
-                color_space: DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
-                last_present_issue: None,
             })
         }
-    }
-}
-
-/// A visible top-level window of this process: the one the title made, if
-/// it made one.
-fn title_window() -> Option<HWND> {
-    extern "system" fn visit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
-        let mut process = 0;
-        // SAFETY: a window handle from the enumeration; `found` is ours.
-        unsafe {
-            GetWindowThreadProcessId(hwnd, Some(&mut process));
-            if process == windows::Win32::System::Threading::GetCurrentProcessId()
-                && IsWindowVisible(hwnd).as_bool()
-            {
-                *(found.0 as *mut Option<HWND>) = Some(hwnd);
-                return false.into();
-            }
-        }
-        true.into()
-    }
-    let mut found: Option<HWND> = None;
-    // SAFETY: the callback only writes `found`, which outlives the call.
-    let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut found as isize)) };
-    found
-}
-
-#[cfg(test)]
-mod present_retry {
-    use super::{PresentStep, Retry, retry_delay};
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn the_backoff_starts_short_and_stops_at_a_second() {
-        let schedule: Vec<u64> = (1..=7).map(|n| retry_delay(n).as_millis() as u64).collect();
-        assert_eq!(schedule, [100, 200, 400, 800, 1_000, 1_000, 1_000]);
-    }
-
-    #[test]
-    fn a_failed_attempt_waits_before_the_next_one() {
-        let start = Instant::now();
-        let mut retry = Retry::new();
-        // Nothing has failed, so an attempt is due.
-        assert!(retry.due(start));
-        retry.failed(start);
-        assert_eq!(retry.attempts, 1);
-        assert!(!retry.due(start));
-        assert!(!retry.due(start + Duration::from_millis(99)));
-        assert!(retry.due(start + Duration::from_millis(100)));
-        // A second failure doubles the wait and counts.
-        let second = start + Duration::from_millis(100);
-        retry.failed(second);
-        assert_eq!(retry.attempts, 2);
-        assert!(!retry.due(second + Duration::from_millis(199)));
-        assert!(retry.due(second + Duration::from_millis(200)));
-    }
-
-    #[test]
-    fn a_working_attempt_clears_the_state_and_reports_the_failures() {
-        let start = Instant::now();
-        let mut retry = Retry::new();
-        for _ in 0..3 {
-            retry.failed(start);
-        }
-        assert_eq!(retry.attempts, 3);
-        assert_eq!(retry.reset(), 3);
-        assert_eq!(retry.attempts, 0);
-        assert!(retry.due(start));
-        // A later failure starts the schedule over.
-        retry.failed(start);
-        assert!(!retry.due(start + Duration::from_millis(99)));
-    }
-
-    /// A minute behind a desktop that never appears: one attempt per backoff
-    /// instead of one per presented frame.
-    #[test]
-    fn a_minute_without_a_desktop_asks_a_bounded_number_of_times() {
-        let mut retry = Retry::new();
-        let mut now = Instant::now();
-        let mut attempts = 0u32;
-        for _ in 0..1_200 {
-            // 60 s at 20 fps.
-            if retry.due(now) {
-                attempts += 1;
-                retry.failed(now);
-            }
-            now += Duration::from_millis(50);
-        }
-        assert!(
-            (59..=64).contains(&attempts),
-            "{attempts} attempts in a minute, one per backoff expected"
-        );
-    }
-
-    #[test]
-    fn every_step_of_a_presenter_has_a_name() {
-        for step in [
-            PresentStep::Window,
-            PresentStep::Factory,
-            PresentStep::SwapChain,
-            PresentStep::List,
-        ] {
-            assert!(!step.name().is_empty());
-        }
-    }
-}
-
-#[cfg(test)]
-mod present_outcome {
-    use super::*;
-    #[test]
-    fn present_result_distinguishes_occlusion_from_success_and_failure() {
-        assert!(present_result(HRESULT(0)).unwrap());
-        assert!(!present_result(DXGI_STATUS_OCCLUDED).unwrap());
-        assert_eq!(
-            present_result(DXGI_ERROR_DEVICE_REMOVED)
-                .unwrap_err()
-                .code(),
-            DXGI_ERROR_DEVICE_REMOVED
-        );
     }
 }

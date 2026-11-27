@@ -25,7 +25,6 @@ use std::collections::{BTreeMap, HashMap};
 
 use windows::Win32::Foundation::CloseHandle;
 
-use super::send::DirtyCopy;
 use super::*;
 use crate::shadow::Shadow;
 
@@ -133,14 +132,17 @@ struct Stale {
     some: Vec<String>,
 }
 
-static STALE: Mutex<BTreeMap<(u64, u64), Stale>> = Mutex::new(BTreeMap::new());
+/// A shadow's starting title address and byte length.
+type CopySpan = (u64, u64);
+
+static STALE: Mutex<BTreeMap<CopySpan, Stale>> = Mutex::new(BTreeMap::new());
 
 /// Records the looks at what `dirty` sends up into `list`, ahead of the
 /// sends.
 pub(super) fn record(
     host: &Host,
     list: &ID3D12GraphicsCommandList,
-    dirty: &[DirtyCopy],
+    dirty: &[send::DirtyCopy],
 ) -> Option<Looks> {
     let mut noted = std::mem::take(&mut *NOTED.lock().unwrap_or_else(|e| e.into_inner()));
     let mut all: Vec<(std::sync::Arc<Shadow>, Taken)> = Vec::new();
@@ -240,7 +242,7 @@ impl Looks {
 }
 
 /// Once a second: what was found since.
-fn line(stale: &mut BTreeMap<(u64, u64), Stale>) {
+fn line(stale: &mut BTreeMap<CopySpan, Stale>) {
     static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
     let said = SAID.load(Ordering::Relaxed);
@@ -330,7 +332,7 @@ fn known(copy: u64, at: usize) -> String {
 /// Reads of title memory through one copy while a flight in the air may
 /// write it through another: (reader, writer) by their spans: how often, and
 /// the last range they share.
-type Crossed = BTreeMap<((u64, u64), (u64, u64)), (u64, usize, usize)>;
+type Crossed = BTreeMap<(CopySpan, CopySpan), (u64, usize, usize)>;
 static CROSSED: Mutex<(u64, Crossed)> = Mutex::new((0, BTreeMap::new()));
 
 /// Flights are in the air and `runs` are about to be prepared: which
@@ -487,32 +489,25 @@ pub(super) fn at_rest(host: &Host) {
     LAST.store(now_ms(), Ordering::Relaxed);
 }
 
-struct StalePages {
-    carded: bool,
-    words: u64,
-    pages: usize,
-    some: Vec<String>,
-}
+/// Whether a copy is carded, how many words and pages differ, and examples.
+type StalePages = (bool, u64, usize, Vec<String>);
 
 /// At rest: copies of title memory, whatever reads them (meshes too), that
 /// are not what title memory holds although nothing told that it changed: a
 /// refresh will not bring them up to date.
 fn look_for_stale() {
     const MOST: usize = 1 << 30;
-    let mut by = BTreeMap::new();
+    let mut by: BTreeMap<CopySpan, StalePages> = BTreeMap::new();
     let compared = crate::shadow::stale_pages(
         MOST,
         &mut |shadow, page, words, (at, copy, title)| {
-            let e = by.entry(shadow.span()).or_insert_with(|| StalePages {
-                carded: shadow.carded(),
-                words: 0,
-                pages: 0,
-                some: Vec::new(),
-            });
-            e.words += words as u64;
-            e.pages += 1;
-            if e.some.len() < 4 {
-                e.some.push(format!("{words} words in the 64 KiB at {page:#x} (the first at {at:#x}: the copy {copy:#x}, title memory {title:#x})"));
+            let e = by
+                .entry(shadow.span())
+                .or_insert((shadow.carded(), 0, 0, Vec::new()));
+            e.1 += words as u64;
+            e.2 += 1;
+            if e.3.len() < 4 {
+                e.3.push(format!("{words} words in the 64 KiB at {page:#x} (the first at {at:#x}: the copy {copy:#x}, title memory {title:#x})"));
             }
         },
     );
@@ -522,14 +517,8 @@ fn look_for_stale() {
         by.len()
     );
     let mut by: Vec<_> = by.into_iter().collect();
-    by.sort_by_key(|(_, e)| std::cmp::Reverse(e.words));
-    for ((start, len), stale) in by.into_iter().take(16) {
-        let StalePages {
-            carded,
-            words,
-            pages,
-            some,
-        } = stale;
+    by.sort_by_key(|(_, e)| std::cmp::Reverse(e.1));
+    for ((start, len), (carded, words, pages, some)) in by.into_iter().take(16) {
         tracing::warn!(
             "up-copy check at rest, stale: {start:#x}+{len:#x} ({}): {words} words in {pages} pages are not title memory's, and nothing \
              told of it: {}",
@@ -657,7 +646,7 @@ fn look(host: &Host) -> Option<u64> {
             };
         }
     })?;
-    let mut by: BTreeMap<(u64, u64), (u64, usize, Vec<String>)> = BTreeMap::new();
+    let mut by: BTreeMap<CopySpan, (u64, usize, Vec<String>)> = BTreeMap::new();
     for d in &differs {
         let e = by.entry(d.shadow.span()).or_default();
         e.0 += u64::from(d.words);

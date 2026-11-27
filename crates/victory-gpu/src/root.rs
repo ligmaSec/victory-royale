@@ -79,7 +79,7 @@ fn host_export(cache: &OnceLock<Option<usize>>, name: &CStr) -> Option<usize> {
 }
 
 fn without_console_flags(desc: Desc) -> Desc {
-    if desc.flags & CONSOLE_FLAGS != 0 && cfg!(feature = "diagnostics") {
+    if desc.flags & CONSOLE_FLAGS != 0 {
         tracing::debug!(
             flags = format_args!("{:#x}", desc.flags),
             "console root signature flags dropped"
@@ -190,9 +190,7 @@ pub(crate) extern "system" fn create(
     }
     // SAFETY: the title passes `size` bytes.
     let blob = unsafe { std::slice::from_raw_parts(blob, size) }.to_vec();
-    if cfg!(feature = "diagnostics") {
-        tracing::debug!(size, "root signature");
-    }
+    tracing::debug!(size, "root signature");
     let root = Box::new(RootSignature {
         object: Object::new(&FUNCTIONS),
         blob,

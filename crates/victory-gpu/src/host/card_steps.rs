@@ -13,10 +13,17 @@ use crate::shadow::Shadow;
 /// submission that depend on them. Only with the relay's second stage
 /// (`relay_exact`).
 ///
-/// A shader can write through a view of a whole heap and read its exact
-/// destination from a job buffer. A CPU read of that heap then has to
-/// wait for the flight, even when it reads a small, disjoint constant
-/// buffer. The stage below can eliminate that wait for eligible reads.
+/// Why: eleven dispatches a frame (the skinning passes, in two early
+/// submissions) write through a view of the title's whole 174 MB heap, at
+/// places they read out of job records in buffers: no bound of what they
+/// write is known before they ran (frame capture replay2: 17af15c4015cb4b6,
+/// 55679a0547649d0b, 89d08e561897d4e5, fdd56d97a806bcca and three more,
+/// all through one view at offset 5920 of the title's bindless table). The
+/// title's ring of constants lies in the same heap. One constant buffer of
+/// 480 bytes and one copy of 20 KiB a frame, at a new place of the ring
+/// each time, waited for these passes to land: 25-30 ms of a 105 ms frame,
+/// the submitting thread standing (run record-1; with `VICTORY_FILL_TITLE=1`
+/// in run relaycopy-1 the copy alone took over the wait).
 ///
 /// What is done: a list of ours goes to the card in front of the
 /// submission's lists, in the same call. It copies the bytes read from the
@@ -404,7 +411,7 @@ fn plan(
         let mut level = 0;
         // Behind what writes what this reads or writes, and, if this
         // writes, behind what reads it.
-        let check = |(j, at): (usize, u32)| {
+        let consider = |&(j, at): &(usize, u32)| {
             let Some((jr, jw)) = reads_writes(&does[j]) else {
                 return;
             };
@@ -413,9 +420,9 @@ fn plan(
             }
         };
         if writes {
-            out.iter().copied().for_each(check);
+            out.iter().for_each(consider);
         } else {
-            copies.iter().map(|&k| out[k]).for_each(check);
+            copies.iter().map(|&k| &out[k]).for_each(consider);
         }
         if writes {
             copies.push(out.len());
@@ -1537,19 +1544,17 @@ mod tests {
         };
         let (a, a_data) = host.shared_buffer(1 << 16).unwrap();
         let (b, b_data) = host.shared_buffer(1 << 16).unwrap();
-        let was = {
-            // SAFETY: both test buffers have 64 KiB mappings and are not yet in GPU use.
-            let (a_bytes, b_bytes) = unsafe {
-                (
-                    std::slice::from_raw_parts_mut(a_data, 1 << 16),
-                    std::slice::from_raw_parts_mut(b_data, 1 << 16),
-                )
-            };
-            for (i, (x, y)) in a_bytes.iter_mut().zip(b_bytes.iter_mut()).enumerate() {
-                (*x, *y) = (i as u8 ^ (i >> 8) as u8, 0xee);
-            }
-            a_bytes.to_vec()
+        // SAFETY: mappings of 64 KiB.
+        let (a_bytes, b_bytes) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(a_data, 1 << 16),
+                std::slice::from_raw_parts_mut(b_data, 1 << 16),
+            )
         };
+        for (i, (x, y)) in a_bytes.iter_mut().zip(b_bytes.iter_mut()).enumerate() {
+            (*x, *y) = (i as u8 ^ (i >> 8) as u8, 0xee);
+        }
+        let was = a_bytes.to_vec();
         let own = host.own_list().unwrap();
         // Within `a` (there and back), from `a` to `b`, and a read alone.
         record(
@@ -1585,21 +1590,14 @@ mod tests {
         host.execute(&[&own.list, &next]);
         // With the debug layer (`VICTORY_D3D12_DEBUG=1`, diagnostics).
         assert_eq!(host.log_messages(), None);
-        // SAFETY: `execute` waited for both lists, and all three mappings are
-        // live and private to the test for these checks.
-        let (a_bytes, b_bytes, out_bytes) = unsafe {
-            (
-                std::slice::from_raw_parts_mut(a_data, 1 << 16),
-                std::slice::from_raw_parts(b_data, 1 << 16),
-                std::slice::from_raw_parts(out_data, 4),
-            )
-        };
         assert_eq!(a_bytes[2000..2100], was[33..133]);
         assert_eq!(a_bytes[33..133], was[2000..2100]);
         assert_eq!(b_bytes[77..84], was[5001..5008]);
         assert_eq!(b_bytes[1077..1084], was[5001..5008]);
         assert_eq!(b_bytes[4096..4196], was[2000..2100]);
-        assert_eq!(out_bytes, &was[9..13]);
+        // SAFETY: `out` still owns the 64 KiB mapping and its GPU copy has completed.
+        let readback = unsafe { std::slice::from_raw_parts(out_data, 4) };
+        assert_eq!(readback, &was[9..13]);
         assert!(b_bytes[..77].iter().all(|&x| x == 0xee));
         a_bytes[2000..2100].copy_from_slice(&was[2000..2100]);
         a_bytes[33..133].copy_from_slice(&was[33..133]);
@@ -1682,9 +1680,9 @@ mod tests {
                 let (stamps, stamp_data) = host.shared_buffer(16).unwrap();
                 let region = |i: usize| {
                     let heap = usize::from(i % 8 == 7);
-                    let unaligned = i.is_multiple_of(61);
-                    let source = (COUNT - 1 - i) * STRIDE + if unaligned { 3 } else { 16 };
-                    let len = if unaligned {
+                    let source =
+                        (COUNT - 1 - i) * STRIDE + if i.is_multiple_of(61) { 3 } else { 16 };
+                    let len = if i.is_multiple_of(61) {
                         77
                     } else {
                         [480, 656, 192, 80][i % 4]

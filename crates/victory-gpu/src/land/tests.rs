@@ -332,8 +332,8 @@ fn a_piece_waits_for_a_change_of_mapping() {
     };
     change.join().unwrap();
     assert_eq!((put, held), (100, now));
-    // SAFETY: the joined thread committed the first page; the first 100 bytes
-    // were landed above, and nobody is writing them now.
+    // SAFETY: the joined worker committed the first page, `piece` wrote
+    // these 100 bytes, and the test still owns the reservation.
     let landed = unsafe { std::slice::from_raw_parts(at as *const u8, 100) };
     assert_eq!(landed, now);
     // SAFETY: our reservation.
@@ -474,18 +474,19 @@ fn landings_beside_the_title_and_its_refreshes_lose_nothing() {
     assert!(copy.0 == title.bytes(), "a write was not told to the copy");
 }
 
-/// Synthetic landing benchmark: scattered pieces of view memory, each
-/// guarded by a refresh. Three quarters of each piece's pages contain new
-/// bytes. Compare landing through the title's address and a view of ours.
+/// What a frame's landing costs (ignored: a measurement): 1,536 pieces of
+/// 64 KiB, 96 MB, of a 174 MB heap of view memory in 15 landings, each block
+/// guarded by a refresh before it; three quarters of the pages of a piece
+/// with new bytes, every dword of them. As before, and here on one thread
+/// and more, through the title's address and through a view of ours.
 #[test]
 #[ignore]
 fn what_landing_costs() {
+    type Landing = [(usize, usize, usize)];
+
     assert!(crate::safecopy::on());
-    const HEAP: usize = 3072 * BLOCK;
-    const COUNT: usize = 1600;
-    const BATCH: usize = 100;
-    // Addresses of the title, fetched, and held bytes.
-    type LandingPiece = (usize, usize, usize);
+    const HEAP: usize = 2784 * BLOCK;
+    const COUNT: usize = 1536;
     let title = Title::new(HEAP);
     let mut held = vec![0u8; HEAP];
     let mut card = vec![0u8; COUNT * BLOCK];
@@ -510,7 +511,7 @@ fn what_landing_costs() {
         let mut round = 0u32;
         // `guarded`: 2 as a refresh leaves them, 1 opened again before (that
         // is timed beside), 0 not at all, as they were after the last.
-        let mut frame = |label: &str, dense: bool, guarded: u8, land: &dyn Fn(&[LandingPiece])| {
+        let mut frame = |label: &str, dense: bool, guarded: u8, land: &dyn Fn(&Landing)| {
             let mut best = f64::MAX;
             let (mut guards, mut opening) = (f64::MAX, f64::MAX);
             for _ in 0..5 {
@@ -547,7 +548,7 @@ fn what_landing_costs() {
                         .for_each(|block| crate::watch::landing(title.at + block * BLOCK, BLOCK));
                 }
                 opening = opening.min(t.elapsed().as_secs_f64() * 1e3);
-                let all: Vec<LandingPiece> = pieces
+                let all: Vec<(usize, usize, usize)> = pieces
                     .iter()
                     .enumerate()
                     .map(|(k, &block)| {
@@ -559,7 +560,7 @@ fn what_landing_costs() {
                     })
                     .collect();
                 let t = std::time::Instant::now();
-                for landing in all.chunks(BATCH) {
+                for landing in all.chunks(COUNT / 15 + 1) {
                     land(landing);
                 }
                 best = best.min(t.elapsed().as_secs_f64() * 1e3);
@@ -577,7 +578,7 @@ fn what_landing_costs() {
                     "every sixteenth dword of them new"
                 }
             );
-            let before: &dyn Fn(&[LandingPiece]) = &|landing| {
+            let before: &dyn Fn(&Landing) = &|landing| {
                 let mut scratch: Vec<u8> = Vec::new();
                 for &(at, now, held) in landing {
                     crate::shadow::land_as_before(at, now, held, BLOCK, &mut scratch);
@@ -604,11 +605,11 @@ fn what_landing_costs() {
                                     unsafe {
                                         piece_at(
                                             at,
-                                            now as *const u8,
-                                            held as *mut u8,
+                                            (now as *const u8, held as *mut u8),
                                             &[(0, BLOCK)],
-                                            MergeMode { take: true, beside },
+                                            true,
                                             &mut notes,
+                                            beside,
                                             std::ptr::null(),
                                         )
                                     };

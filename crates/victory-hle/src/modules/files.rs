@@ -464,13 +464,13 @@ pub extern "system" fn ReadFile(
     );
     // SAFETY: captures the error from ReadFile before changing any guards.
     let error = unsafe { GetLastError() };
-    // shortcut: a pending read's destination stays open until remapped;
-    // we do not observe completion through the title's I/O mechanisms.
-    if done == 0 && !overlapped.is_null() && error == ERROR_IO_PENDING {
-        writing.pending();
-    } else {
-        drop(writing);
+    // A pending kernel read already locked its destination; a GPU refresh
+    // before completion may still miss that write.
+    if done == 0 && error == ERROR_IO_PENDING {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::info!(len, "ReadFile: read pending after return"));
     }
+    drop(writing);
     // SAFETY: restore the result the title would have seen from the host.
     unsafe { SetLastError(error) };
     done

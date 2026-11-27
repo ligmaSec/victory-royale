@@ -114,6 +114,10 @@ pub(crate) fn frame() {
         let records = std::mem::take(&mut *BOOK.lock().unwrap_or_else(|e| e.into_inner()));
         let file = format!("{file}.{}.bin", MADE.fetch_add(1, Relaxed));
         std::thread::spawn(move || {
+            if let Err(error) = victory_core::ensure_outside_repo(std::path::Path::new(&file)) {
+                tracing::warn!(%error, "fault book destination must be outside the checkout");
+                return;
+            }
             // SAFETY: plain data, every byte of it written.
             let bytes = unsafe {
                 std::slice::from_raw_parts(records.as_ptr().cast::<u8>(), size_of_val(&records[..]))

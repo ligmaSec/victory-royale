@@ -25,33 +25,29 @@ pub(crate) struct SigElement {
 }
 
 impl SigElement {
-    fn system_value(&self) -> Option<(u32, &'static str)> {
+    fn system_value(&self) -> u32 {
         match self.kind {
-            1 => Some((6, "SV_VertexID")),
-            2 => Some((8, "SV_InstanceID")),
-            3 => Some((1, "SV_Position")),
-            4 => Some((4, "SV_RenderTargetArrayIndex")),
-            5 => Some((5, "SV_ViewportArrayIndex")),
-            6 => Some((2, "SV_ClipDistance")),
-            7 => Some((3, "SV_CullDistance")),
-            10 => Some((7, "SV_PrimitiveID")),
-            12 => Some((10, "SV_SampleIndex")),
-            13 => Some((9, "SV_IsFrontFace")),
-            14 => Some((66, "SV_Coverage")),
-            15 => Some((70, "SV_InnerCoverage")),
-            16 => Some((64, "SV_Target")),
-            17 => Some((65, "SV_Depth")),
-            18 => Some((68, "SV_DepthLessEqual")),
-            19 => Some((67, "SV_DepthGreaterEqual")),
-            20 => Some((69, "SV_StencilRef")),
-            28 => Some((23, "SV_Barycentrics")),
-            30 => Some((25, "SV_CullPrimitive")),
-            _ => None,
+            1 => 6,  // vertex id
+            2 => 8,  // instance id
+            3 => 1,  // position
+            4 => 4,  // render target array index
+            5 => 5,  // viewport array index
+            6 => 2,  // clip distance
+            7 => 3,  // cull distance
+            10 => 7, // primitive id
+            12 => 10,
+            13 => 9, // front face
+            14 => 66,
+            15 => 70,
+            16 => 64, // target
+            17 => 65, // depth
+            18 => 68,
+            19 => 67,
+            20 => 69,
+            28 => 23, // barycentrics
+            30 => 25, // cull primitive
+            _ => 0,
         }
-    }
-
-    pub(super) fn semantic_name(&self) -> &str {
-        self.system_value().map_or(&self.name, |(_, name)| name)
     }
 
     fn sig_comp(&self) -> u32 {
@@ -64,7 +60,7 @@ impl SigElement {
     }
 
     fn mask(&self) -> u8 {
-        ((1u8 << self.cols) - 1) << self.row.map_or(0, |_| self.col)
+        ((1u8 << self.cols) - 1) << self.col
     }
 }
 
@@ -76,8 +72,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // rows stably sorted by register (unallocated last), retaining metadata
-    // order for elements in the same register.
+    // the rows sorted by register (unallocated last), then name offset.
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -88,24 +83,23 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         match shared {
             Some(j) => offsets.push(offsets[j]),
             None => {
-                let name = e.semantic_name();
                 offsets.push(next);
-                next += name.len() as u32 + 1;
-                names.push(name);
+                next += e.name.len() as u32 + 1;
+                names.push(&e.name);
             }
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| elements[i].row.unwrap_or(u32::MAX));
+    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), offsets[i]));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
-        let used = e.usage << e.row.map_or(0, |_| e.col) & e.mask();
+        let used = e.usage << e.col;
         let rw = if input { used } else { !used & 0xf };
         for v in [
             0,
             offset,
             e.index,
-            e.system_value().map_or(0, |(value, _)| value),
+            e.system_value(),
             e.sig_comp(),
             e.row.unwrap_or(u32::MAX),
         ] {

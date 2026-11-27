@@ -8,12 +8,13 @@
 
 use super::*;
 use windows::Win32::Foundation::RECT;
+use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIFactory4,
 };
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
-use windows::core::Interface;
+use windows::core::{Interface, PCSTR, s};
 
 /// Draws a frame (the title's gameplay frames hold about 3,200 indirect
 /// executions, #107), records a window holds, and how far apart the
@@ -32,6 +33,32 @@ return float4(p, 0.5, 1);
 }
 float4 ps() : SV_Target { return float4(1, 0.5, 0.25, 1); }
 "#;
+
+fn compile(entry: &str, target: &str) -> Vec<u8> {
+    let entry = std::ffi::CString::new(entry).unwrap();
+    let target = std::ffi::CString::new(target).unwrap();
+    let mut code: Option<ID3DBlob> = None;
+    // SAFETY: the source and names outlive the call.
+    unsafe {
+        D3DCompile(
+            SHADERS.as_ptr().cast(),
+            SHADERS.len(),
+            s!("bench"),
+            None,
+            None,
+            PCSTR(entry.as_ptr().cast()),
+            PCSTR(target.as_ptr().cast()),
+            0,
+            0,
+            &mut code,
+            None,
+        )
+        .unwrap();
+        let code = code.unwrap();
+        std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+            .to_vec()
+    }
+}
 
 /// The clamp as it was before it charged the budget once per group
 /// (record by record, every thread racing for the budget word), kept
@@ -197,10 +224,7 @@ fn bench_indirect_draw_barriers() {
         let frequency = queue.GetTimestampFrequency().unwrap() as f64;
 
         // The pipeline: tiny triangles into a small target.
-        let vs =
-            crate::hlsl::compile_stage("indirect bench", SHADERS, c"vs", c"vs_5_1", true).unwrap();
-        let ps =
-            crate::hlsl::compile_stage("indirect bench", SHADERS, c"ps", c"ps_5_1", false).unwrap();
+        let (vs, ps) = (compile("vs", "vs_5_1"), compile("ps", "ps_5_1"));
         let root: ID3D12RootSignature = device.CreateRootSignature(0, &vs).unwrap();
         let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),

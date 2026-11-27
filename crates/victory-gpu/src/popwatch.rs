@@ -329,6 +329,10 @@ fn folder() -> Option<&'static PathBuf> {
     FOLDER
         .get_or_init(|| {
             let folder = PathBuf::from(std::env::var_os("VICTORY_POP_FOLDER")?);
+            if let Err(error) = victory_core::ensure_outside_repo(&folder) {
+                tracing::warn!(%error, "frame sample folder must be outside the checkout");
+                return None;
+            }
             std::fs::create_dir_all(&folder).ok()?;
             Some(folder)
         })

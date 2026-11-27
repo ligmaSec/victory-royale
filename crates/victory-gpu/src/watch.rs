@@ -1168,7 +1168,17 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     let mut ahead = held_ahead.take();
     let answers = spread_each(alone_ranges.len(), |r| {
         let (first, last) = alone_ranges[r];
-        kernel_written(first, last)
+        #[cfg(feature = "diagnostics")]
+        let asking = std::time::Instant::now();
+        let found = kernel_written(first, last);
+        #[cfg(feature = "diagnostics")]
+        alone(
+            first * PAGE,
+            last * PAGE,
+            found.as_ref().map_or(0, Vec::len),
+            asking.elapsed(),
+        );
+        found
     });
     for (&(first, last), found) in alone_ranges.iter().zip(answers) {
         if let Some(pages) = found {
@@ -1198,6 +1208,65 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     }
     j.kept = !ahead.is_empty();
     j.ahead.set(ahead);
+}
+
+#[cfg(feature = "diagnostics")]
+type AloneRanges = std::collections::HashMap<(usize, usize), (u64, u64, u64)>;
+
+/// Diagnostics: the ranges a submission's asking asks about alone
+/// ([`ask_rest`]), by (start, end): askings, 64 KiB pages found written,
+/// microseconds.
+#[cfg(feature = "diagnostics")]
+static ALONE: Mutex<Option<AloneRanges>> = Mutex::new(None);
+
+#[cfg(feature = "diagnostics")]
+fn alone(start: usize, end: usize, pages: usize, took: std::time::Duration) {
+    let mut all = ALONE.lock().unwrap_or_else(|e| e.into_inner());
+    let e = all
+        .get_or_insert_with(Default::default)
+        .entry((start, end))
+        .or_default();
+    *e = (e.0 + 1, e.1 + pages as u64, e.2 + took.as_micros() as u64);
+}
+
+/// Diagnostics, for the frame lines: [`ALONE`] per frame, the busiest.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn alone_line(frames: f64) {
+    let all = ALONE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .unwrap_or_default();
+    if all.is_empty() {
+        return;
+    }
+    let (n, pages, us) = all
+        .values()
+        .fold((0, 0, 0), |s, v| (s.0 + v.0, s.1 + v.1, s.2 + v.2));
+    let mut all: Vec<_> = all.into_iter().collect();
+    all.sort_unstable_by_key(|(_, v)| std::cmp::Reverse(v.2));
+    let top: Vec<String> = all
+        .iter()
+        .take(12)
+        .map(|((s, e), (k, p, u))| {
+            format!(
+                "{s:#x}+{:#x} {:.1}x {:.1} pages {:.2} ms",
+                e - s,
+                *k as f64 / frames,
+                *p as f64 / frames,
+                *u as f64 / 1e3 / frames
+            )
+        })
+        .collect();
+    tracing::info!(
+        "ranges a submission's asking asks about alone, per frame: {:.1} askings of {} ranges, {:.1} pages of 64 KiB found written, \
+         {:.2} ms; the costliest: {}",
+        n as f64 / frames,
+        all.len(),
+        pages as f64 / frames,
+        us as f64 / 1e3 / frames,
+        top.join("; ")
+    );
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -2516,8 +2585,6 @@ struct Guards {
     /// not yet done ([`title_memory_unmapping`]). Not in the sets above, and
     /// left as they are by [`guard`], which reports them written.
     kernel: Vec<(usize, usize)>,
-    /// Destinations of overlapped reads whose completion the runtime cannot observe.
-    pending_kernel: BTreeSet<(usize, usize)>,
     changing: Vec<(usize, usize)>,
     /// Blocks whose page is shown at other addresses too and that were made
     /// read-only together with those (which are in it as well): what opens
@@ -2591,7 +2658,6 @@ impl Guards {
         self.kernel
             .iter()
             .chain(&self.changing)
-            .chain(&self.pending_kernel)
             .any(|&(first, last)| (first..last).contains(&block))
     }
 
@@ -2651,7 +2717,6 @@ static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     held: Blocks::new(),
     foreign: BTreeSet::new(),
     kernel: Vec::new(),
-    pending_kernel: BTreeSet::new(),
     changing: Vec::new(),
     aliased: Blocks::new(),
     opened: Mutex::new(std::collections::HashMap::with_hasher(
@@ -3547,16 +3612,6 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
     KernelWrite(first, if len == 0 { first } else { last })
 }
 
-impl KernelWrite {
-    /// A kernel write is still pending after its initiating call returned.
-    /// Keep the destination unguarded until it is unmapped or released.
-    pub fn pending(self) {
-        if self.0 != self.1 {
-            guards().pending_kernel.insert((self.0, self.1));
-        }
-    }
-}
-
 impl Drop for KernelWrite {
     fn drop(&mut self) {
         if self.0 == self.1 {
@@ -3978,16 +4033,6 @@ pub fn title_memory_freed(at: usize, len: usize) {
     }
     let mut g = guards();
     let first = at / BLOCK;
-    if !g.pending_kernel.is_empty() {
-        let end = if len == 0 {
-            allocation_end(at, at)
-        } else {
-            at.saturating_add(len)
-        };
-        let last = end.div_ceil(BLOCK);
-        g.pending_kernel
-            .retain(|&(from, to)| !(first <= from && to <= last));
-    }
     let noted = [
         g.protected.range(first..).next(),
         g.absent.range(first..).next(),
@@ -4074,8 +4119,6 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'s
     for block in foreign {
         g.foreign.remove(&block);
     }
-    g.pending_kernel
-        .retain(|&(from, to)| !(range.start <= from && to <= range.end));
     let aliased: Vec<usize> = g.aliased.range(range).collect();
     for block in aliased {
         g.aliased.remove(block);
@@ -4470,7 +4513,7 @@ mod tests {
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
         };
         // SAFETY: a pagefile section of two blocks, mapped read-write.
-        let (section, view) = unsafe {
+        let view = unsafe {
             let section = CreateFileMappingW(
                 -1isize as _,
                 std::ptr::null(),
@@ -4480,10 +4523,7 @@ mod tests {
                 std::ptr::null(),
             );
             assert!(!section.is_null());
-            (
-                section,
-                MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK),
-            )
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK)
         };
         let at = view.Value as usize;
         assert_ne!(at, 0);
@@ -4512,20 +4552,9 @@ mod tests {
         assert_eq!(guard(at, at + 2 * BLOCK), Some(pages(0).collect()));
         assert!(!writable(at));
         assert_eq!(guard(at, at + 2 * BLOCK), Some(Vec::new()));
-
-        kernel_writing(at + 100, 13).pending();
-        assert_eq!(guard(at, at + 2 * BLOCK), Some(pages(0).collect()));
-        assert!(writable(at) && !writable(at + BLOCK));
-        title_memory_remapped(at, 2 * BLOCK);
-        assert!(guard(at, at + 2 * BLOCK).is_some());
-        assert!(!writable(at));
-
         title_memory_unmapping(at, 2 * BLOCK);
-        // SAFETY: the test owns the view and its section.
-        unsafe {
-            UnmapViewOfFile(view);
-            windows_sys::Win32::Foundation::CloseHandle(section);
-        }
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(view) };
     }
 
     /// A hole the kernel is to write is no known hole meanwhile, nor is one
@@ -4643,10 +4672,11 @@ mod tests {
         assert_eq!(guard(p, p + 3 * BLOCK).map(|w| w.len()), Some(3));
         // Not told of what comes: the view goes, code is there; and private
         // memory in the holes.
-        // SAFETY: `view` is the live mapping that replaced our placeholder in this process.
-        let unmapped =
-            unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
-        assert_ne!(unmapped, 0);
+        assert_ne!(
+            // SAFETY: `view` is the live mapping at `p` in this process.
+            unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) },
+            0
+        );
         private_at(p, PAGE_EXECUTE_READ);
         private_at(p + BLOCK, PAGE_READWRITE);
         private_at(p + 2 * BLOCK, PAGE_EXECUTE_READWRITE);
@@ -5222,16 +5252,16 @@ mod tests {
         for view in [one, two] {
             assert_eq!(guard(view, view + BLOCK), Some(vec![page(view)]));
         }
-        // SAFETY: offset 8 is in our live second view; the fault handler opens it for the store.
+        // SAFETY: offset 8 is within `two`; the handler opens the guarded view on write.
         unsafe { ((two + 8) as *mut u8).write(1) };
         assert!(writable(two) && !writable(one));
-        // SAFETY: offset 8 is in our live first view; the fault handler opens it for the store.
+        // SAFETY: offset 8 is within `one`; its guard is opened by the handler.
         unsafe { ((one + 8) as *mut u8).write(1) };
         assert!(writable(two) && writable(one));
         assert_eq!(guard(one, one + BLOCK), Some(vec![page(one)]));
         assert_eq!(guard(two, two + BLOCK), Some(vec![page(two)]));
         // Written at the view that was left as it was, after the other.
-        // SAFETY: offset 8 is still mapped in the second view; the handler reopens it after re-guarding.
+        // SAFETY: `two` is still mapped and its guard opens on write.
         unsafe { ((two + 8) as *mut u8).write(1) };
         assert_eq!(
             guard(one, one + BLOCK),
@@ -5243,7 +5273,7 @@ mod tests {
         assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
         // Of a page that was told at one view, a kernel write to the other
         // finds it open.
-        // SAFETY: offset 8 is still mapped in the second view; the handler opens it on a fault.
+        // SAFETY: the same mapped byte in `two` is writable after the fault handler runs.
         unsafe { ((two + 8) as *mut u8).write(1) };
         assert!(!writable(one));
         writing(one, 8);
@@ -5268,7 +5298,7 @@ mod tests {
             Some(Vec::new()),
             "nothing written: as it was"
         );
-        // SAFETY: offset 8 is within our live second view, which the handler opens on a fault.
+        // SAFETY: offset 8 is within the live `two` view, opened by the handler.
         unsafe { ((two + 8) as *mut u8).write(1) };
         for _ in 0..3 {
             assert_eq!(guard(one, one + BLOCK), Some(vec![page]));
@@ -5278,7 +5308,7 @@ mod tests {
                     && !published(two, two + BLOCK)
                     && !published(one, one + BLOCK)
             );
-            // SAFETY: offset 8 is in the live second view, just checked to be writable.
+            // SAFETY: this is the same mapped byte; `two` was just checked writable.
             unsafe { ((two + 8) as *mut u8).write(1) };
         }
         rests(false);
@@ -5384,34 +5414,37 @@ mod tests {
         };
         for round in 1..200u32 {
             quiet();
-            // SAFETY: offset 64 is aligned and lies within the first mapped view;
-            // this thread alone accesses the word, and the watcher handles protected stores.
+            // SAFETY: `one + 64` is an aligned word in the live view; the handler opens it on a fault.
             unsafe { ((one + 64) as *mut u32).write_volatile(round) };
-            // SAFETY: this is the aligned second mapping of the initialized word.
-            // All accesses to that word are sequential on this thread.
+            // SAFETY: the same initialized, aligned word through `two`, with no
+            // overlapping access during the atomic operation. The handler opens the view on a fault.
             let was = unsafe { AtomicU32::from_ptr((two + 64) as *mut u32) }
                 .fetch_sub(1, Ordering::SeqCst);
-            // SAFETY: the initialized word at offset 64 remains aligned and readable
-            // through the first view; the atomic access through the alias has finished.
-            let observed = unsafe { ((one + 64) as *const u32).read_volatile() };
-            assert_eq!((was, observed), (round, round - 1));
+            // SAFETY: the atomic access has ended; the aligned word remains readable via `one`.
+            let current = unsafe { ((one + 64) as *const u32).read_volatile() };
+            assert_eq!((was, current), (round, round - 1));
             let bytes = vec![round as u8; 3000 + round as usize];
-            // SAFETY: the copy straddles the block boundary within the two-block
-            // mapping, and `bytes` supplies the entire source from separate storage.
-            let returned =
-                unsafe { copy((one + BLOCK - 1000) as *mut u8, bytes.as_ptr(), bytes.len()) };
-            assert_eq!(returned as usize, one + BLOCK - 1000);
-            // SAFETY: the second view aliases the initialized destination, and
-            // this thread does not write to either view while the slice is used.
+            // Over the end of the first block.
+            assert_eq!(
+                // SAFETY: the destination spans two blocks of `one` and stays within SIZE.
+                // `bytes` is initialized and separate, and the copy hook handles guarded writes.
+                unsafe { copy((one + BLOCK - 1000) as *mut u8, bytes.as_ptr(), bytes.len()) }
+                    as usize,
+                one + BLOCK - 1000
+            );
+            // SAFETY: `two` aliases the initialized range just copied, which remains
+            // mapped and is not modified while this slice is used.
             let there = unsafe {
                 std::slice::from_raw_parts((two + BLOCK - 1000) as *const u8, bytes.len())
             };
-            assert!(there == bytes);
-            // SAFETY: this initialized byte immediately after the copy lies within
-            // the readable second block of the live second view.
-            let after =
-                unsafe { ((two + BLOCK + 2000 + round as usize) as *const u8).read_volatile() };
-            assert_ne!(after, round as u8);
+            assert!(
+                there == bytes && {
+                    // SAFETY: the byte just past the copy is initialized section memory within `two`.
+                    (unsafe {
+                        ((two + BLOCK + 2000 + round as usize) as *const u8).read_volatile()
+                    }) != round as u8
+                }
+            );
             kept += usize::from(!writable(one) && !writable(two));
             for view in [one, two] {
                 assert_eq!(guard(view, view + SIZE), Some(pages(view)), "round {round}");
@@ -5425,16 +5458,15 @@ mod tests {
         );
         // What is there already is not written: nothing to tell.
         for k in 0..10 {
-            // SAFETY: offset 64 is an aligned word in our first view and the watcher
-            // handles the protected store; this thread alone accesses the word.
+            // SAFETY: the aligned word remains mapped; the store hook handles guarded writes.
             unsafe { ((one + 64) as *mut u32).write_volatile(198) };
-            // SAFETY: the slice is inside the initialized span previously copied;
-            // the temporary shared borrow ends before the next mapped write.
             let same =
+                // SAFETY: these initialized bytes span two live blocks of `one` and
+                // are only borrowed for the duration of `to_vec()`.
                 unsafe { std::slice::from_raw_parts((one + BLOCK - 900) as *const u8, 1500) }
                     .to_vec();
-            // SAFETY: `same` owns an independent source and the destination fits
-            // in our mapped view, with protected writes handled by the wrapper.
+            // SAFETY: the destination is the same live range; `same` is an independent
+            // initialized copy and the copy hook handles the guarded destination.
             unsafe { copy((one + BLOCK - 900) as *mut u8, same.as_ptr(), same.len()) };
             assert!(!writable(one) && !writable(two), "{k}");
         }
@@ -5442,8 +5474,8 @@ mod tests {
         // Many stores to a block: it is opened.
         quiet();
         for k in 0..20 {
-            // SAFETY: these aligned offsets are all in the first block of our
-            // view, where the watcher handles protected stores.
+            // SAFETY: these aligned words lie within the first live block of `one`;
+            // the store hook handles guarded writes.
             unsafe { ((one + 128 + k * 4) as *mut u32).write_volatile(7) };
         }
         assert!(writable(one));
@@ -5920,8 +5952,8 @@ mod many_askers_tests {
                     let mut last = [0u64; VIEWS];
                     for round in 0..300usize {
                         let (page, asked) = (round * 5 % PAGES, round % VIEWS);
-                        // SAFETY: the section stays open for the scoped threads;
-                        // the requested aligned page is within it.
+                        // SAFETY: the open section contains `page`, and the aligned
+                        // offset and length select one complete page.
                         let one = unsafe {
                             MapViewOfFile(
                                 section as _,
@@ -5935,8 +5967,8 @@ mod many_askers_tests {
                         assert_ne!(one, 0);
                         super::title_memory_remapped(one, PAGE);
                         crate::title_memory_view(one, PAGE, section, (page * PAGE) as u64);
-                        // SAFETY: the aligned word fits in the mapped page and is
-                        // beyond the distinct word slots used by the other threads.
+                        // SAFETY: the new view is live, with an aligned word at this
+                        // offset reserved for this thread; the handler handles guarded writes.
                         unsafe { ((one + THREADS * 8) as *mut u64).write_volatile(round as u64) };
                         let (now, written) = writes(
                             all[asked] + page * PAGE,
@@ -5954,8 +5986,8 @@ mod many_askers_tests {
                         {
                             let _changing = super::title_memory_remapping();
                             super::title_memory_unmapping(one, PAGE);
-                            // SAFETY: `one` is this thread's live view base and
-                            // the tracker has been told before unmapping it.
+                            // SAFETY: this thread still owns the live view, and
+                            // the remapping guard excludes concurrent tracker readers.
                             unsafe {
                                 UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
                                     Value: one as *mut _,
@@ -5991,11 +6023,11 @@ mod many_askers_tests {
                             // As in the test above, or after a word of ours,
                             // or past the guard.
                             let word = through + page * PAGE + t * 8;
-                            // Some writes go through a temporary alias, as title copies do.
                             if next(3) == 0
                                 && super::put_beside(word / PAGE, 1, |delta| {
-                                    // SAFETY: `delta` translates to the live writable alias
-                                    // for this thread's aligned word slot within the page.
+                                    // SAFETY: the tracker supplies a writable alias while
+                                    // holding the mapping read guard. `word` is this worker's
+                                    // aligned slot within the mapped page.
                                     unsafe {
                                         (word.wrapping_add(delta) as *mut u64).write_volatile(3);
                                     }
@@ -6014,13 +6046,13 @@ mod many_askers_tests {
                             how = usize::from(reading.is_some());
                             let beside = reading.as_ref().and_then(|_| crate::inplace::beside(word, 8));
                             if let Some(to) = beside {
-                                // SAFETY: `beside` gives a writable alias of this
-                                // thread's aligned word while `reading` is held.
+                                // SAFETY: `beside` found a writable alias for all eight
+                                // bytes of this worker's aligned slot under `reading`.
                                 unsafe { (to as *mut u64).write_volatile(2) };
                                 super::landed_beside(&[word / 4096], &[(word, 8)]);
                                 past.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                // SAFETY: the original view stays mapped; the
-                                // initialized word is in this thread's aligned slot.
+                                // SAFETY: this worker's aligned word remains readable
+                                // through the original view under the mapping read guard.
                                 let observed = unsafe { (word as *const u64).read_volatile() };
                                 assert_eq!(observed, 2, "put elsewhere");
                             } else {
@@ -6029,8 +6061,8 @@ mod many_askers_tests {
                                     super::writing(word, 8);
                                     how += 4;
                                 }
-                                // SAFETY: the aligned word lies in a live view in
-                                // this thread's slot; the watcher handles guarded writes.
+                                // SAFETY: the aligned word is this worker's slot in a
+                                // live test view; the handler opens guarded pages on write.
                                 unsafe { (word as *mut u64).write_volatile(1) };
                             }
                         } else {
@@ -6085,8 +6117,7 @@ mod many_askers_tests {
     fn holes_are_known_until_the_runtime_tells() {
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         const BLOCKS: usize = 8;
-        // SAFETY: the OS chooses a fresh placeholder in the current process;
-        // the pagefile-backed section is newly created with no caller buffers.
+        // SAFETY: reserve an OS-chosen range and create a pagefile-backed section.
         let (at, section) = unsafe {
             let at = VirtualAlloc2(
                 GetCurrentProcess(),
@@ -6107,24 +6138,22 @@ mod many_askers_tests {
             );
             (at, section)
         };
-        let map = |block: usize| {
+        // SAFETY: the only callers choose distinct in-range placeholder blocks.
+        // Each aligned address and section offset selects one complete page.
+        let map = |block: usize| unsafe {
             let to = at + block * PAGE;
-            // SAFETY: each call uses an unmapped block in our live placeholder
-            // and maps the corresponding range of the live section in this process.
-            let view = unsafe {
-                VirtualFree(to as *mut _, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
-                MapViewOfFile3(
-                    section,
-                    GetCurrentProcess(),
-                    to as *const _,
-                    (block * PAGE) as u64,
-                    PAGE,
-                    MEM_REPLACE_PLACEHOLDER,
-                    PAGE_READWRITE,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            };
+            VirtualFree(to as *mut _, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            let view = MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                to as *const _,
+                (block * PAGE) as u64,
+                PAGE,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            );
             assert_eq!(view.Value as usize, to);
             super::title_memory_remapped(to, PAGE);
         };
@@ -6151,7 +6180,7 @@ mod many_askers_tests {
         assert_eq!(all, (0..BLOCKS).collect::<Vec<_>>());
         assert!(super::published(at, end), "with its holes");
         // Written; mapped into; unmapped.
-        // SAFETY: block 5 has a live view; the watcher handles a protected store.
+        // SAFETY: block 5 is still mapped; the handler opens the guard on write.
         unsafe { ((at + 5 * PAGE) as *mut u8).write_volatile(1) };
         assert!(!super::published(at, end));
         let (second, all) = ask(first);
@@ -6160,13 +6189,12 @@ mod many_askers_tests {
         assert!(!super::published(at, end));
         let (third, all) = ask(second);
         assert_eq!(all, [2]);
-        // SAFETY: the new view covers block 2; the watcher handles a protected store.
+        // SAFETY: `map(2)` installed this live view, whose guard opens on write.
         unsafe { ((at + 2 * PAGE) as *mut u8).write_volatile(1) };
         let (fourth, all) = ask(third);
         assert_eq!(all, [2]);
         super::title_memory_unmapping(at + 5 * PAGE, PAGE);
-        // SAFETY: block 5 is still mapped at this base in our process and
-        // replaced a placeholder, so it can be unmapped preserving the placeholder.
+        // SAFETY: block 5 is a live view in this process, replacing a placeholder.
         unsafe {
             let view = MEMORY_MAPPED_VIEW_ADDRESS {
                 Value: (at + 5 * PAGE) as *mut _,
@@ -6182,7 +6210,7 @@ mod many_askers_tests {
         let (_, all) = ask(fifth);
         assert!(all.is_empty());
         // A reservation of the ordinary kind is no placeholder.
-        // SAFETY: a null base lets the OS choose a fresh reservation without committing pages.
+        // SAFETY: the OS chooses the address of a new inaccessible reservation.
         let plain =
             unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_NOACCESS) } as usize;
         assert!(!super::placeholder(plain / PAGE));
@@ -6204,8 +6232,8 @@ mod many_askers_tests {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         const BLOCKS: usize = 12;
-        // SAFETY: the OS chooses an unused range for the placeholder; the split
-        // addresses are within that range and the section uses the pagefile.
+        // SAFETY: split an OS-chosen placeholder at in-range aligned boundaries
+        // and create a pagefile-backed section covering the same length.
         let (at, section) = unsafe {
             let at = VirtualAlloc2(
                 GetCurrentProcess(),
@@ -6250,9 +6278,8 @@ mod many_askers_tests {
                             let block = t * 3 + round % 3;
                             let to = at + block * PAGE;
                             let (before, _) = writes(at, end, true).expect("a view");
-                            // SAFETY: this thread owns the three placeholder blocks
-                            // it cycles through; the aligned section range remains
-                            // live, and the store follows a successful view mapping.
+                            // SAFETY: this mapper owns the chosen placeholder block.
+                            // A successful replacement makes its first byte writable.
                             unsafe {
                                 let view = MapViewOfFile3(
                                     section as _,
@@ -6274,14 +6301,14 @@ mod many_askers_tests {
                                 number(&written, block) > before,
                                 "mapped and written: not told"
                             );
-                            // SAFETY: offset 9 is in this thread's live view;
-                            // the watcher handles a protected store.
+                            // SAFETY: the mapper's view remains live, offset 9 is in
+                            // bounds, and the handler opens the guard on write.
                             unsafe { ((to + 9) as *mut u8).write_volatile(round as u8) };
                             let (again, written) = writes(to, to + PAGE, true).expect("a view");
                             assert!(number(&written, block) > mapped, "written again: not told");
                             super::title_memory_unmapping(to, PAGE);
-                            // SAFETY: `to` is this thread's live view base in
-                            // the current process; unmapping restores its placeholder.
+                            // SAFETY: only this mapper replaces or unmaps this live view;
+                            // preserving the placeholder allows reuse on the next round.
                             unsafe {
                                 let view = MEMORY_MAPPED_VIEW_ADDRESS {
                                     Value: to as *mut _,
@@ -6509,9 +6536,8 @@ mod port7_tests {
         std::thread::spawn(move || {
             // Per thread: what it noted (page, number) and what it read
             // (first, last, number, the notes read).
-            type Note = (usize, u64);
-            type Read = (usize, usize, u64, Vec<Note>);
-            type ThreadLog = (Vec<Note>, Vec<Read>);
+            type Read = (usize, usize, u64, Vec<(usize, u64)>);
+            type ThreadLog = (Vec<(usize, u64)>, Vec<Read>);
             let logs: Vec<ThreadLog> = std::thread::scope(|s| {
                 let all: Vec<_> = (0..THREADS)
                     .map(|t| {
@@ -6743,10 +6769,11 @@ mod rearm_tests {
         let before = NOT_REARMED.load(Relaxed);
         assert!(rearm_guard(Some(page)));
         let mut info = MEMORY_BASIC_INFORMATION::default();
-        // SAFETY: `page` lies in the live allocation; `info` is writable and
-        // the supplied size is exactly its capacity.
-        let queried = unsafe { VirtualQuery(page as *const _, &mut info, size_of_val(&info)) };
-        assert_ne!(queried, 0);
+        assert_ne!(
+            // SAFETY: `info` is a writable output buffer of the supplied size.
+            unsafe { VirtualQuery(page as *const _, &mut info, size_of_val(&info)) },
+            0
+        );
         assert_ne!(
             info.Protect & PAGE_GUARD,
             0,

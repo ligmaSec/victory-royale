@@ -991,14 +991,11 @@ fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> usize {
         return 0;
     }
     let mut changed = 0;
-    for (t, o) in title
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(ours.as_chunks_mut::<4>().0)
-    {
-        if *t != *o {
-            *o = *t;
+    let title_words = title.as_chunks::<4>().0;
+    let our_words = ours.as_chunks_mut::<4>().0;
+    for (t, o) in title_words.iter().zip(our_words) {
+        if t != o {
+            o.copy_from_slice(t);
             changed += 1;
         }
     }
@@ -1325,7 +1322,14 @@ mod dump {
     fn folder() -> Option<&'static std::path::PathBuf> {
         static FOLDER: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
         FOLDER
-            .get_or_init(|| std::env::var_os("VICTORY_MEMORY_DUMP").map(Into::into))
+            .get_or_init(|| {
+                let path = std::path::PathBuf::from(std::env::var_os("VICTORY_MEMORY_DUMP")?);
+                if let Err(error) = victory_core::ensure_outside_repo(&path) {
+                    tracing::warn!(%error, "memory dump folder must be outside the checkout");
+                    return None;
+                }
+                Some(path)
+            })
             .as_ref()
     }
 

@@ -365,10 +365,10 @@ impl Panel {
     }
 
     pub(super) fn poll(&mut self, hwnd: HWND) {
-        // SAFETY: plain queries. Only a new press checks the foreground.
+        // SAFETY: a key-state query with a valid virtual key.
         let down = unsafe { GetAsyncKeyState(i32::from(VK_F3)) } < 0;
         self.key(down, || {
-            // SAFETY: no arguments; only compare the returned handle, which may be null.
+            // SAFETY: a query with no input pointers; the returned handle is only compared.
             unsafe { GetForegroundWindow() == hwnd.0 }
         });
     }

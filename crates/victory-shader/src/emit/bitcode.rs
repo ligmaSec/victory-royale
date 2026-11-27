@@ -593,8 +593,8 @@ impl Module {
         live
     }
 
-    #[cfg(test)]
     /// The blocks a block's terminator branches to.
+    #[cfg(test)]
     fn successors(&self, b: usize) -> Vec<usize> {
         match self.blocks[b].term {
             Some(Term::Br(t)) => vec![t],

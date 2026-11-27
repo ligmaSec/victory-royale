@@ -217,7 +217,8 @@ fn seeds() -> [[u32; 4]; 64] {
 }
 
 fn tail(parts: &mut [[u32; 4]; 64], bytes: &[u8]) {
-    for (thread, chunk) in bytes.as_chunks::<16>().0.iter().enumerate() {
+    let (chunks, _) = bytes.as_chunks::<16>();
+    for (thread, chunk) in chunks.iter().enumerate() {
         let with = std::array::from_fn(|i| {
             u32::from_le_bytes([
                 chunk[i * 4],

@@ -220,7 +220,7 @@ impl HostList {
         let at = to.offset(dst as u64);
         // What the title's CPU wrote around and under it so far goes first.
         to.refresh(self, dst as u64, len as u64);
-        // SAFETY: this list is still open for recording the placed copy.
+        // SAFETY: this list is open for recording.
         unsafe { wait_for_all(host, &self.list) };
         match (&own, &scratch) {
             (Some(from), _) => {
@@ -230,9 +230,9 @@ impl HostList {
                     let Some(between) = self.between(host, len as u64) else {
                         return false;
                     };
-                    // SAFETY: the list is open, the shadows cover the requested
-                    // ranges, and the list retains the separate temporary
-                    // buffer sized for `len`, transitioned before reading it.
+                    // SAFETY: the list retains the live shadow buffers and the
+                    // intermediate buffer; both ranges fit, and the latter
+                    // transitions from copy destination to source between uses.
                     unsafe {
                         self.list
                             .CopyBufferRegion(&between, 0, &from.buffer, offset, len as u64);
@@ -246,8 +246,8 @@ impl HostList {
                             .CopyBufferRegion(&to.buffer, at, &between, 0, len as u64);
                     }
                 } else {
-                    // SAFETY: the list is open, and the two live shadows
-                    // cover the requested ranges in distinct buffers.
+                    // SAFETY: the open list retains both distinct shadow buffers,
+                    // each looked up for its full copy range.
                     unsafe {
                         self.list
                             .CopyBufferRegion(&to.buffer, at, &from.buffer, offset, len as u64)
@@ -256,8 +256,8 @@ impl HostList {
                 STATS[2].fetch_add(1, Ordering::Relaxed);
             }
             (None, Some((from, offset, _))) => {
-                // SAFETY: the list is open and retains the upload buffer;
-                // scratch_at reserved `len` bytes and `to` covers the destination.
+                // SAFETY: the open list retains the upload scratch reservation
+                // and the destination shadow, each covering the copied bytes.
                 unsafe {
                     self.list
                         .CopyBufferRegion(&to.buffer, at, from, *offset, len as u64);
@@ -265,7 +265,7 @@ impl HostList {
             }
             (None, None) => return false,
         }
-        // SAFETY: the list is still open after recording the copy commands.
+        // SAFETY: recording the copies above did not close this list.
         unsafe { wait_for_all(host, &self.list) };
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
