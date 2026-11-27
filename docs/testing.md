@@ -157,6 +157,79 @@ fields. Unknown messages, command lines, hostnames, wall-clock timestamps, scree
 the request's free text are excluded. If the summary misses something, describe
 it in words. See the [asset policy](asset-policy.md).
 
+### Compare extracted builds locally
+
+Use `--local` to run already extracted builds without selecting a hardware
+request, opening the report editor, or uploading results. Use verified packages
+with `victory.exe`, `REVISION` and, on Linux, `victory-proton.sh` in each `--build`
+directory. Run from the checkout with Python 3.9 or later. On Linux the packaged
+launcher needs Bash and UMU as above. Keep the title, report destination and
+system temporary directory outside the checkout; put the results and temporary
+files outside the title, build and source-save directories as well.
+If `--output-dir` is omitted, the runner uses the system temporary directory.
+
+Start by checking a clean first launch. On Linux:
+
+```sh
+python3 scripts/hardware-test/run-test.py --local \
+  --build candidate "/path/to/candidate/victory" \
+  --title "/path/to/game/title.exe" --clean-data \
+  --output-dir "/path/to/private/results"
+```
+
+On Windows (PowerShell):
+
+```powershell
+py scripts/hardware-test/run-test.py --local --build candidate 'D:\Builds\candidate\victory' `
+  --title 'D:\Games\Title\title.exe' --clean-data --output-dir 'D:\Private\VIctory results'
+```
+
+For a copied-save comparison, explicitly select `--save-dir` instead of
+`--clean-data`. Repeat `--build NAME DIR` in the order you want the builds run.
+The following scripted example assumes both extracted builds were compiled
+with the `diagnostics` feature; omit `--keys` for normal release builds.
+
+```sh
+python3 scripts/hardware-test/run-test.py --local \
+  --build main "/path/to/main/victory" --build candidate "/path/to/candidate/victory" \
+  --title "/path/to/game/title.exe" --save-dir "/path/to/7952987A" \
+  --warm --console series-x --keys "10:Enter,15:X" \
+  --output-dir "/path/to/private/results"
+```
+
+The same flags work with `py` and Windows paths. Each build's cold run starts
+with empty VIctory caches and, on Linux, separate translation and driver cache
+directories. `--warm` immediately repeats the run with the same cache directories;
+it does not reset system-wide caches. Each cold or warm case starts with its own
+fresh user data (empty or copied from the same save snapshot), and its own
+temporary working directory and Proton prefix. `--console` defaults to `series-x`
+and also accepts `series-s`. Windows runs the packaged EXE directly. On Linux the
+runner uses the packaged `--run` command with the pinned vkd3d-proton runtime.
+If the verified pin is not cached, the launcher may download it; use
+`--runtime proton` to use Proton's bundled vkd3d-proton instead. Follow the same
+runtime choice for all runs you intend to compare.
+
+`--keys` passes an optional `VICTORY_KEYS` schedule unchanged to each build.
+It requires a diagnostics-enabled build. The point syntax above holds each key
+for 0.2 seconds at the specified time after input starts, not after process
+launch. Use range syntax such as `10-10.5:Enter` only with builds that support
+it. With no `--keys`, the runner does not inherit an ambient `VICTORY_KEYS`.
+Close each game normally when your scenario is finished; the runner does not
+enforce a timeout. Verify gameplay and that a new save resumes manually, using
+a separate persistent test profile for the create-and-resume check: local
+comparison profiles are discarded and are not suitable for testing persistence
+across runs.
+
+The printed `victory-local-*` results folder contains labeled `cold` and
+optional `warm` case directories. Each has `case.json` (build name, package
+revision, SHA-256 of `victory.exe`, console, key schedule, starting data and
+cache class and graphics runtime), raw `console.log`, any Proton Steam logs,
+`console-exit.txt`, and timing/diagnostic summaries and CSVs. Timings can include menus;
+neither a boot log nor a zero exit proves gameplay or a successful save. The
+runner finishes normal exits serially and returns the first nonzero status, if
+any. It does not archive saves or upload the results. Keep this folder private:
+its unfiltered logs can contain sensitive information.
+
 ## Receive private hardware reports
 
 From the repository root, with GitHub CLI signed in to github.com and authorized

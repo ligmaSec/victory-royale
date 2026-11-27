@@ -152,6 +152,10 @@ def default_save():
     return base / "saves" / TITLE_ID
 
 
+def has_standard_save(source):
+    return source.name.upper() == TITLE_ID and any(p.is_file() for p in (source / "saves").rglob("*"))
+
+
 def copy_save(source, destination):
     # Only persistent player data belongs in the test. In particular, a title's
     # temp directory may contain unrelated files or logs from an earlier run.
@@ -179,32 +183,43 @@ def copy_save(source, destination):
             copy_entry(path, destination / name)
 
 
+def native_path(path, windows):
+    return str(path) if windows else "Z:" + str(path).replace("/", "\\")
+
+
+def launch_command(folder, title, windows, console, mode, runtime):
+    args = [str(title), "--console", console]
+    if windows:
+        return [str(folder / "victory.exe"), "run", str(title), "--execute", "--console", console]
+    return ["bash", str(folder / "victory-proton.sh"), mode, "--runtime", runtime, *args]
+
+
+def capture_launch(command, cwd, env, log_path, find_report=False):
+    report = None
+    with log_path.open("wb") as log, subprocess.Popen(command, cwd=cwd, env=env,
+                                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
+        with process.stdout:
+            for line in process.stdout:
+                log.write(line)
+                if find_report:
+                    found = re.fullmatch(rb"Report: (.+) \(launcher exit [0-9]+\)", line.rstrip(b"\r\n"))
+                    if found:
+                        report = Path(os.fsdecode(found[1]))
+        status = process.wait()
+    return status, report
+
+
 def launch(side, folder, title, results, windows, console="series-x"):
     env = os.environ.copy()
     # Ignore a developer override that could silently substitute a different build.
     env.pop("VICTORY_EXE", None)
     env["VICTORY_TRACE_PIPELINES"] = "1"
-    for variable, directory in (("VICTORY_CACHE_DIR", "cache"), ("VICTORY_DATA_DIR", "data")):
-        path = str(folder / directory)
-        env[variable] = path if windows else "Z:" + path.replace("/", "\\")
-    args = [str(title), "--console", console]
-    if windows:
-        command = [str(folder / "victory.exe"), "run", str(title), "--execute", "--console", console]
-    else:
+    env["VICTORY_CACHE_DIR"] = native_path(folder / "cache", windows)
+    env["VICTORY_DATA_DIR"] = native_path(folder / "data", windows)
+    if not windows:
         env.update(VKD3D_SHADER_CACHE_PATH=str(folder / "vkd3d"), DXVK_STATE_CACHE_PATH=str(folder / "dxvk"))
-        command = ["bash", str(folder / "victory-proton.sh"), "--report", "--runtime", "pinned", *args]
-    log_path = results / (side + ".log")
-    report = None
-    with log_path.open("wb") as log, subprocess.Popen(command, cwd=title.parent, env=env,
-                                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
-        with process.stdout:
-            for line in process.stdout:
-                log.write(line)
-                if not windows:
-                    found = re.fullmatch(rb"Report: (.+) \(launcher exit [0-9]+\)", line.rstrip(b"\r\n"))
-                    if found:
-                        report = Path(os.fsdecode(found[1]))
-        status = process.wait()
+    command = launch_command(folder, title, windows, console, "--report", "pinned")
+    status, report = capture_launch(command, title.parent, env, results / (side + ".log"), not windows)
     (results / (side + "-exit.txt")).write_text(f"{status}\n")
     if not windows:
         if report is None or not report.is_file():
@@ -345,7 +360,25 @@ def run():
     parser.add_argument("--save-dir", type=Path, help=f"use a local {TITLE_ID} folder outside the default saves/ directory")
     parser.add_argument("--plan", action="store_true", help="preview the selected test without launching")
     parser.add_argument("--title", type=Path, help="use this executable instead of the file chooser")
+    parser.add_argument("--local", action="store_true", help="run local extracted builds without a test request")
+    parser.add_argument("--build", nargs=2, metavar=("NAME", "DIR"), action="append",
+                        help="named extracted build directory for --local; repeat to compare builds")
+    parser.add_argument("--clean-data", action="store_true", help="start each --local run with empty user data")
+    parser.add_argument("--warm", action="store_true", help="repeat each --local build with its warmed caches")
+    parser.add_argument("--keys", metavar="SCHEDULE", help="pass a VICTORY_KEYS schedule to each --local run")
+    parser.add_argument("--console", choices=("series-x", "series-s"), help="console profile for --local (default Series X)")
+    parser.add_argument("--runtime", choices=("pinned", "proton"), help="graphics runtime for --local on Linux (default pinned)")
     options = parser.parse_args()
+    if options.local:
+        if options.request or options.list or options.plan:
+            parser.error("--local cannot be combined with a request, --list or --plan")
+        if not options.build or not options.title:
+            parser.error("--local requires at least one --build NAME DIR and an explicit --title")
+        if options.clean_data == (options.save_dir is not None):
+            parser.error("--local requires exactly one of --clean-data or --save-dir")
+        return run_local(options)
+    if options.build or options.clean_data or options.warm or options.keys is not None or options.console or options.runtime:
+        parser.error("--build, --clean-data, --warm, --keys, --console and --runtime require --local")
     if options.list and options.request:
         parser.error("--list takes no request")
     options.save_dir = (options.save_dir or default_save()).expanduser().resolve()
@@ -479,6 +512,15 @@ def wave_range(raw):
     return None
 
 
+def present_window(raw):
+    if match := INTERVAL.search(ANSI.sub(b"", raw).rstrip()):
+        n, mean, median, p95, worst, over100, over1000 = match.groups()
+        n, over100, over1000 = int(n), int(over100), int(over1000)
+        if 1 <= n <= 4096 and over1000 <= over100 <= n:
+            return n, float(mean), float(median), float(p95), float(worst), over100, over1000
+    return None
+
+
 def read_metrics(stream, frame_log, submission_log, timeline):
     """Count diagnostic messages and completed, non-overlapping present windows."""
     frames = windows = slow = stalls = submissions = 0
@@ -489,20 +531,16 @@ def read_metrics(stream, frame_log, submission_log, timeline):
     vendor = None
     for raw in stream:
         if b"present intervals:" in raw:
-            match = INTERVAL.search(ANSI.sub(b"", raw).rstrip())
-            if match:
-                n, mean, median, p95, worst, over100, over1000 = match.groups()
-                n, over100, over1000 = int(n), int(over100), int(over1000)
-                if 1 <= n <= 4096 and over1000 <= over100 <= n:
-                    frame_log.writerow([windows + 1, n, float(mean), float(median), float(p95),
-                                        float(worst), over100, over1000])
-                    frames += n
-                    windows += 1
-                    timeline.record(ANSI.sub(b"", raw), "present window", sample=windows)
-                    elapsed += n * float(mean)
-                    longest = max(longest, float(worst))
-                    slow += over100
-                    stalls += over1000
+            if window := present_window(raw):
+                n, mean, _, _, worst, over100, over1000 = window
+                frame_log.writerow((windows + 1, *window))
+                frames += n
+                windows += 1
+                timeline.record(ANSI.sub(b"", raw), "present window", sample=windows)
+                elapsed += n * mean
+                longest = max(longest, worst)
+                slow += over100
+                stalls += over1000
         elif b" ms/frame (" in raw:
             match = SUBMISSION.search(ANSI.sub(b"", raw).rstrip())
             if match:
@@ -535,7 +573,7 @@ def read_metrics(stream, frame_log, submission_log, timeline):
     return rows, bool(frames or submissions or counts or vendor or shader_seen), wave_ranges
 
 
-def side_metrics(results, side, windows, frame_log, submission_log, timeline):
+def side_metrics(results, side, windows, frame_log, submission_log, timeline, proton_logs=None):
     console = results / (side + ".log")
     if not console.is_file():
         return ["No console log recorded"]
@@ -554,7 +592,22 @@ def side_metrics(results, side, windows, frame_log, submission_log, timeline):
         elif not waves:
             waves = Counter(limits for line in stream if (limits := wave_range(line)))
 
-    if not windows:
+    if proton_logs is not None:
+        # --run writes directly to the console and may also have a Proton log.
+        # Use the source with present windows first, then look for driver messages.
+        logs = [console, *proton_logs]
+        if proton_logs:
+            for index, path in enumerate(logs):
+                with path.open("rb") as stream:
+                    if any(b"present intervals:" in line and present_window(line) for line in stream):
+                        logs.insert(0, logs.pop(index))
+                        break
+        for path in logs:
+            with path.open("rb") as stream:
+                consume(stream)
+            if recognized and waves:
+                break
+    elif not windows:
         archive = results / (side + ".tar.gz")
         if archive.is_file():
             # UMU typically puts VIctory output in the Steam log. Some versions
@@ -573,12 +626,28 @@ def side_metrics(results, side, windows, frame_log, submission_log, timeline):
                                 break
             except (OSError, EOFError, tarfile.TarError):
                 pass
-    if not (recognized and waves):
+    if proton_logs is None and not (recognized and waves):
         with console.open("rb") as stream:
             consume(stream)
     for (lo, hi, amin, amax), count in sorted(waves.items()):
         rows.append(f"Wave-size rejection messages: {count} (shader {lo}–{hi} lanes, adapter {amin}–{amax})")
     return rows
+
+
+def measurement_summary(results, side, windows, destination, shader_ids, proton_logs=None):
+    exit_path = results / (side + "-exit.txt")
+    status = exit_path.read_bytes().strip() if exit_path.is_file() else b""
+    code = str(int(status)) if re.fullmatch(rb"-?[0-9]{1,10}", status) else "unreported"
+    with (destination / (side + "-frames.csv")).open("x", encoding="ascii", newline="") as frames, \
+            (destination / (side + "-submissions.csv")).open("x", encoding="ascii", newline="") as samples, \
+            (destination / (side + "-events.csv")).open("x", encoding="ascii", newline="") as events:
+        frame_log = csv.writer(frames)
+        submission_log = csv.writer(samples)
+        submission_log.writerow(SUBMISSION_COLUMNS)
+        frame_log.writerow(["window", "intervals", "mean_ms", "median_ms", "p95_ms", "longest_ms",
+                            "over_100_ms", "over_1_s"])
+        return [f"Launcher exit: {code}", *side_metrics(results, side, windows, frame_log, submission_log,
+                                                        Timeline(events, shader_ids), proton_logs)]
 
 
 def diagnostic_summary(request, results, windows, complete, destination):
@@ -589,22 +658,7 @@ def diagnostic_summary(request, results, windows, complete, destination):
             "Timings cover all recorded phases, including menus."]
     for side in ("main", "candidate"):
         rows.extend(["", f"{side.capitalize()} | {request[side]['revision']}"])
-        exit_path = results / (side + "-exit.txt")
-        status = exit_path.read_bytes().strip() if exit_path.is_file() else b""
-        code = str(int(status)) if re.fullmatch(rb"-?[0-9]{1,10}", status) else "unreported"
-        frames_path = destination / (side + "-frames.csv")
-        samples_path = destination / (side + "-submissions.csv")
-        events_path = destination / (side + "-events.csv")
-        with frames_path.open("x", encoding="ascii", newline="") as frames, \
-                samples_path.open("x", encoding="ascii", newline="") as samples, \
-                events_path.open("x", encoding="ascii", newline="") as events:
-            frame_log = csv.writer(frames)
-            submission_log = csv.writer(samples)
-            submission_log.writerow(SUBMISSION_COLUMNS)
-            frame_log.writerow(["window", "intervals", "mean_ms", "median_ms", "p95_ms", "longest_ms",
-                                "over_100_ms", "over_1_s"])
-            rows.append(f"Launcher exit: {code}")
-            rows.extend(side_metrics(results, side, windows, frame_log, submission_log, Timeline(events, shader_ids)))
+        rows.extend(measurement_summary(results, side, windows, destination, shader_ids))
     return "\n".join(rows) + "\n"
 
 
@@ -893,6 +947,150 @@ def share_result(pr, filtered, kit, binding=None, console="series-x"):
           f"Filtered diagnostics: {filtered}", sep="\n", flush=True)
 
 
+def outside_checkout(*directories):
+    for directory in directories:
+        if any((parent / ".victory-root").exists() for parent in (directory, *directory.parents)):
+            raise ValueError("Use a game, temporary directory and report destination outside the VIctory checkout.")
+
+
+def regular_file(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return (stat.S_ISREG(info.st_mode)
+            and not getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def local_round(folder, title, metadata, cache, scratch, result, source, windows):
+    if ((folder / "REVISION").read_text(encoding="ascii").strip() != metadata["revision"]
+            or digest(folder / "victory.exe") != metadata["binary_sha256"]):
+        raise ValueError(f"{metadata['name']}: the build changed during the comparison.")
+    data = scratch / "data"
+    data.mkdir(parents=True)
+    if source is not None:
+        shutil.copytree(source, data / TITLE_ID)
+    result.mkdir()
+    temporary = scratch / "tmp"
+    temporary.mkdir()
+    (result / "case.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    env = {key: value for key, value in os.environ.items()
+           if not key.upper().startswith(("VICTORY_", "STEAM_COMPAT_"))}
+    env.update(VICTORY_DATA_DIR=native_path(data, windows),
+               VICTORY_CACHE_DIR=native_path(cache / "victory", windows),
+               VICTORY_TRACE_PIPELINES="1", TMP=str(temporary), TEMP=str(temporary), TMPDIR=str(temporary))
+    if metadata["keys"] is not None:
+        env["VICTORY_KEYS"] = metadata["keys"]
+    raw = scratch / "proton-logs"
+    if not windows:
+        raw.mkdir()
+        prefix = str(scratch / "prefix")
+        env.update(WINEPREFIX=prefix, STEAM_COMPAT_DATA_PATH=prefix, GAMEID="umu-victory",
+                   STEAM_COMPAT_INSTALL_PATH=str(scratch),
+                   STEAM_COMPAT_SHADER_PATH=str(cache / "steam-shaders"),
+                   VKD3D_SHADER_CACHE_PATH=str(cache / "vkd3d"), DXVK_STATE_CACHE_PATH=str(cache / "dxvk"),
+                   MESA_SHADER_CACHE_DIR=str(cache / "mesa"), __GL_SHADER_DISK_CACHE_PATH=str(cache / "nvidia"),
+                   PROTON_LOG="1", PROTON_LOG_DIR=str(raw))
+    command = launch_command(folder, title, windows, metadata["console"], "--run", metadata["graphics_runtime"])
+    try:
+        status, _ = capture_launch(command, scratch, env, result / "console.log")
+        (result / "console-exit.txt").write_text(f"{status}\n", encoding="ascii")
+        return status
+    finally:
+        logs = []
+        for path in sorted(raw.glob("steam-*.log")):
+            if regular_file(path):
+                logs.append(result / path.name)
+                shutil.copyfile(path, logs[-1])
+        rows = ["Present timings can include menus. Logs do not establish gameplay or save success."]
+        rows.extend(measurement_summary(result, "console", windows, result, {}, logs))
+        if metadata["keys"] is not None:
+            rows.append("A key schedule was requested; the runner does not verify that the build used it.")
+        (result / "summary.txt").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+
+def run_local(options):
+    windows = sys.platform == "win32"
+    if windows and options.runtime is not None:
+        raise ValueError("--runtime applies only to local Linux/Proton comparisons.")
+    if not windows and not sys.platform.startswith("linux"):
+        raise ValueError("Local comparisons support Windows and Linux/Proton.")
+    title = options.title.expanduser().resolve()
+    if not title.is_file() or title.suffix.lower() != ".exe":
+        raise ValueError("Select an existing game .exe with --title.")
+    temp = Path(tempfile.gettempdir()).resolve()
+    output = (options.output_dir or temp).expanduser().resolve()
+    outside_checkout(title.parent, output, temp)
+    source = options.save_dir.expanduser().resolve() if options.save_dir is not None else None
+    if source is not None and not has_standard_save(source):
+        raise ValueError(f"--save-dir must name a nonempty {TITLE_ID} save folder.")
+    builds = []
+    names = set()
+    for name, directory in options.build:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name) or name.lower() in names:
+            raise ValueError("Use a distinct build name: 1–64 ASCII letters, digits, underscores or dashes, starting with a letter or digit.")
+        folder = Path(directory).expanduser().resolve()
+        binary, stamp = folder / "victory.exe", folder / "REVISION"
+        required = [binary, stamp] if windows else [binary, stamp, folder / "victory-proton.sh"]
+        if not all(regular_file(path) for path in required):
+            raise ValueError(f"{name}: expected an extracted build with regular files: "
+                             + ", ".join(path.name for path in required))
+        revision = stamp.read_text(encoding="ascii").strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise ValueError(f"{name}: expected a full package revision in REVISION.")
+        builds.append((folder, dict(name=name, revision=revision, binary_sha256=digest(binary))))
+        names.add(name.lower())
+    protected = [folder for folder, _ in builds] + ([source] if source is not None else [])
+    if any(title.is_relative_to(path) for path in protected):
+        raise ValueError("Use a title outside the extracted builds and the source save.")
+    if any(directory.is_relative_to(path) for directory in (temp, output)
+           for path in [title.parent, *protected]):
+        raise ValueError("Choose temporary and report directories outside the title, extracted builds and source save.")
+    runtime = "native" if windows else options.runtime or "pinned"
+    if runtime == "pinned":
+        cache_home = Path(os.environ.get("XDG_CACHE_HOME", ""))
+        if not cache_home.is_absolute():
+            cache_home = Path.home() / ".cache"
+        pinned_cache = (cache_home / "victory").resolve()
+        outside_checkout(pinned_cache)
+        if any(pinned_cache.is_relative_to(path) for path in [title.parent, *protected]):
+            raise ValueError("Choose a launcher runtime cache outside the title, extracted builds and source save.")
+    if not windows:
+        for binary in ("bash", "umu-run"):
+            if not shutil.which(binary):
+                raise ValueError(f"Missing {binary}; install it before running an extracted build on Linux.")
+    console = options.console or "series-x"
+    instruction_block(PRIVACY_HEADING, LOG_PRIVACY + " Local comparisons do not upload results.")
+    with tempfile.TemporaryDirectory(prefix="victory-local-work-", dir=temp) as work:
+        scratch = Path(work)
+        seed = None
+        if source is not None:
+            seed = scratch / "seed"
+            copy_save(source, seed)
+        output.mkdir(parents=True, exist_ok=True)
+        destination = Path(tempfile.mkdtemp(prefix="victory-local-", dir=output))
+        print(f"Private local results: {destination}", flush=True)
+        status = 0
+        for number, (folder, build) in enumerate(builds, start=1):
+            cache = scratch / f"{number:02}-cache"
+            cache_names = ("victory",) if windows else ("victory", "vkd3d", "dxvk", "steam-shaders", "mesa", "nvidia")
+            for name in cache_names:
+                (cache / name).mkdir(parents=True)
+            rounds = ("cold", "warm") if options.warm else ("cold",)
+            for cache_class in rounds:
+                label = f"{number:02}-{cache_class}"
+                print(f"{label} | {build['name']} | {console_name(console)}", flush=True)
+                metadata = dict(build, console=console, keys=options.keys, cache_class=cache_class,
+                                starting_data="clean" if seed is None else f"copied {TITLE_ID}",
+                                platform="Windows" if windows else "Linux/Proton",
+                                graphics_runtime=runtime)
+                with tempfile.TemporaryDirectory(prefix=f"{label}-", dir=scratch) as case:
+                    code = local_round(folder, title, metadata, cache, Path(case), destination / label, seed, windows)
+                print(f"{label} exited ({code}).", flush=True)
+                status = status or code
+        return status
+
+
 def run_request(manifest, options):
     data = manifest.read_bytes()
     request = parse_request(data)
@@ -901,7 +1099,7 @@ def run_request(manifest, options):
     print(f"VIctory PR #{request['pr']} | {console_name(console)} | two launches", flush=True)
     instruction_block(PRIVACY_HEADING, LOG_PRIVACY + " Your reports stay on this machine until you choose to share.")
     source = (options.save_dir or default_save()).expanduser().resolve()
-    if source.name.upper() != TITLE_ID or not any(p.is_file() for p in (source / "saves").rglob("*")):
+    if not has_standard_save(source):
         message = (f"Standard save {TITLE_ID} missing or empty at {source}. "
                    f"Place your copy in saves/{TITLE_ID}/ or pass --save-dir pointing to your {TITLE_ID} folder.")
         if not options.plan:
@@ -934,9 +1132,7 @@ def run_request(manifest, options):
         raise ValueError("Select the game's .exe file.")
     temp = Path(tempfile.gettempdir()).resolve()
     output = (options.output_dir or temp).expanduser().resolve()
-    for directory in (output, temp, title.parent):
-        if any((parent / ".victory-root").exists() for parent in (directory, *directory.parents)):
-            raise ValueError("Use a game, temporary directory and report destination outside the VIctory checkout.")
+    outside_checkout(output, temp, title.parent)
     with tempfile.TemporaryDirectory(prefix="victory-builds-") as work:
         for side in ("main", "candidate"):
             print(f"Checking {side}…", flush=True)
@@ -979,6 +1175,6 @@ def run_request(manifest, options):
 
 if __name__ == "__main__":
     try:
-        run()
+        sys.exit(run())
     except (OSError, ValueError, TypeError, KeyError, EOFError, subprocess.CalledProcessError, tarfile.TarError, zipfile.BadZipFile) as error:
         sys.exit(str(error))

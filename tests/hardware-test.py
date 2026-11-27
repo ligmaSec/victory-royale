@@ -48,6 +48,178 @@ class SaveLocations(unittest.TestCase):
                 self.assertEqual(runner.default_save(), kit / "saves" / "7952987A")
 
 
+class LocalComparison(unittest.TestCase):
+    def setUp(self):
+        work = tempfile.TemporaryDirectory()
+        self.addCleanup(work.cleanup)
+        self.root = Path(work.name).resolve()
+        self.title = self.root / "title folder" / "synthetic title.exe"
+        self.title.parent.mkdir()
+        self.title.touch()
+        self.save = self.root / "7952987A"
+        for directory, file, value in (("saves", "progress", "private progress"),
+                                       ("storage", "settings", "private settings"),
+                                       ("temp", "old.log", "private stale log")):
+            (self.save / directory).mkdir(parents=True)
+            (self.save / directory / file).write_text(value, encoding="ascii")
+        self.builds = []
+        for label, revision in (("main", "a" * 40), ("candidate", "b" * 40)):
+            folder = self.root / f"{label} build"
+            folder.mkdir()
+            (folder / "victory.exe").write_bytes(f"synthetic build {label}".encode("ascii"))
+            (folder / "victory-proton.sh").touch()
+            (folder / "REVISION").write_text(revision, encoding="ascii")
+            self.builds.append((label, folder, revision))
+        self.output = self.root / "results"
+        self.args = ["runner", "--local", "--title", str(self.title), "--output-dir", str(self.output)]
+        for label, folder, _ in self.builds:
+            self.args += ["--build", label, str(folder)]
+
+    def test_local_rounds_keep_private_data_out_of_durable_results(self):
+        schedule = "10-10.5:Enter,15:X"
+        timing = ("present intervals: 2 frames, mean 30.00 ms, median 30.00 ms, p95 32.00 ms, "
+                  "longest 32.00 ms, 0 over 100 ms, 0 over 1 s")
+        for platform in ("linux", "win32"):
+            for clean in (True, False):
+                with self.subTest(platform=platform, clean=clean):
+                    cases = []
+                    windows = platform == "win32"
+                    runtime = "native" if windows else ("pinned" if clean else "proton")
+                    output = self.output / f"{platform}-{clean}"
+                    args = self.args + ["--output-dir", str(output), "--warm", "--console", "series-s"]
+                    args += ["--clean-data"] if clean else ["--save-dir", str(self.save), "--keys", schedule]
+                    if runtime == "proton":
+                        args += ["--runtime", "proton"]
+                    popen = subprocess.Popen
+
+                    def start(command, **kwargs):
+                        number, warm = divmod(len(cases), 2)
+                        _, folder, _ = self.builds[number]
+                        env = kwargs["env"]
+                        scratch = kwargs["cwd"]
+                        data = scratch / "data"
+                        cache = scratch.parent / f"{number + 1:02}-cache" / "victory"
+                        self.assertNotEqual(scratch, self.title.parent)
+                        self.assertEqual(env["VICTORY_DATA_DIR"], runner.native_path(data, windows))
+                        self.assertEqual(env["VICTORY_CACHE_DIR"], runner.native_path(cache, windows))
+                        self.assertEqual(env["VICTORY_TRACE_PIPELINES"], "1")
+                        for key in ("VICTORY_EXE", "VICTORY_CONFIG", "VICTORY_CAPTURE_FRAME"):
+                            self.assertNotIn(key, env)
+                        self.assertEqual(env.get("VICTORY_KEYS"), None if clean else schedule)
+                        self.assertEqual(env["TMP"], str(scratch / "tmp"))
+                        self.assertEqual((cache / "cache-token").exists(), bool(warm))
+                        self.assertEqual(set(p.name for p in data.iterdir()), set() if clean else {runner.TITLE_ID})
+                        if not clean:
+                            slot = data / runner.TITLE_ID
+                            self.assertEqual({p.name for p in slot.iterdir()}, {"saves", "storage"})
+                            self.assertEqual((slot / "saves" / "progress").read_text(), "private progress")
+                            self.assertEqual((slot / "storage" / "settings").read_text(), "private settings")
+                        if windows:
+                            self.assertEqual(command, [str(folder / "victory.exe"), "run", str(self.title),
+                                                       "--execute", "--console", "series-s"])
+                        else:
+                            self.assertEqual(command, ["bash", str(folder / "victory-proton.sh"), "--run",
+                                                       "--runtime", runtime, str(self.title), "--console", "series-s"])
+                            self.assertEqual(env["WINEPREFIX"], str(scratch / "prefix"))
+                            self.assertEqual(env["STEAM_COMPAT_DATA_PATH"], env["WINEPREFIX"])
+                            self.assertEqual(env["VKD3D_SHADER_CACHE_PATH"], str(cache.parent / "vkd3d"))
+                            self.assertEqual(env["DXVK_STATE_CACHE_PATH"], str(cache.parent / "dxvk"))
+                            self.assertNotIn("STEAM_COMPAT_LIBRARY_PATHS", env)
+                        cases.append(scratch)
+                        # A fake child mutates its disposable user data and cache.
+                        program = (
+                            "import os, sys\nfrom pathlib import Path\n"
+                            "Path(sys.argv[1]).write_text('private changed save')\n"
+                            "Path(sys.argv[2]).write_text('cache')\n"
+                            "if sys.argv[4]:\n"
+                            "    (Path(os.environ['PROTON_LOG_DIR']) / 'steam-victory.log').write_text(sys.argv[4])\n"
+                            "print(sys.argv[3])\n"
+                            "sys.exit(int(sys.argv[5]))"
+                        )
+                        changed = data if clean else data / runner.TITLE_ID / "saves"
+                        stdout = timing if windows else "host D3D12 device ready vendor=0x1002"
+                        if clean and number == 0 and not warm:
+                            stdout, proton = "boot only", ""
+                        else:
+                            proton = "" if windows else timing
+                        return popen([sys.executable, "-c", program, str(changed / "child-save"),
+                                      str(cache / "cache-token"), stdout, proton, str(7 if warm else 0)], **kwargs)
+
+                    inherited = {"VICTORY_EXE": "another.exe", "VICTORY_CONFIG": "another.toml",
+                                 "VICTORY_KEYS": "1:Y", "VICTORY_CAPTURE_FRAME": "99",
+                                 "VICTORY_DATA_DIR": "do not touch", "VICTORY_CACHE_DIR": "shared cache",
+                                 "WINEPREFIX": "active player prefix", "STEAM_COMPAT_LIBRARY_PATHS": "active library"}
+                    with mock.patch.object(sys, "argv", args), mock.patch.object(sys, "platform", platform), \
+                            mock.patch.dict(os.environ, inherited), contextlib.redirect_stdout(io.StringIO()), \
+                            mock.patch.object(shutil, "which", return_value="synthetic dependency"), \
+                            mock.patch.object(runner, "select_published", side_effect=AssertionError), \
+                            mock.patch.object(runner, "share_result", side_effect=AssertionError), \
+                            mock.patch.object(subprocess, "run", side_effect=AssertionError), \
+                            mock.patch.object(subprocess, "Popen", side_effect=start):
+                        self.assertEqual(runner.run(), 7)
+                        self.assertEqual(os.environ["VICTORY_KEYS"], inherited["VICTORY_KEYS"])
+                    self.assertEqual(len(set(cases)), 4)
+                    self.assertTrue(all(not case.parent.exists() for case in cases))
+                    report, = output.iterdir()
+                    labels = ["01-cold", "01-warm", "02-cold", "02-warm"]
+                    self.assertEqual(sorted(p.name for p in report.iterdir()), labels)
+                    for index, case in enumerate(labels):
+                        result = report / case
+                        name, folder, revision = self.builds[index // 2]
+                        files = {"case.json", "console.log", "console-exit.txt", "summary.txt",
+                                 "console-frames.csv", "console-submissions.csv", "console-events.csv"}
+                        boot_only = clean and index == 0
+                        if not windows and not boot_only:
+                            files.add("steam-victory.log")
+                        self.assertEqual({p.name for p in result.iterdir()}, files)
+                        console_log = (result / "console.log").read_text().strip()
+                        self.assertEqual(console_log, "boot only" if boot_only else
+                                         timing if windows else "host D3D12 device ready vendor=0x1002")
+                        if "steam-victory.log" in files:
+                            self.assertEqual((result / "steam-victory.log").read_text(), timing)
+                        self.assertEqual(json.loads((result / "case.json").read_text()), {
+                            "name": name, "revision": revision, "console": "series-s",
+                            "binary_sha256": hashlib.sha256((folder / "victory.exe").read_bytes()).hexdigest(),
+                            "keys": None if clean else schedule, "cache_class": case[3:],
+                            "starting_data": "clean" if clean else "copied 7952987A",
+                            "platform": "Windows" if windows else "Linux/Proton", "graphics_runtime": runtime,
+                        })
+                        self.assertEqual((result / "console-exit.txt").read_text().strip(), str(7 if index % 2 else 0))
+                        summary = (result / "summary.txt").read_text()
+                        self.assertIn("Frame timings: unavailable" if boot_only else "2 frame intervals", summary)
+                        self.assertIn("do not establish gameplay or save success", summary)
+                        for path in result.iterdir():
+                            self.assertNotIn(b"private ", path.read_bytes())
+                    self.assertEqual((self.save / "saves" / "progress").read_text(), "private progress")
+                    self.assertFalse((self.save / "saves" / "child-save").exists())
+
+    def test_local_requires_named_builds_and_explicit_data_and_rejects_unsafe_paths(self):
+        for args in (["runner", "--local", "--title", str(self.title), "--clean-data"],
+                     ["runner", "--local", "--build", "main", str(self.builds[0][1]), "--clean-data"],
+                     self.args, self.args + ["--clean-data", "--save-dir", str(self.save)],
+                     self.args + ["--clean-data", "--plan"]):
+            with mock.patch.object(sys, "argv", args), contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(runner, "select_published", side_effect=AssertionError), self.assertRaises(SystemExit):
+                runner.run()
+        base = self.args + ["--clean-data"]
+        with mock.patch.object(subprocess, "Popen", side_effect=AssertionError):
+            for extra, diagnostic in ((["--title", str(self.root / "missing.exe")], "existing game"),
+                                      (["--output-dir", str(self.title.parent / "out")], "outside the title"),
+                                      (["--output-dir", str(self.builds[0][1] / "out")], "outside the title"),
+                                      (["--build", "../build", str(self.builds[0][1])], "distinct build name"),
+                                      (["--build", "MAIN", str(self.builds[0][1])], "distinct build name")):
+                with mock.patch.object(sys, "argv", base + extra), self.assertRaisesRegex(ValueError, diagnostic):
+                    runner.run()
+            with mock.patch.object(sys, "argv", base), mock.patch.object(sys, "platform", "linux"), \
+                    mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(self.title.parent)}), \
+                    self.assertRaisesRegex(ValueError, "launcher runtime cache outside the title"):
+                runner.run()
+            (self.title.parent / ".victory-root").touch()
+            with mock.patch.object(sys, "argv", base), self.assertRaisesRegex(ValueError, "outside the VIctory checkout"):
+                runner.run()
+        self.assertFalse(self.output.exists())
+
+
 class HardwareRequest(unittest.TestCase):
     def setUp(self):
         # Launch tests capture their output and must never prompt the person running the suite.
