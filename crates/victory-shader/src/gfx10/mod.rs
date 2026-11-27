@@ -63,6 +63,17 @@ pub struct Instruction {
 }
 
 impl Instruction {
+    /// An instruction of these words, its name resolved.
+    pub fn new(offset: usize, encoding: Encoding, opcode: u16, words: Vec<u32>) -> Self {
+        Self {
+            offset,
+            encoding,
+            opcode,
+            words,
+            name: name(encoding, opcode),
+        }
+    }
+
     /// AMD's name for the opcode, if it is in our table.
     pub fn name(&self) -> Option<&'static str> {
         self.name
@@ -71,7 +82,7 @@ impl Instruction {
 
 /// Decodes every instruction reachable from offset 0, sorted by offset.
 pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
-    if !code.len().is_multiple_of(4) {
+    if code.len() & 3 != 0 {
         return Err(isa(code.len(), "code size is not a multiple of 4"));
     }
     let mut found = BTreeMap::new();
@@ -359,6 +370,21 @@ mod tests {
     }
 
     #[test]
+    fn flat_offsets_ignore_bit_eleven() {
+        let offset = |word0: u32| {
+            let code = bytes(&[word0, 0x0000_0001, S_ENDPGM]);
+            match decode(&code).unwrap()[0].fields(false) {
+                Fields::Flat { offset, .. } => offset,
+                fields => panic!("{fields:?}"),
+            }
+        };
+        // flat_load_dword v0, v[1:2]: the FLAT offset is 11-bit and
+        // unsigned, so bit 11 is ignored (0x800 -> 0, 0xfff -> 0x7ff).
+        assert_eq!(offset(0xDC30_0800), 0);
+        assert_eq!(offset(0xDC30_0FFF), 0x7FF);
+    }
+
+    #[test]
     fn tables_are_sorted() {
         for t in [
             opcodes::SOP2,
@@ -481,10 +507,6 @@ mod tests {
         );
     }
 
-    /// RDNA2 (GFX10.3) has the fused legacy multiply-adds at these
-    /// opcodes: LLVM's gfx1030 assembler tests encode
-    /// `v_fma_legacy_f32 v0, v1, v2, v3` and `v_fmac_legacy_f32_e32 v0,
-    /// v1, v2` as these words.
     #[test]
     fn legacy_multiply_adds_are_the_fused_ones() {
         let fma = summary(&[0xD540_0000, 0x040E_0501, S_ENDPGM]);

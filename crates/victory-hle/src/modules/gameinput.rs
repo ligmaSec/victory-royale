@@ -1319,43 +1319,70 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// Debugging aid: VICTORY_KEYS holds a key for 0.2 s at a point or
+    /// throughout a start-end interval, measured from input start.
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        static SCRIPT: LazyLock<(Instant, Vec<KeyHold>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
+            (
+                Instant::now(),
+                list.split(',').filter_map(key_hold).collect(),
+            )
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
         keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
+            .filter(|(when, _)| when.contains(&now))
             .map(|&(_, vk)| vk)
             .collect()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    type KeyHold = (std::ops::Range<Duration>, u8);
+
+    #[cfg(feature = "diagnostics")]
+    fn key_hold(entry: &str) -> Option<KeyHold> {
+        let (at, key) = entry.split_once(':')?;
+        let vk = match key.trim() {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        };
+        let time = |s: &str| Duration::try_from_secs_f64(s.trim().parse().ok()?).ok();
+        let when = if let Some(start) = time(at) {
+            start..start.checked_add(Duration::from_millis(200))?
+        } else {
+            // Try a point first, and do not mistake a negative exponent
+            // in either endpoint for the separator.
+            at.match_indices('-').find_map(|(i, _)| {
+                let start = time(&at[..i])?;
+                let end = time(&at[i + 1..])?;
+                (start < end).then_some(start..end)
+            })?
+        };
+        Some((when, vk))
+    }
+
+    #[cfg(all(test, feature = "diagnostics"))]
+    #[test]
+    fn scripted_keys_keep_point_taps_and_hold_explicit_ranges() {
+        let ms = Duration::from_millis;
+        assert_eq!(key_hold("0.5:Enter"), Some((ms(500)..ms(700), 0x0D)));
+        assert_eq!(key_hold("1e-1: X"), Some((ms(100)..ms(300), b'X')));
+        assert_eq!(key_hold("1e-1 - 2.5: x"), Some((ms(100)..ms(2500), b'X')));
+        assert_eq!(key_hold("3-2:Esc"), None);
+        assert_eq!(key_hold("-1:Tab"), None);
+        assert_eq!(key_hold("1:unknown"), None);
     }
 
     /// The keyboard state `ToUnicodeEx` reads with the keys `held` down:

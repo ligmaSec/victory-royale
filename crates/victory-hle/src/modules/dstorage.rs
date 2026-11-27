@@ -4,11 +4,13 @@
 //! slots here are the ones the title calls, read from its call
 //! sites. Slots nobody has needed yet log their offset.
 //!
-//! Submitted requests of every queue run on one pool of workers, as the
+//! Requests begin at Submit, after the title has installed destination page
+//! lists. A queue full of unsubmitted requests starts them to make room.
+//! The queues share one pool of workers, as the
 //! console's hardware runs them: in parallel, started in queue order,
 //! queues served by weighted round robin over their priorities (about 10x
 //! per level, counted in bytes), with at most the staging buffer's worth of
-//! buffered source in flight. Each request reads its source (a file or
+//! buffered file source in flight. Each request reads its source (a file or
 //! memory), inflates zlib data and/or unpacks BCPack data, and writes the
 //! destination (an address, or physical pages). Completion is what stays
 //! in order: a status entry is written once every request enqueued before
@@ -18,10 +20,11 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
@@ -163,6 +166,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     let file = Instance::create(
         Object::new("dstorage file", &FILE_VTABLE),
         File {
+            readers: (0..worker_count()).map(|_| OnceLock::new()).collect(),
             file,
             filename: filename.into(),
         },
@@ -286,7 +290,46 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    readers: Box<[OnceLock<Option<std::fs::File>>]>,
     filename: Box<[u16]>,
+}
+
+impl File {
+    /// Independent handles let the host serve archive reads concurrently.
+    /// Reopen the existing handle, never the title-supplied path again.
+    fn reader(&self) -> &std::fs::File {
+        use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+        };
+
+        WORKER.with(Cell::get)
+            .and_then(|index| self.readers.get(index))
+            .and_then(|reader| reader.get_or_init(|| {
+                // SAFETY: the opened file is owned by this live object.
+                let handle = unsafe {
+                    ReOpenFile(self.file.as_raw_handle(), GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0)
+                };
+                if handle == INVALID_HANDLE_VALUE {
+                    tracing::warn!(error = %std::io::Error::last_os_error(), "dstorage: reopening a file failed");
+                    None
+                } else {
+                    // SAFETY: ReOpenFile returned a new handle that we own.
+                    Some(unsafe { std::fs::File::from_raw_handle(handle) })
+                }
+            }).as_ref())
+            .unwrap_or(&self.file)
+    }
+}
+
+thread_local! {
+    static WORKER: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+fn worker_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| std::thread::available_parallelism().map_or(4, usize::from))
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -424,44 +467,44 @@ unsafe impl Send for Job {}
 /// The scheduler, with its workers started on first use; `None` if not
 /// even one worker could start.
 fn scheduler() -> Option<&'static Scheduler> {
-    static SCHEDULER: OnceLock<Option<Scheduler>> = OnceLock::new();
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    let scheduler = SCHEDULER
-        .get_or_init(|| {
-            Some(Scheduler {
-                lanes: Mutex::new(Lanes {
-                    lanes: HashMap::new(),
-                    next_id: 0,
-                    next_seq: 0,
-                    staged: 0,
-                    staging: STAGING,
-                    starved: false,
-                    clock: [0; 3],
-                    now: 0,
-                    lane_now: [0; 3],
-                    done: Default::default(),
-                    refused: 0,
-                    bcpack: Default::default(),
-                    since: None,
-                }),
-                work: Condvar::new(),
-                finished: Condvar::new(),
-            })
-        })
-        .as_ref()?;
-    STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let started = (0..workers)
-            .filter(|i| {
-                std::thread::Builder::new()
-                    .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
-                    .is_ok()
-            })
-            .count();
-        tracing::info!(workers = started, "dstorage: workers");
+    static SCHEDULER: OnceLock<Scheduler> = OnceLock::new();
+    static STARTED: OnceLock<bool> = OnceLock::new();
+    let scheduler = SCHEDULER.get_or_init(|| Scheduler {
+        lanes: Mutex::new(Lanes {
+            lanes: HashMap::new(),
+            next_id: 0,
+            next_seq: 0,
+            staged: 0,
+            staging: STAGING,
+            starved: false,
+            clock: [0; 3],
+            now: 0,
+            lane_now: [0; 3],
+            done: Default::default(),
+            refused: 0,
+            bcpack: Default::default(),
+            since: None,
+        }),
+        work: Condvar::new(),
+        finished: Condvar::new(),
     });
-    Some(scheduler)
+    STARTED
+        .get_or_init(|| {
+            let started = (0..worker_count())
+                .filter(|&i| {
+                    std::thread::Builder::new()
+                        .name(format!("dstorage {i}"))
+                        .spawn(move || {
+                            WORKER.with(|slot| slot.set(Some(i)));
+                            work(scheduler);
+                        })
+                        .is_ok()
+                })
+                .count();
+            tracing::info!(workers = started, "dstorage: workers");
+            started != 0
+        })
+        .then_some(scheduler)
 }
 
 impl Scheduler {
@@ -650,41 +693,21 @@ impl Lane {
     }
 }
 
-/// Staging bytes a request holds while it runs: what it buffers between
-/// the source and the destination, charged against the staging buffer so
-/// the requests in flight together cannot allocate more than the title
-/// asked for.
-///
-/// A memory source needs none, as on the console: it is read in place. A
-/// request that inflates, unpacks, or writes physical pages holds its whole
-/// source. A plain file read into a title address is copied in from a side
-/// buffer of at most [`BOUNCE_CHUNK`] bytes (see `execute`), so a large one
-/// costs a constant.
-// shortcut: a memory source into physical pages that are not consecutive
-// pages of one allocation buffers the destination and is charged nothing;
-// whether it buffers is only known once the pages are looked up, after the
-// charge is made.
+/// Raw file reads to title addresses go straight to the destination;
+/// memory sources also need no staging. A compressed file source holds
+/// its full input. A raw file request to fragmented physical pages can
+/// need a buffer the size of the source, so charge that too.
+// shortcut: the staging limit accounts for file data in flight, not the
+// decoder's intermediate workspace or the page-destination scatter buffer
+// (whether the latter is needed is only known when the worker maps it).
 fn staging_bytes(request: &Request) -> u64 {
-    let options = request.options;
-    if options & MEMORY_SOURCE != 0 {
-        return 0;
+    if request.options & MEMORY_SOURCE == 0
+        && request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0
+    {
+        u64::from(request.source_size)
+    } else {
+        0
     }
-    if options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0 {
-        return u64::from(request.source_size);
-    }
-    bounce_bytes(request.source_size as usize) as u64
-}
-
-/// The most a bouncing plain read buffers at once, as `files::fread`
-/// bounds its own chunks. Every worker can hold one, so the pool's side
-/// buffers stay within a staging buffer of the console's default size.
-const BOUNCE_CHUNK: usize = 1 << 20;
-
-/// The side buffer a bouncing plain read of `source_size` bytes allocates.
-/// [`staging_bytes`] charges this and [`bounce_into`] allocates it, so the
-/// charge cannot under-report the allocation.
-fn bounce_bytes(source_size: usize) -> usize {
-    source_size.min(BOUNCE_CHUNK)
 }
 
 /// Ends a queue: what was enqueued but not submitted is dropped, and this
@@ -809,6 +832,12 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
+        if !lane.unsubmitted.is_empty() && lane.reads.is_empty() && lane.running.is_empty() {
+            tracing::warn!(queue = id, "dstorage: full queue submitted to make room");
+            lanes.submit(id);
+            scheduler.work.notify_all();
+            continue;
+        }
         lanes = scheduler
             .finished
             .wait(lanes)
@@ -818,10 +847,6 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
-        lanes.submit(id);
-        scheduler.work.notify_all();
-    }
 }
 
 extern "system" fn submit(this: QueueRef) {
@@ -835,6 +860,7 @@ extern "system" fn submit(this: QueueRef) {
     tracing::debug!(commands = pending, "dstorage: submit");
     lanes.submit(id);
     scheduler.work.notify_all();
+    scheduler.finished.notify_all();
 }
 
 /// Ends the queue whatever its reference count: what was not submitted
@@ -906,20 +932,8 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        // A file read into a title address is the kernel's write, and the
-        // kernel does not fault into the GPU side's guard. A block guarded
-        // again between `kernel_will_write` and the read made the read fail
-        // with ERROR_INVALID_USER_BUFFER, and the title stopped at the failed
-        // request. Read beside and copy in: the copy is a user-mode write
-        // like the title's own stores.
-        let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
-        return into_destination(request, size, |out| {
-            if !bounce {
-                return read_into(request, out).map(|()| size);
-            }
-            bounce_into(request, out).map(|()| size)
-        })
-        .map_err(|hr| fail(hr, "copying"));
+        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
+            .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 {
         Some(bcpack_tables()?)
@@ -932,6 +946,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         let mut packed = vec![0; request.intermediate_size as usize];
         let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
         packed.truncate(n);
+        drop(source);
         Cow::Owned(packed)
     } else {
         source
@@ -955,11 +970,47 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 /// that ends short of `out` passes: the title's chunks fill it exactly, and
 /// nothing says that is required.
 fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
-    miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
-        .map_err(|status| {
-            tracing::debug!(?status, "dstorage: zlib stream");
-            INVALID_DATA
-        })
+    thread_local! {
+        static INFLATE: std::cell::RefCell<zlib_rs::Inflate> =
+            std::cell::RefCell::new(zlib_rs::Inflate::new(true, 15));
+    }
+    INFLATE.with_borrow_mut(|state| {
+        state.reset(true);
+        // `Inflate::decompress` cannot distinguish a valid empty stream from
+        // an insufficient buffer when `avail_out == 0`, so use a 1-byte scratch
+        // destination and verify `written <= out_len` afterward.
+        let out_len = out.len();
+        let mut scratch = [0u8; 1];
+        let dest = if out_len == 0 { &mut scratch[..] } else { out };
+        let (mut in_pos, mut out_pos) = (0usize, 0usize);
+        let status = loop {
+            match state.decompress(
+                &source[in_pos..],
+                &mut dest[out_pos..],
+                zlib_rs::InflateFlush::NoFlush,
+            ) {
+                Ok(zlib_rs::Status::StreamEnd) => break Ok(zlib_rs::Status::StreamEnd),
+                Ok(zlib_rs::Status::Ok) => {
+                    let next_in = state.total_in() as usize;
+                    let next_out = state.total_out() as usize;
+                    if next_in == in_pos && next_out == out_pos {
+                        break Ok(zlib_rs::Status::BufError);
+                    }
+                    in_pos = next_in;
+                    out_pos = next_out;
+                }
+                other => break other,
+            }
+        };
+        let written = state.total_out() as usize;
+        match status {
+            Ok(zlib_rs::Status::StreamEnd) if written <= out_len => Ok(written),
+            other => {
+                tracing::debug!(?other, "dstorage: zlib stream");
+                Err(INVALID_DATA)
+            }
+        }
+    })
 }
 
 /// The BCPack format's constant tables, parsed once for the process. If
@@ -1006,7 +1057,7 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 
 /// A compressed request's source: borrowed from memory, or read from the
 /// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+fn read_source(request: &Request) -> Result<Cow<'_, [u8]>, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
@@ -1021,32 +1072,31 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
 
-/// Fills `out` (the source size) from the request's file or memory.
+/// Fills the source-sized destination, reading at the specified offset
+/// until complete or EOF. A kernel write to title memory is covered by
+/// the destination's kernel-writing guard for the entire read.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
-        // SAFETY: the title's source holds `out.len()` bytes until completion.
+        // SAFETY: the title's source holds out.len() bytes until completion.
         out.copy_from_slice(unsafe {
             std::slice::from_raw_parts(request.source.cast(), out.len())
         });
         return Ok(());
     }
-    read_file_into(request, out, request.offset)
-}
-
-/// Fills `out` from the request's file, `at` bytes in, repeating short
-/// reads; a read that returns nothing has run off the end.
-fn read_file_into(request: &Request, out: &mut [u8], at: u64) -> Result<(), HRESULT> {
-    // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
+    // SAFETY: this is a file object we created and the title keeps open.
+    let file = unsafe { &*request.source.cast::<Instance<File>>() }
         .state
-        .file;
+        .reader();
     let started = std::time::Instant::now();
     let mut done = 0;
     let result = loop {
         if done == out.len() {
             break Ok(());
         }
-        match file.seek_read(&mut out[done..], at + done as u64) {
+        let Some(at) = request.offset.checked_add(done as u64) else {
+            break Err(E_INVALIDARG);
+        };
+        match file.seek_read(&mut out[done..], at) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
             Err(error) => break Err(from_win32(&error)),
@@ -1056,90 +1106,121 @@ fn read_file_into(request: &Request, out: &mut [u8], at: u64) -> Result<(), HRES
     result
 }
 
-/// Fills `out` from the request's file beside the destination, a chunk at
-/// a time, copying each chunk in. `execute` asks for the source size, so
-/// the side buffer is the [`bounce_bytes`] the scheduler charged this
-/// request, and a read of any size holds no more staging than that. A read
-/// that fails part way leaves the destination as a direct read would: the
-/// bytes before the failure landed, the rest did not.
-fn bounce_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
-    let mut beside = vec![0u8; bounce_bytes(out.len())];
-    let bound = beside.len();
-    let mut done = 0;
-    while done < out.len() {
-        let chunk = &mut beside[..(out.len() - done).min(bound)];
-        read_file_into(request, chunk, request.offset + done as u64)?;
-        out[done..done + chunk.len()].copy_from_slice(chunk);
-        done += chunk.len();
-    }
-    Ok(())
-}
-
-/// Runs `fill` on the destination's first `len` bytes; `fill` returns how
-/// many it produced. GPU-visible destinations are host memory like the
-/// rest (GPU address = CPU address), so an address is written in place;
-/// physical pages are too when they are consecutive pages of one
-/// allocation, and otherwise go through a buffer.
+/// Runs fill on the destination or its backing pages. A physical list is
+/// resolved after Submit. If the title replaces it while a write is in
+/// flight, the new pages also get the data before completion.
 fn into_destination(
     request: &Request,
     len: usize,
-    fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
+    mut fill: impl FnMut(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
+    if len == 0 {
+        return fill(&mut []).map(drop);
+    }
     if request.options & PAGE_DESTINATION == 0 {
+        let at = request.destination as usize;
         if request.options & (ZLIB | BCPACK) == 0 {
-            // Raw reads copy in from a side buffer of one chunk (see
-            // `bounce_into`) and do not need a second buffer the size of the
-            // destination; their blocks are opened once for the whole range,
-            // so each chunk's copy lands without faulting.
-            victory_gpu::kernel_will_write(request.destination as usize, len);
-            // SAFETY: the title's destination holds `destination_size` bytes,
-            // at least `len`, and the worker owns this request until completion.
-            let out =
-                unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-            let filled = fill(out);
-            victory_gpu::kernel_wrote(request.destination as usize, len);
-            return filled.map(drop);
+            let writing = victory_gpu::kernel_writing(at, len);
+            // SAFETY: a raw request holds a writable buffer of at least len
+            // bytes until completion. We own the request while it is running.
+            let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast(), len) };
+            let result = fill(out).map(drop);
+            drop(writing);
+            // A GPU refresh between submission and completion can have
+            // copied the old bytes; the read, even a short one, is now done.
+            victory_gpu::kernel_will_write(at, len);
+            return result;
         }
-        // Decode into host-owned memory first. A title mapping can disappear
-        // while a worker is running; copying through the kernel reports that
-        // instead of faulting this worker while it writes the destination.
+        // Decode into our own memory so a vanished title mapping is
+        // reported as a failed write instead of faulting a decoder thread.
         let mut data = vec![0; len];
-        let written = fill(&mut data)?;
-        if written > len {
+        let n = fill(&mut data)?;
+        let _writing = victory_gpu::kernel_writing(at, n);
+        if !victory_gpu::write_title_memory(at, &data[..n]) {
+            tracing::warn!(bytes = n, "dstorage: decompressed destination write failed");
             return Err(E_INVALIDARG);
         }
-        if !victory_gpu::write_title_memory(request.destination as usize, &data[..written]) {
+        victory_gpu::kernel_will_write(at, n);
+        return Ok(());
+    }
+
+    let offset = (request.page_offset & 0xffff) as usize;
+    let list = request.destination.cast::<usize>();
+    let count = (offset + len).div_ceil(PAGE);
+    let mut pages = Vec::with_capacity(count);
+    read_list(list, count, &mut pages);
+    let started = std::time::Instant::now();
+    while !super::xmem::pages_known(&pages, offset, len) {
+        if started.elapsed().as_millis() >= 1500 {
+            tracing::warn!(count, "dstorage: destination page list was not initialized");
+            return Err(E_INVALIDARG);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        read_list(list, count, &mut pages);
+    }
+    for _ in 0..3 {
+        into_pages(&pages, offset, len, &mut fill)?;
+        // No second allocation on the stable path. The ABI requires the
+        // submitted page list to stay in title memory through completion.
+        if pages.iter().enumerate().all(|(i, &page)| {
+            // SAFETY: a submitted list has count readable entries.
+            page == unsafe { list.add(i).read_volatile() }
+        }) {
+            return Ok(());
+        }
+        read_list(list, count, &mut pages);
+        if !super::xmem::pages_known(&pages, offset, len) {
             tracing::warn!(
-                bytes = written,
-                "dstorage: decompressed destination write failed"
+                count,
+                "dstorage: destination page list changed to unknown pages"
             );
             return Err(E_INVALIDARG);
         }
-        return Ok(());
+        tracing::warn!(
+            count,
+            "dstorage: destination page list changed during the write"
+        );
     }
-    let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
-    };
-    // Consecutive pages of one allocation (the usual case): written in
-    // place through one view.
+    Err(E_INVALIDARG)
+}
+
+fn into_pages(
+    pages: &[usize],
+    offset: usize,
+    len: usize,
+    fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
+) -> Result<(), HRESULT> {
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        let written = fill(window.bytes())?;
-        window.finish(written);
+        let n = fill(window.bytes())?;
+        window.finish(n);
         return Ok(());
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    if super::xmem::write_physical(pages, offset, &data[..n]) {
-        Ok(())
-    } else {
-        Err(E_INVALIDARG)
+    // When the host refuses a view during intense mapping, give it time
+    // to make room before surfacing the failed write.
+    for attempt in 0..=12 {
+        if super::xmem::write_physical(pages, offset, &data[..n]) {
+            return Ok(());
+        }
+        if attempt < 12 {
+            std::thread::sleep(std::time::Duration::from_millis(2u64 << attempt.min(6)));
+        }
     }
+    tracing::warn!(
+        offset,
+        len,
+        pages = pages.len(),
+        "dstorage: writing the destination pages failed"
+    );
+    Err(E_INVALIDARG)
+}
+
+fn read_list(list: *const usize, count: usize, pages: &mut Vec<usize>) {
+    pages.clear();
+    // SAFETY: the submitted request provides one addressable entry per
+    // destination page for its lifetime. Reload entries from title memory.
+    pages.extend((0..count).map(|i| unsafe { list.add(i).read_volatile() }));
 }
 
 /// Slots by the 2020 order, which the argument shapes at the
@@ -1545,7 +1626,64 @@ mod tests {
     }
 
     #[test]
-    fn half_a_queue_submits_itself() {
+    fn half_a_queue_waits_for_the_submit() {
+        use crate::modules::xmem;
+        // Two pages the title owns: the one its list still names from
+        // earlier, and the one it maps for this batch when it submits.
+        let mut pages = [0usize; 2];
+        let mut n = 2;
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()),
+            1
+        );
+        let [stale, right] = pages;
+        let plain = pattern(64);
+        let mut list = [stale];
+        let (queue, array) = (new_queue(1), status_array(1));
+        // More than half of the queue's 128.
+        for i in 0..100 {
+            let mut r = request(
+                PAGE_DESTINATION | MEMORY_SOURCE,
+                list.as_mut_ptr().cast(),
+                plain.len(),
+                plain.as_ptr().cast(),
+                0,
+                plain.len(),
+            );
+            r.page_offset = i * 64;
+            enqueue(queue, &r);
+        }
+        // Inspect the lane before filling the list, so a regression to
+        // half-submit cannot race a worker against the test's list write.
+        // SAFETY: queue is a live Instance<Queue> returned by new_queue.
+        let id = unsafe { &*queue.cast::<Instance<Queue>>() }.state.id;
+        let waiting = scheduler().unwrap().lock().lanes[&id].unsubmitted.len();
+        if waiting != 100 {
+            void(queue, 0x40);
+            panic!("streaming started before submit");
+        }
+        list[0] = right;
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        let bytes = |page: usize| -> Vec<u8> {
+            xmem::page_window(&[page], 0, 6400)
+                .unwrap()
+                .bytes()
+                .to_vec()
+        };
+        assert_eq!(list[0], right);
+        assert!(
+            bytes(stale).iter().all(|&b| b == 0),
+            "stale page was written"
+        );
+        assert_eq!(bytes(right), plain.repeat(100));
+        assert_eq!(xmem::XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        void(queue, 0x40);
+    }
+
+    #[test]
+    fn a_full_queue_submits_itself() {
         let (_dir, file) = file_with(&pattern(64));
         let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
             call(factory(), 0x50);
@@ -1559,11 +1697,19 @@ mod tests {
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
         let array = status_array(1);
-        let mut out = [0u8; 16];
-        enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
-        enqueue_status(queue, array, 0); // the second of four: no submit needed
+        let mut outs = [[0u8; 16]; 4];
+        for out in &mut outs[..2] {
+            enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
+        }
+        enqueue_status(queue, array, 0);
+        assert_eq!(result(array, 0), E_PENDING, "three of four: not submitted");
+        // One more than fits: would wait for good.
+        for out in &mut outs[2..] {
+            enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
+        }
         assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(out, pattern(64)[8..24]);
+        void(queue, 0x40);
+        assert!(outs[..2].iter().all(|out| out[..] == pattern(64)[8..24]));
     }
 
     /// Lanes without workers: what `start` picks, and when statuses land.
@@ -1617,56 +1763,38 @@ mod tests {
     }
 
     #[test]
-    fn staging_bounds_compressed_bytes_in_flight() {
+    fn unbuffered_reads_can_run_beside_compressed_requests() {
         let mut l = lanes(100);
         l.lanes.insert(0, Lane::new(0, 64).unwrap());
         read(&mut l, 0, ZLIB, 60);
+        read(&mut l, 0, 0, 1000);
         read(&mut l, 0, ZLIB, 60);
         l.submit(0);
         let first = l.start().unwrap();
         assert_eq!(first.staging, 60);
-        assert!(l.start().is_none(), "60 + 60 > 100");
+        let raw = l.start().unwrap();
+        assert_eq!(raw.staging, 0);
+        assert!(l.start().is_none(), "60 + 60 exceeds the staging limit");
         l.finish(&first, None);
         let second = l.start().unwrap();
         assert_eq!(second.staging, 60);
-        // A plain file read into a title address copies in from a side
-        // buffer, so it is charged too and does not fit beside the
-        // compressed one.
-        read(&mut l, 0, 0, 1000);
-        l.submit(0);
-        assert!(l.start().is_none(), "60 + 1000 > 100");
         l.finish(&second, None);
-        // Alone, a request larger than the buffer still runs, holding what
-        // it allocates, and nothing starts beside it.
-        let plain = l.start().unwrap();
-        assert_eq!(plain.staging, 1000);
-        read(&mut l, 0, ZLIB, 10);
-        l.submit(0);
-        assert!(l.start().is_none(), "1000 is already over the budget");
-        l.finish(&plain, None);
+        l.finish(&raw, None);
         assert_eq!(l.staged, 0);
-        assert_eq!(l.start().unwrap().staging, 10);
     }
 
-    /// A plain read charges its side buffer, which is capped at one chunk,
-    /// so reads far larger than the staging buffer still run together.
     #[test]
-    fn staging_charges_a_bouncing_plain_read_its_chunk_bound() {
-        let mut l = lanes(4 << 20);
+    fn one_large_staged_request_can_run_by_itself() {
+        let mut l = lanes(100);
         l.lanes.insert(0, Lane::new(0, 64).unwrap());
-        let huge = (BOUNCE_CHUNK * 8) as u32;
-        read(&mut l, 0, 0, huge);
-        read(&mut l, 0, 0, huge);
-        read(&mut l, 0, 0, 1024); // smaller than the bound: charged in full
+        read(&mut l, 0, PAGE_DESTINATION, 256);
+        read(&mut l, 0, ZLIB, 16);
         l.submit(0);
-        let jobs: Vec<Job> = (0..3).map(|_| l.start().unwrap()).collect();
-        let charged: Vec<u64> = jobs.iter().map(|j| j.staging).collect();
-        let chunk = BOUNCE_CHUNK as u64;
-        assert_eq!(charged, [chunk, chunk, 1024], "the bound, then the size");
-        assert_eq!(l.staged, 2 * chunk + 1024);
-        assert!(l.staged <= l.staging, "16 MiB of reads in a 4 MiB buffer");
-        jobs.iter().for_each(|job| l.finish(job, None));
-        assert_eq!(l.staged, 0, "every finish releases its charge");
+        let large = l.start().unwrap();
+        assert_eq!(large.staging, 256);
+        assert!(l.start().is_none());
+        l.finish(&large, None);
+        assert_eq!(l.start().unwrap().staging, 16);
     }
 
     /// What a request buffers is what it is charged: a memory source is
@@ -1676,7 +1804,7 @@ mod tests {
     fn staging_charges_only_what_a_request_buffers() {
         let mut l = lanes(STAGING);
         l.lanes.insert(0, Lane::new(0, 64).unwrap());
-        let big = (BOUNCE_CHUNK * 4) as u32;
+        let big = 4 << 20;
         read(&mut l, 0, MEMORY_SOURCE, big);
         read(&mut l, 0, ZLIB | MEMORY_SOURCE, big);
         read(&mut l, 0, PAGE_DESTINATION | MEMORY_SOURCE, big);
@@ -1877,12 +2005,12 @@ mod tests {
         assert!(out == data);
     }
 
-    /// A plain read longer than the side buffer is read and copied in a
-    /// chunk at a time, from the right offsets and including a short last
-    /// chunk; one that runs off the end still fails as a single read does.
+    /// A large read at a non-zero offset arrives whole. A later read past
+    /// EOF preserves the bytes actually read and reports failure.
     #[test]
-    fn a_plain_read_longer_than_the_bounce_chunk_arrives_whole() {
-        let data = pattern(2 * BOUNCE_CHUNK + 4321);
+    fn a_large_plain_read_arrives_whole_and_reports_eof() {
+        const MIB: usize = 1 << 20;
+        let data = pattern(2 * MIB + 4321);
         let (_dir, file) = file_with(&data);
         let (queue, array) = (new_queue(0), status_array(2));
         let mut out = vec![0u8; data.len() - 77];
@@ -1894,11 +2022,11 @@ mod tests {
         enqueue_status(queue, array, 0);
         void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);
-        assert!(out == data[77..], "every chunk from its own offset");
+        assert!(out == data[77..], "bytes at the requested offset");
 
-        let mut past = vec![0u8; BOUNCE_CHUNK + 16];
+        let mut past = vec![0u8; MIB + 16];
         let len = past.len();
-        let offset = (data.len() - BOUNCE_CHUNK) as u64;
+        let offset = (data.len() - MIB) as u64;
         enqueue(
             queue,
             &request(0, past.as_mut_ptr().cast(), len, file, offset, len),
@@ -1906,6 +2034,8 @@ mod tests {
         enqueue_status(queue, array, 1);
         void(queue, 0x30);
         assert_eq!(wait(array, 1), END_OF_FILE);
+        assert_eq!(&past[..MIB], &data[data.len() - MIB..]);
+        assert_eq!(&past[MIB..], &[0; 16]);
         void(queue, 0x40);
     }
 
@@ -2003,12 +2133,12 @@ mod tests {
             );
             pages
         };
-        let (a, b) = (allocate(3), allocate(1));
+        let (a, b, c) = (allocate(3), allocate(2), allocate(1));
         let plain = pattern(2 * PAGE + 100);
         let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
         // One allocation's pages in order (one window), then pages of two
         // (through a buffer), both from 50 bytes into the first.
-        let mut destinations = [a.clone(), vec![a[0], a[1], b[0]]];
+        let mut destinations = [a.clone(), vec![b[0], b[1], c[0]]];
         let (queue, array) = (new_queue(1), status_array(1));
         for pages in &mut destinations {
             let mut r = request(
@@ -2048,7 +2178,154 @@ mod tests {
             );
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
-        assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+        assert_eq!(xmem::XMemFreePhysicalPages(2, b.as_ptr()), 1);
+        assert_eq!(xmem::XMemFreePhysicalPages(1, c.as_ptr()), 1);
+    }
+
+    #[test]
+    fn a_list_that_changes_during_the_write_has_its_new_pages_written() {
+        use crate::modules::xmem;
+        let mut pages = [0usize; 4];
+        let mut n = 4;
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()),
+            1
+        );
+        // In place (consecutive pages) and through a buffer.
+        for old in [[pages[0], pages[1]], [pages[1], pages[0]]] {
+            let new = [pages[3], pages[2]];
+            let mut list = old;
+            let at = list.as_mut_ptr();
+            let len = PAGE + 100;
+            let r = request(PAGE_DESTINATION, at.cast(), len, std::ptr::null(), 0, len);
+            let mut runs = 0;
+            let written = into_destination(&r, len, |out| {
+                runs += 1;
+                out.fill(0xa5);
+                // SAFETY: our own list.
+                unsafe { at.cast::<[usize; 2]>().write_volatile(new) };
+                Ok(out.len())
+            });
+            assert_eq!((written, runs), (Ok(()), 2));
+            assert!(
+                xmem::page_window(&new[..1], 0, PAGE)
+                    .unwrap()
+                    .bytes()
+                    .iter()
+                    .all(|&b| b == 0xa5)
+            );
+            assert!(
+                xmem::page_window(&new[1..], 0, 100)
+                    .unwrap()
+                    .bytes()
+                    .iter()
+                    .all(|&b| b == 0xa5)
+            );
+            for page in new {
+                xmem::page_window(&[page], 0, PAGE).unwrap().bytes().fill(0);
+            }
+        }
+        assert_eq!(xmem::XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn out_of_order_writes_do_not_complete_an_earlier_status() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64).unwrap());
+        let array = status_array(2).cast::<Instance<StatusArray>>();
+        let mut buffers = [[0u8; 4]; 2];
+        let input = [[11u8; 4], [22u8; 4]];
+        let lane = l.lanes.get_mut(&0).unwrap();
+        for (i, (buffer, data)) in buffers.iter_mut().zip(input.iter()).enumerate() {
+            lane.unsubmitted.push(Command::Read(request(
+                MEMORY_SOURCE,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                data.as_ptr().cast(),
+                0,
+                data.len(),
+            )));
+            enqueue_test_status(lane, array, i as u32);
+        }
+        l.submit(0);
+        let first = l.start().unwrap();
+        let second = l.start().unwrap();
+        assert_eq!(execute(&second.request), Ok(()));
+        l.finish(&second, None);
+        assert_eq!(buffers, [[0; 4], [22; 4]]);
+        assert_eq!(result(array.cast(), 0), E_PENDING);
+        assert_eq!(result(array.cast(), 1), E_PENDING);
+        assert_eq!(execute(&first.request), Ok(()));
+        l.finish(&first, None);
+        assert_eq!(buffers, input);
+        assert_eq!(result(array.cast(), 0), S_OK);
+        assert_eq!(result(array.cast(), 1), S_OK);
+        assert_eq!(release(array), 0);
+    }
+
+    fn enqueue_test_status(lane: &mut Lane, array: Array, index: u32) {
+        let status = Status { array, index };
+        add_ref_instance(array);
+        status.entry().store(E_PENDING, Ordering::Release);
+        lane.unsubmitted.push(Command::Status(status));
+    }
+
+    #[test]
+    fn zlib_inflate_handles_short_exact_empty_and_bad_streams() {
+        let compress = |plain: &[u8]| miniz_oxide::deflate::compress_to_vec_zlib(plain, 6);
+        let plain = pattern(65_537);
+        let packed = compress(&plain);
+
+        // Exact fit.
+        let mut exact = vec![0u8; plain.len()];
+        assert_eq!(inflate(&packed, &mut exact), Ok(plain.len()));
+        assert_eq!(exact, plain);
+
+        // Short stream into a larger buffer passes and returns bytes written;
+        // guard bytes outside the slice passed to `inflate` stay untouched.
+        let mut larger = vec![0xAA; plain.len() + 64];
+        assert_eq!(
+            inflate(&packed, &mut larger[..plain.len() + 32]),
+            Ok(plain.len())
+        );
+        assert_eq!(&larger[..plain.len()], &plain[..]);
+        assert!(larger[plain.len() + 32..].iter().all(|&b| b == 0xAA));
+
+        // Empty valid stream passes for empty or non-empty destinations.
+        let empty = compress(&[]);
+        assert_eq!(inflate(&empty, &mut []), Ok(0));
+        let mut scratch = [0x55u8; 4];
+        assert_eq!(inflate(&empty, &mut scratch), Ok(0));
+
+        // Oversized stream (destination too small, including empty) fails.
+        let mut small = vec![0u8; plain.len() - 1];
+        assert_eq!(inflate(&packed, &mut small), Err(INVALID_DATA));
+        assert_eq!(inflate(&packed, &mut []), Err(INVALID_DATA));
+
+        // Truncated stream (missing trailer or payload bytes) fails.
+        let mut out = vec![0u8; plain.len()];
+        assert_eq!(
+            inflate(&packed[..packed.len() - 1], &mut out),
+            Err(INVALID_DATA)
+        );
+        assert_eq!(
+            inflate(&packed[..packed.len() / 2], &mut out),
+            Err(INVALID_DATA)
+        );
+        assert_eq!(inflate(&[], &mut out), Err(INVALID_DATA));
+
+        // Corrupt Adler-32 trailer fails.
+        let mut bad_adler = packed.clone();
+        *bad_adler.last_mut().unwrap() ^= 1;
+        assert_eq!(inflate(&bad_adler, &mut out), Err(INVALID_DATA));
+
+        // Corrupt header/payload fails, and subsequent valid inflate on the
+        // same thread still succeeds (verifies thread-local state reset).
+        let mut bad_body = packed.clone();
+        bad_body[2] ^= 0xFF;
+        assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
+        assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
+        assert_eq!(out, plain);
     }
 
     /// A title releasing once too often: the count stays 0 and nothing is

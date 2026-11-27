@@ -1,3 +1,5 @@
+//! Synthetic console memory instructions exercise descriptor and address provenance.
+
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -144,10 +146,9 @@ fn shared_sum_with_two_dynamic_terms_stays_opaque() {
 }
 
 #[test]
-fn spill_table_loads_survive_branches_mov64_and_constant_offsets() {
-    // Mixed compute layout: s2 holds a root constant, s20 holds a spilled
-    // descriptor table (user_data 20 -> dword 4 = byte offset 0x10 of spill
-    // table in s[0:1]).
+fn spill_table_loads_survive_branch_targets_and_keep_the_root_slot() {
+    // s2 holds a root constant. A second constant starts the spill table;
+    // its descriptor table is dword 4 of the spill table (user-data index 20).
     let layout = [
         RootParam {
             root: RootType::Constants,
@@ -156,6 +157,14 @@ fn spill_table_loads_survive_branches_mov64_and_constant_offsets() {
             base_register: 0,
             user_data: 2,
             slot: 0,
+        },
+        RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 16,
+            slot: 2,
         },
         RootParam {
             root: RootType::Table,
@@ -167,14 +176,14 @@ fn spill_table_loads_survive_branches_mov64_and_constant_offsets() {
         },
     ];
     let words = [
-        0xBE84_0400u32, // s_mov_b64 s[4:5], s[0:1]
-        0x8004_8804,    // s_add_u32 s4, s4, 8
-        0x8205_8005,    // s_addc_u32 s5, s5, 0
-        0xBF06_8002,    // s_cmp_eq_u32 s2, 0
-        0xBF85_0001,    // s_cbranch_scc1 +1 (skip s_nop so s_load sits at a branch target)
-        0xBF80_0000,    // s_nop 0
+        0xBE84_0300u32, // s_mov_b32 s4, s0
+        0x8705_FF01,    // s_and_b32 s5, s1, 0xff (40-bit address)
+        0xff,
+        0xBF06_8002, // s_cmp_eq_u32 s2, 0
+        0xBF85_0001, // s_cbranch_scc1 +1 (skip s_nop so s_load sits at a branch target)
+        0xBF80_0000, // s_nop 0
         0xF400_0202,
-        0xFA00_0008, // s_load_dword s8, s[4:5], 0x8 (total 0x10 -> s20)
+        0xFA00_0010, // s_load_dword s8, s[4:5], 0x10 (spilled s20)
         0xBE89_0380, // s_mov_b32 s9, 0
         0xF408_0404,
         0xFA00_0000, // s_load_dwordx4 s[16:19], s[8:9], null
@@ -187,17 +196,20 @@ fn spill_table_loads_survive_branches_mov64_and_constant_offsets() {
         vgprs: 4,
         layout: layout.to_vec(),
         used: vec![],
-        io: victory_shader::native::StageIo::None,
-        code: code.clone(),
+        io: victory_shader::native::StageIo::Cs(victory_shader::native::ComputeIo {
+            rsrc2: 3 << 1,
+            threads: [1, 1, 1],
+        }),
+        code,
     };
-    assert!(native.uses_spill_table());
-    let program = ir::build_with(&code, false, 4, native.uses_spill_table()).unwrap();
+    assert!(victory_shader::spill::is_spilled(&native));
+    let program = victory_shader::spill::build(&native).unwrap();
     let tracked = track(&program, &layout, HwStage::Cs, None).unwrap();
     assert_eq!(tracked.scalar.len(), 1);
     assert_eq!(
         tracked.scalar[0].1,
         Address {
-            param: 1,
+            param: 2,
             offset: 0,
             dynamic: None,
         }
@@ -275,6 +287,11 @@ fn address_arithmetic_addk_sub_const_lshl_add_and_vadd3_trace() {
         0x9882_0809, // s_lshl4_add_u32 s2, s9, s8 -> dynamic table address
         LOAD,
         0xFA00_0000,
+        0xD76D_0001,
+        0x0281_2008, // v_add3_u32 v1, s8, 16, 32
+        0x7E04_0501, // v_readfirstlane_b32 s2, v1
+        LOAD,
+        0xFA00_0000,
         END,
     ]);
     let dyn_lshl = program.blocks[0].insts[7].write(Reg::S(2)).unwrap();
@@ -304,6 +321,14 @@ fn address_arithmetic_addk_sub_const_lshl_add_and_vadd3_trace() {
                     param: 0,
                     offset: 0,
                     dynamic: Some(dyn_lshl),
+                }
+            ),
+            (
+                (0, 11),
+                Address {
+                    param: 0,
+                    offset: 0x30,
+                    dynamic: None,
                 }
             ),
         ]
@@ -434,13 +459,32 @@ fn first_lane_reads_from_smem_uniform_valu_and_waterfall_table_address_trace() {
         END,
     ]);
     let tracked = track(&uniform_smem, &[TABLE], HwStage::Ps, None).unwrap();
-    assert_eq!(tracked.scalar.len(), 2);
-    assert_eq!(tracked.scalar[1].1.param, 0);
-    assert!(tracked.scalar[1].1.dynamic.is_some());
+    let index = uniform_smem.blocks[0].insts[4].write(Reg::V(1)).unwrap();
+    assert_eq!(
+        tracked.scalar,
+        [
+            (
+                (0, 2),
+                Address {
+                    param: 0,
+                    offset: 0,
+                    dynamic: None,
+                }
+            ),
+            (
+                (0, 8),
+                Address {
+                    param: 0,
+                    offset: 0,
+                    dynamic: Some(index),
+                }
+            ),
+        ]
+    );
 
     // 2. Per-lane table address in VGPRs read with v_readfirstlane_b32 inside
     //    a proven single-block waterfall loop that loads and uses a buffer descriptor.
-    let waterfall_addr = build(&[
+    let words = [
         0x3402_0085, // 0x00: v_lshlrev_b32 v1, 5, v0 (per-lane!)
         0x4A04_0208, // 0x04: v_add_nc_u32 v2, s8, v1 (per-lane table address)
         0xBE85_0380, // 0x08: s_mov_b32 s5, 0
@@ -458,14 +502,39 @@ fn first_lane_reads_from_smem_uniform_valu_and_waterfall_table_address_trace() {
         0xBF89_FFF6, // 0x34: s_cbranch_execnz -> 0x10 (-10 dwords from 0x38)
         0xBEFE_0314, // 0x38: s_mov_b32 exec_lo, s20
         END,
-    ]);
+    ];
+    let waterfall_addr = build(&words);
     let st = victory_shader::structure::structure(&waterfall_addr).unwrap();
     let tracked = track(&waterfall_addr, &[TABLE], HwStage::Ps, Some(&st)).unwrap();
     assert_eq!(tracked.scalar.len(), 1);
-    assert_eq!(tracked.scalar[0].1.param, 0);
-    assert_eq!(tracked.waterfall.reads.len(), 1);
-    assert_eq!(tracked.waterfall.compares.len(), 1);
-    assert_eq!(tracked.waterfall.loads, vec![tracked.scalar[0].0]);
+    let (load, address) = tracked.scalar[0];
+    let insts = &waterfall_addr.blocks[load.0].insts;
+    let read = insts[0].write(Reg::S(4)).unwrap();
+    let index = waterfall_addr.blocks[0].insts[0].write(Reg::V(1)).unwrap();
+    assert_eq!(
+        address,
+        Address {
+            param: 0,
+            offset: 0,
+            dynamic: Some(index),
+        }
+    );
+    assert_eq!(tracked.waterfall.reads, [read]);
+    assert_eq!(tracked.waterfall.compares, [(load.0, 1)]);
+    assert_eq!(tracked.waterfall.loads, [load]);
+
+    // A self-loop is not enough: the compared vector must be the address read.
+    let mut wrong_compare = words;
+    wrong_compare[6] = 0x0002_0204; // v_cmp_eq_u32_e64 s21, s4, v1
+    let wrong_compare = build(&wrong_compare);
+    let st = victory_shader::structure::structure(&wrong_compare).unwrap();
+    assert_eq!(
+        track(&wrong_compare, &[TABLE], HwStage::Ps, Some(&st)).unwrap_err(),
+        ShaderError::Unsupported {
+            offset: 0x20,
+            what: "an address read from the first lane of a per-lane value",
+        }
+    );
 
     // 3. Same per-lane table address read OUTSIDE a waterfall loop stays refused.
     let non_waterfall = build(&[

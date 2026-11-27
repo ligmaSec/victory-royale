@@ -11,6 +11,7 @@
 // collide at link time.
 #[cfg(test)]
 pub mod agility;
+pub mod bvh;
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
@@ -19,6 +20,7 @@ pub mod io;
 pub mod ir;
 pub mod native;
 pub mod resource;
+pub mod spill;
 pub mod structure;
 
 pub use dxbc::{Container, DispatchInfo, FourCC, Fspx, Part, inspect_fspx};

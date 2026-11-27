@@ -20,7 +20,7 @@ use windows_sys::Win32::Foundation::{
 };
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, M128A, RtlLookupFunctionEntry,
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, RtlLookupFunctionEntry,
     RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
 };
 use windows_sys::Win32::System::LibraryLoader::{
@@ -182,6 +182,19 @@ fn windows_version() -> String {
     format!("{major}.{minor}.{build}")
 }
 
+/// A scope that holds runtime-owned, write-watched title views open while
+/// the callback tries to write them. Other memory protections are unchanged.
+pub type ConsoleWriteScope = fn(usize, usize, &mut dyn FnMut());
+
+static CONSOLE_WRITES: std::sync::OnceLock<ConsoleWriteScope> = std::sync::OnceLock::new();
+
+/// Installs the exception handlers and lets CLZERO cooperate with the
+/// runtime's write-watched mappings. Call once before running title code.
+pub fn report_crashes_with_console_writes(scope: ConsoleWriteScope) {
+    let _ = CONSOLE_WRITES.set(scope);
+    report_crashes();
+}
+
 /// Installs the handlers; call once before running title code.
 pub fn report_crashes() {
     unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
@@ -194,9 +207,9 @@ pub fn report_crashes() {
             && std::env::var_os("VICTORY_CRASH_BREAKPOINTS").is_some_and(|value| value == "1"),
         Ordering::Relaxed,
     );
-    // SAFETY: registers handlers that only read the exception they are
-    // given; the title's own filter, once it sets one, takes the place of
-    // ours and calls `report_unhandled` first.
+    // SAFETY: the handlers use the system-provided exception context to resume
+    // known console instructions or report the fault. The title can replace our
+    // filter but calls `report_unhandled` ahead of its own.
     unsafe {
         AddVectoredExceptionHandler(0, Some(handler));
         SetUnhandledExceptionFilter(Some(filter));
@@ -213,103 +226,246 @@ const FATAL: [i32; 6] = [
     EXCEPTION_BREAKPOINT,
 ];
 
-/// Console CPUs are Zen 2: titles use AMD-only instructions Intel CPUs
-/// lack. Does their job instead: `clzero` (`0f 01 fc`) zeroes the 64-byte
-/// line at `rax` (see [`clzero`] for the loops around it);
-/// `monitorx`/`mwaitx` (`0f 01 fa`/`fb`) are wait hints, so a spin loop
-/// around them works with mwaitx as a yield; `rdpru` (`0f 01 fd`) reads
-/// MPERF (`ecx` 0) or APERF (1), cycles at the nominal and the actual
-/// frequency, and gets the time-stamp counter for both: a core that never
-/// changes frequency.
+/// Handles only a continuable illegal instruction at the saved RIP. The
+/// instruction bytes are decoded before any state is changed.
+///
+/// # Safety
+/// The system supplied the record and context for the faulting thread.
 unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
-    // SAFETY: the system passes valid exception pointers; the faulting
-    // instruction's bytes are readable, as the CPU just fetched them.
-    unsafe {
-        let record = &*(*info).ExceptionRecord;
-        let context = &mut *(*info).ContextRecord;
-        if record.ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION {
-            return false;
-        }
-        let code = context.Rip as *const u8;
-        match code.cast::<[u8; 3]>().read_unaligned() {
-            [0x0f, 0x01, 0xfc] => return clzero(context),
-            [0x0f, 0x01, 0xfa] => {}
-            [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
-            [0x0f, 0x01, 0xfd] => {
-                // Flags are left as they are: a Zen 3 changes none, for
-                // known counters or not (measured in user mode).
-                let known = context.Rcx as u32 <= 1;
-                let cycles = if known {
-                    std::arch::x86_64::_rdtsc()
+    use crate::console_insn_decode::{Instruction, decode, extrq, insertq};
+
+    // SAFETY: the system passes valid exception pointers.
+    let (record, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
+    if record.ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION
+        || record.ExceptionFlags & 1 != 0 // EXCEPTION_NONCONTINUABLE
+        || record.ExceptionAddress as u64 != context.Rip
+    {
+        return false;
+    }
+    // SAFETY: the faulting instruction's code is still mapped while its thread is running.
+    let Some((bytes, start, end)) = (unsafe { instruction_window(context.Rip as usize) }) else {
+        return false;
+    };
+    let code = &bytes[7..end];
+    let Some((instruction, len)) = decode(code) else {
+        return false;
+    };
+    let single_step = context.EFlags & 0x100 != 0;
+    match instruction {
+        Instruction::Clwb => {
+            // shortcut: a write-back hint has no work on the coherent host. It
+            // does not reproduce write-back ordering for persistent memory.
+            if !single_step && let Some(pass) = clwb_loop(code) {
+                let limit = *gpr(context, pass.limit);
+                let base = gpr(context, pass.base);
+                let lines = if *base > limit {
+                    1
                 } else {
-                    0
+                    (limit - *base) / 64 + 1
                 };
-                context.Rax = cycles & 0xffff_ffff;
-                context.Rdx = cycles >> 32;
-            }
-            _ => {
-                // Only bytes inside the faulting instruction's page are read: the next page may
-                // not be mapped.
-                let room = 0x1000 - (context.Rip as usize & 0xfff);
-                let mut bytes = [0u8; 32];
-                let n = room.min(bytes.len());
-                std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
-                if let Some(pass) = clwb_loop(&bytes[..n]) {
-                    // A whole write-back loop in one exception (see `clwb_loop`).
-                    let limit = *gpr(context, pass.limit);
-                    let base = gpr(context, pass.base);
-                    *base = if *base <= limit {
-                        base.wrapping_add(((limit - *base) / 64 + 1) * 64)
-                    } else {
-                        base.wrapping_add(64)
-                    };
-                    let flags = cmp_flags(*base, limit);
-                    context.EFlags = context.EFlags & !CMP_FLAGS | flags;
+                if let Some(next) = lines
+                    .checked_mul(64)
+                    .and_then(|bytes| base.checked_add(bytes))
+                {
+                    *base = next;
+                    set_compare_flags(context, next, limit);
                     context.Rip += pass.len as u64;
                     return true;
                 }
-                if let Some(len) = clwb_len(&bytes[..n]) {
-                    // A write-back hint: the PC's memory is coherent, so it has nothing to do.
-                    context.Rip += len as u64;
-                    return true;
-                }
-                let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {
-                    return false;
-                };
-                context.Rip += len as u64;
-                return true;
             }
         }
-        context.Rip += 3;
+        Instruction::Clzero { address32 } => {
+            if !single_step && len == 3 {
+                // SAFETY: CLZERO's line belongs to the title for the duration
+                // of the operation, as with the real instruction.
+                if let Some(skip) = unsafe { clzero_loop(context, &bytes[start..7], code) } {
+                    context.Rip += skip;
+                    return true;
+                }
+            }
+            let at = if address32 {
+                context.Rax as u32 as u64
+            } else {
+                context.Rax
+            };
+            // SAFETY: as above; even a single line is checked for a writable mapping.
+            if unsafe { zero_lines(at, 1) } == 0 {
+                return false;
+            }
+        }
+        Instruction::Rdpru => {
+            // shortcut: TSC replaces both model-specific cycle counters;
+            // the host does not expose the title's actual frequency changes.
+            let cycles = if context.Rcx as u32 <= 1 {
+                // SAFETY: x86-64 hosts support RDTSC.
+                unsafe { std::arch::x86_64::_rdtsc() }
+            } else {
+                0
+            };
+            context.Rax = cycles & 0xffff_ffff;
+            context.Rdx = cycles >> 32;
+        }
+        // shortcut: the waiter checks its condition again after the hint;
+        // no timed wait or hardware address monitor is installed.
+        Instruction::Monitorx => {}
+        Instruction::Mwaitx => std::thread::yield_now(),
+        Instruction::Rdpid(reg) => {
+            // SAFETY: a plain query of the calling thread's current processor.
+            let cpu = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessorNumber() };
+            *gpr(context, reg) = u64::from(cpu);
+        }
+        Instruction::Extrq { dst, src, len, idx } => {
+            // SAFETY: the exception context contains the faulting thread's saved XMM registers.
+            let xmm = unsafe { &mut context.Anonymous.FltSave.XmmRegisters };
+            let (len, idx) = src.map_or((len, idx), |src| {
+                let value = xmm[usize::from(src)].Low;
+                (value as u8, (value >> 8) as u8)
+            });
+            let dst = &mut xmm[usize::from(dst)];
+            dst.Low = extrq(dst.Low, len, idx);
+            dst.High = 0; // Undefined on the console.
+        }
+        Instruction::Insertq {
+            dst,
+            src,
+            register_fields,
+            len,
+            idx,
+        } => {
+            // SAFETY: the exception context contains the faulting thread's saved XMM registers.
+            let xmm = unsafe { &mut context.Anonymous.FltSave.XmmRegisters };
+            let src = xmm[usize::from(src)];
+            let (len, idx) = if register_fields {
+                (src.High as u8, (src.High >> 8) as u8)
+            } else {
+                (len, idx)
+            };
+            let dst = &mut xmm[usize::from(dst)];
+            dst.Low = insertq(dst.Low, src.Low, len, idx);
+            dst.High = 0; // Undefined on the console.
+        }
     }
+    context.Rip += len as u64;
     true
 }
 
-/// `clwb m8` (`66 [rex] 0f ae /6`, a memory operand), which Intel CPUs before
-/// Ice Lake lack: its length, or `None` for any other instruction.
+#[cfg(test)]
 fn clwb_len(code: &[u8]) -> Option<usize> {
-    let at = if *code.get(1)? & 0xf0 == 0x40 { 2 } else { 1 };
-    if *code.first()? != 0x66 || code.get(at..at + 2)? != [0x0f, 0xae] {
-        return None;
+    use crate::console_insn_decode::{Instruction, decode};
+    match decode(code)? {
+        (Instruction::Clwb, len) => Some(len),
+        _ => None,
     }
-    let modrm = *code.get(at + 2)?;
-    let (mode, rm) = (modrm >> 6, modrm & 7);
-    if mode == 3 || (modrm >> 3) & 7 != 6 {
-        return None;
-    }
-    let mut len = at + 3;
-    let mut base = rm;
-    if rm == 4 {
-        base = *code.get(len)? & 7;
-        len += 1;
-    }
-    len += match mode {
-        0 if rm == 5 || (rm == 4 && base == 5) => 4,
-        1 => 1,
-        2 => 4,
-        _ => 0,
+}
+
+fn committed_region(at: usize) -> Option<(std::ops::Range<usize>, u32)> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
     };
-    (len <= code.len()).then_some(len)
+
+    // SAFETY: all zeros are valid for this output structure.
+    let mut region: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: queries page metadata and writes only to the sized output buffer.
+    let found = unsafe { VirtualQuery(at as *const _, &mut region, size_of_val(&region)) };
+    if found == 0
+        || region.State != MEM_COMMIT
+        || region.Protect & (PAGE_GUARD | PAGE_NOACCESS) != 0
+    {
+        return None;
+    }
+    let start = region.BaseAddress as usize;
+    let end = start.checked_add(region.RegionSize)?;
+    (start <= at && at < end).then_some((start..end, region.Protect))
+}
+
+/// Captures up to seven preceding bytes for the alternate CLZERO loop and up
+/// to one x86 instruction from RIP. A managed page boundary can truncate it.
+///
+/// # Safety
+/// RIP is in mapped code in use by the faulting thread; that code stays mapped.
+unsafe fn instruction_window(at: usize) -> Option<([u8; 22], usize, usize)> {
+    let (region, _) = committed_region(at)?;
+    let before = (at - region.start).min(7);
+    let after = (region.end - at).min(15);
+    let mut bytes = [0; 22];
+    let start = 7 - before;
+    let mut end = 7 + after;
+    // SAFETY: this range is within one committed, readable part of mapped code.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (at - before) as *const u8,
+            bytes.as_mut_ptr().add(start),
+            before + after,
+        );
+    }
+    if after < 15
+        && let Some((next, _)) = committed_region(region.end)
+    {
+        let n = (next.end - region.end).min(15 - after);
+        // SAFETY: the following part of the fetched instruction is also committed and readable.
+        unsafe {
+            std::ptr::copy_nonoverlapping(region.end as *const u8, bytes.as_mut_ptr().add(end), n);
+        }
+        end += n;
+    }
+    Some((bytes, start, end))
+}
+
+/// Fill at most 16 MiB at a time. Split across regions by resuming the
+/// loop at the next line; only the runtime can open a write-watched view.
+///
+/// # Safety
+/// The supplied lines are the title's to zero and may not be concurrently
+/// unmapped or reprotected by it, the same lifetime contract as native CLZERO.
+unsafe fn zero_lines(at: u64, lines: u64) -> u64 {
+    use windows_sys::Win32::System::Memory::{
+        PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_READONLY, PAGE_READWRITE,
+        PAGE_WRITECOPY,
+    };
+
+    let start = at as usize & !63;
+    let Some((region, protect)) = committed_region(start) else {
+        return 0;
+    };
+    let writable = |protect| {
+        matches!(
+            protect & 0xff,
+            PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+        )
+    };
+    let limit = (lines.min((16 << 20) / 64) * 64) as usize;
+    let span = (region.end - start).min(limit) & !63;
+    if span == 0 {
+        return 0;
+    }
+    let write = |len| {
+        // SAFETY: each caller checked the span and keeps the mapping available.
+        unsafe { std::ptr::write_bytes(start as *mut u8, 0, len) };
+    };
+    if writable(protect) {
+        write(span);
+        return (span / 64) as u64;
+    }
+    let mut written = 0;
+    if protect & 0xff == PAGE_READONLY
+        && let Some(scope) = CONSOLE_WRITES.get()
+    {
+        scope(start, span, &mut || {
+            if written == 0
+                && let Some((region, protect)) = committed_region(start)
+                && writable(protect)
+            {
+                let len = (region.end - start).min(span) & !63;
+                write(len);
+                written = len / 64;
+            }
+        });
+    }
+    written as u64
+}
+
+fn set_compare_flags(context: &mut CONTEXT, a: u64, b: u64) {
+    context.EFlags = (context.EFlags & !CMP_FLAGS) | cmp_flags(a, b);
 }
 
 /// A `clwb` write-back loop as the title's compilers build it, one cache line a
@@ -370,61 +526,22 @@ fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
     (limit != base).then_some(ClwbLoop { base, limit, len })
 }
 
-/// `clzero` at `context.Rip`. An exception costs about a microsecond and
-/// titles clear tens of kilobytes at a time, a line per pass, so the two
-/// loops compilers build around the instruction are done whole in one
-/// exception, leaving registers and flags as their last pass would (`a`
-/// and `b` any registers but `rax`):
-///
-/// ```text
-/// top: clzero                 top: mov rax, a
-///      add rax, 0x40               add a, 0x40
-///      cmp rax, b                  clzero
-///      jb  top                     cmp a, b
-///                                  jb  top
-/// ```
-///
-/// Anything else around it is one line and the next instruction.
+/// Zeroes one bounded chunk of either compiler-generated CLZERO loop.
+/// Returns the advance in RIP (zero if the loop still has lines to clear),
+/// or None if the loop cannot be batched and must be stepped normally.
 ///
 /// # Safety
-/// `context` is the state of a thread that faulted at a `clzero`; the
-/// lines its registers name are the title's to zero.
-unsafe fn clzero(context: &mut CONTEXT) -> bool {
-    // SAFETY: (every use) a line the title asked to zero.
-    let zero = |rax: u64| unsafe { ((rax & !63) as *mut u8).write_bytes(0, 64) };
-    let at = context.Rip as usize;
-    // The loops' other instructions are read only where that stays inside
-    // the faulting instruction's page (the next one may not be mapped).
-    let page = at & 0xfff;
-    if page + 12 <= 0x1000 {
-        // SAFETY: inside the page the CPU fetched the instruction from.
-        let after = unsafe { &*((at + 3) as *const [u8; 9]) };
-        if let [0x48, 0x83, 0xc0, 0x40, cmp @ .., 0x72, 0xf4] = after
+/// CLZERO's operands are the title's lines to zero, kept mapped by the caller.
+unsafe fn clzero_loop(context: &mut CONTEXT, before: &[u8], code: &[u8]) -> Option<u64> {
+    let start = context.Rax;
+    let first_next = start.checked_add(64)?;
+    let (offset, limit_reg, pointer_reg) =
+        if let Some([0x48, 0x83, 0xc0, 0x40, cmp @ .., 0x72, 0xf4]) = code.get(3..12)
             && let Some((0, limit)) = compare_registers(cmp)
             && limit != 0
         {
-            let limit = *gpr(context, limit);
-            loop {
-                zero(context.Rax);
-                context.Rax = context.Rax.wrapping_add(0x40);
-                if context.Rax >= limit {
-                    break;
-                }
-            }
-            context.EFlags = context.EFlags & !CMP_FLAGS | cmp_flags(context.Rax, limit);
-            context.Rip += 12;
-            return true;
-        }
-    }
-    if (7..=0x1000 - 8).contains(&page) {
-        // SAFETY: inside the page the CPU fetched the instruction from.
-        let (before, after) = unsafe {
-            (
-                &*((at - 7) as *const [u8; 7]),
-                &*((at + 3) as *const [u8; 5]),
-            )
-        };
-        if let [
+            (12, limit, None)
+        } else if let [
             rex @ (0x48 | 0x4c),
             0x89,
             load,
@@ -432,8 +549,8 @@ unsafe fn clzero(context: &mut CONTEXT) -> bool {
             0x83,
             add,
             0x40,
-        ] = *before
-            && let [cmp @ .., 0x72, 0xf1] = after
+        ] = before
+            && let Some([cmp @ .., 0x72, 0xf1]) = code.get(3..8)
             && let Some((a, b)) = compare_registers(cmp)
             && load & 0xc7 == 0xc0
             && a == (load >> 3) & 7 | (rex & 4) << 1
@@ -441,25 +558,52 @@ unsafe fn clzero(context: &mut CONTEXT) -> bool {
             && a == add & 7 | (add_rex & 1) << 3
             && a != 0
             && b != 0
+            && a != b
+            && *gpr(context, a) == first_next
         {
-            let limit = *gpr(context, b);
-            loop {
-                zero(context.Rax);
-                let next = *gpr(context, a);
-                if next >= limit {
-                    break;
-                }
-                context.Rax = next;
-                *gpr(context, a) = next.wrapping_add(0x40);
-            }
-            context.EFlags = context.EFlags & !CMP_FLAGS | cmp_flags(*gpr(context, a), limit);
-            context.Rip += 8;
-            return true;
-        }
+            (8, b, Some(a))
+        } else {
+            return None;
+        };
+    let limit = *gpr(context, limit_reg);
+    let wanted = limit.saturating_sub(start).div_ceil(64).max(1);
+    // Don't batch a loop whose final pointer would wrap around the address space.
+    start.checked_add(wanted.checked_mul(64)?)?;
+    // SAFETY: same contract as native CLZERO, and each span is checked before it is written.
+    let done = unsafe { zero_lines(start, wanted) };
+    if done == 0 {
+        return None;
     }
-    zero(context.Rax);
-    context.Rip += 3;
-    true
+    let next = start + done * 64;
+    set_compare_flags(context, next, limit);
+    if let Some(reg) = pointer_reg {
+        if done < wanted {
+            let resumed = next + 64;
+            *gpr(context, reg) = resumed;
+            context.Rax = next;
+            // The ADD in the next iteration precedes the next CLZERO and
+            // leaves status flags. The following CMP supersedes them, but
+            // a fault at CLZERO must see the ADD's flags, not that CMP's.
+            context.EFlags = (context.EFlags & !CMP_FLAGS) | add_flags(next, 64);
+        } else {
+            *gpr(context, reg) = next;
+            context.Rax = next - 64;
+        }
+    } else {
+        context.Rax = next;
+    }
+    Some(if done == wanted { offset } else { 0 })
+}
+
+/// The flags of ADD at the partial CLZERO loop's point of resumption.
+fn add_flags(a: u64, b: u64) -> u32 {
+    let (r, carry) = a.overflowing_add(b);
+    u32::from(carry)
+        | u32::from((r as u8).count_ones().is_multiple_of(2)) << 2
+        | (((a ^ b ^ r) >> 4) as u32 & 1) << 4
+        | u32::from(r == 0) << 6
+        | ((r >> 63) as u32) << 7
+        | ((((a ^ r) & (b ^ r)) >> 63) as u32) << 11
 }
 
 /// `cmp rm, reg` between 64-bit registers (`REX.W 39 /r`): (`rm`, `reg`).
@@ -506,59 +650,6 @@ fn cmp_flags(a: u64, b: u64) -> u32 {
         | ((((a ^ b) & (a ^ r)) >> 63) as u32) << 11
 }
 const CMP_FLAGS: u32 = 0x8d5;
-
-/// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
-/// the saved XMM registers; returns the instruction's length.
-unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
-    // SAFETY: the caller's code bytes are readable up to the instruction's end.
-    let b = |i: usize| unsafe { code.add(i).read() };
-    let prefix = b(0);
-    let (rex, at) = if b(1) & 0xf0 == 0x40 {
-        (b(1), 2)
-    } else {
-        (0, 1)
-    };
-    if !matches!(prefix, 0x66 | 0xf2) || b(at) != 0x0f || !matches!(b(at + 1), 0x78 | 0x79) {
-        return None;
-    }
-    let modrm = b(at + 2);
-    if modrm >> 6 != 3 {
-        return None;
-    }
-    let dst = usize::from((modrm >> 3) & 7 | (rex & 4) << 1);
-    let src = usize::from(modrm & 7 | (rex & 1) << 3);
-    let immediate = b(at + 1) == 0x78;
-    let (fields, len) = if immediate {
-        ((b(at + 3), b(at + 4)), at + 5)
-    } else {
-        // extrq reads its fields from src's low half, insertq from its high.
-        let f = if prefix == 0x66 {
-            xmm[src].Low
-        } else {
-            xmm[src].High as u64
-        };
-        ((f as u8, (f >> 8) as u8), at + 3)
-    };
-    let (n, at_bit) = (u32::from(fields.0 & 63), u32::from(fields.1 & 63));
-    let bits = if n == 0 { 64 } else { n };
-    let mask = if bits == 64 {
-        u64::MAX
-    } else {
-        (1u64 << bits) - 1
-    };
-    if prefix == 0x66 {
-        // extrq: register form takes its fields from src, works on dst.
-        if immediate && (modrm >> 3) & 7 != 0 {
-            return None;
-        }
-        let target = if immediate { src } else { dst };
-        xmm[target].Low = (xmm[target].Low >> at_bit) & mask;
-    } else {
-        let value = (xmm[src].Low & mask) << at_bit;
-        xmm[dst].Low = xmm[dst].Low & !(mask << at_bit) | value;
-    }
-    Some(len)
-}
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers.
@@ -873,6 +964,7 @@ fn memory_at(address: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::System::Diagnostics::Debug::M128A;
     use windows_sys::Win32::System::Diagnostics::Debug::{
         EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
     };
@@ -1124,6 +1216,7 @@ mod tests {
                 end.copy_from_nonoverlapping(insn.as_ptr(), insn.len());
                 let mut record: EXCEPTION_RECORD = std::mem::zeroed();
                 record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+                record.ExceptionAddress = end.cast();
                 let mut context: CONTEXT = std::mem::zeroed();
                 context.Rip = end as u64;
                 let mut pointers = EXCEPTION_POINTERS {
@@ -1278,15 +1371,16 @@ mod tests {
     fn emulate_as(exception: i32, code: &[u8], rax: u64, xmm: &mut [M128A; 16]) -> Option<u64> {
         // `int3` after the instruction, so that a decoder that reads too
         // far sees no valid bytes.
-        let mut bytes = [0xcc_u8; 16];
-        bytes[..code.len()].copy_from_slice(code);
-        let start = bytes.as_ptr() as u64;
+        let mut bytes = [0xcc_u8; 22];
+        bytes[7..7 + code.len()].copy_from_slice(code);
+        let start = bytes[7..].as_ptr() as u64;
         // SAFETY: a zeroed record and context are valid; the emulation
         // reads only `bytes` and writes only `context` (and memory at
         // `rax` for clzero, which the caller owns).
         unsafe {
             let mut record: EXCEPTION_RECORD = std::mem::zeroed();
             record.ExceptionCode = exception;
+            record.ExceptionAddress = start as *mut _;
             let mut context: CONTEXT = std::mem::zeroed();
             context.Rip = start;
             context.Rax = rax;
@@ -1338,6 +1432,7 @@ mod tests {
         unsafe {
             let mut record: EXCEPTION_RECORD = std::mem::zeroed();
             record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+            record.ExceptionAddress = context.Rip as *mut _;
             let mut pointers = EXCEPTION_POINTERS {
                 ExceptionRecord: &mut record,
                 ContextRecord: context,
@@ -1416,6 +1511,57 @@ mod tests {
         assert!(emulate_in(&code, 0, &mut context));
         assert_eq!(context.Rip, 3);
         assert_eq!(zeroed(&mem), [false, true, false]);
+    }
+
+    #[test]
+    fn a_clzero_loop_stops_at_a_nonwritable_region() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        let code = [
+            0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4,
+        ];
+        // SAFETY: a private two-page allocation, with the last part changed
+        // to read-only before giving it to the simulated faulting context.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                0x2000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!page.is_null());
+            let start = page.add(0x1000 - 64);
+            start.write_bytes(0xff, 128);
+            let mut old = 0;
+            assert_ne!(
+                VirtualProtect(start.add(64).cast(), 0x1000, PAGE_READONLY, &mut old),
+                0
+            );
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rax = start as u64 + 5;
+            context.R10 = context.Rax + 128;
+            assert!(emulate_in(&code, 0, &mut context));
+            assert_eq!((context.Rip, context.Rax), (0, start as u64 + 69));
+            assert_eq!(
+                context.EFlags & CMP_FLAGS,
+                native_compare(context.Rax, context.R10)
+            );
+            assert!(!emulate_in(&code, 0, &mut context));
+            assert!(
+                std::slice::from_raw_parts(start, 64)
+                    .iter()
+                    .all(|&byte| byte == 0)
+            );
+            assert!(
+                std::slice::from_raw_parts(start.add(64), 64)
+                    .iter()
+                    .all(|&byte| byte == 0xff)
+            );
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
     }
 
     #[test]

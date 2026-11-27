@@ -457,17 +457,22 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError};
-    victory_gpu::kernel_will_write(buffer as usize, len as usize);
+    use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, SetLastError};
+    let writing = victory_gpu::kernel_writing(buffer as usize, len as usize);
     let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
     );
-    // shortcut: an overlapped read still pending keeps its blocks open for
-    // good (they are copied at every refresh), since its end is not seen.
-    // SAFETY: reads the thread's last error, which stays as it is.
-    if !(done == 0 && !overlapped.is_null() && unsafe { GetLastError() } == ERROR_IO_PENDING) {
-        victory_gpu::kernel_wrote(buffer as usize, len as usize);
+    // SAFETY: captures the error from ReadFile before changing any guards.
+    let error = unsafe { GetLastError() };
+    // shortcut: a pending read's destination stays open until remapped;
+    // we do not observe completion through the title's I/O mechanisms.
+    if done == 0 && !overlapped.is_null() && error == ERROR_IO_PENDING {
+        writing.pending();
+    } else {
+        drop(writing);
     }
+    // SAFETY: restore the result the title would have seen from the host.
+    unsafe { SetLastError(error) };
     done
 }
 
@@ -499,11 +504,10 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
         let want = (total - done).min(CHUNK);
         let n = read_chunk(beside.as_mut_ptr(), 1, want, stream);
         if n > 0 {
-            victory_gpu::kernel_will_write(buffer as usize + done, n);
+            let _writing = victory_gpu::kernel_writing(buffer as usize + done, n);
             // SAFETY: the caller's buffer holds `size * count` bytes, and
             // `done + n` is at most that.
             unsafe { std::ptr::copy_nonoverlapping(beside.as_ptr(), buffer.add(done), n) };
-            victory_gpu::kernel_wrote(buffer as usize + done, n);
             done += n;
         }
         if n < want {

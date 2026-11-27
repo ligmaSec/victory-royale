@@ -1,3 +1,5 @@
+//! Map and bind a console title, then start it with the chosen host policy.
+
 use std::path::Path;
 
 #[cfg(windows)]
@@ -64,6 +66,7 @@ pub fn run(
         .inspect_err(|error| IoOperation::ReadImage.failed(error, started))
         .with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
+    drop(original);
     let hash = prepared.original_hash.to_hex();
     let title_dir = exe.parent().unwrap_or(Path::new("."));
     match victory_game::identify(&hash) {
@@ -79,6 +82,7 @@ pub fn run(
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
+    drop(prepared);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     println!(
@@ -179,7 +183,8 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
-    victory_loader::report_crashes();
+    configure_render_profile(&image, console)?;
+    victory_loader::report_crashes_with_console_writes(victory_hle::with_console_write);
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
@@ -201,6 +206,108 @@ pub fn run(
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
+    Ok(())
+}
+
+/// Pacing remains title-controlled unless the user asks to override it.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq)]
+struct FrameOverride {
+    interval: std::time::Duration,
+    title_fps: Option<u32>,
+}
+
+#[cfg(any(windows, test))]
+fn frame_override(
+    interval: Option<&str>,
+    title_rate: Option<&str>,
+) -> Result<Option<FrameOverride>> {
+    let Some(spec) = interval else {
+        anyhow::ensure!(
+            title_rate.is_none(),
+            "VICTORY_TITLE_FPS requires VICTORY_FRAME_INTERVAL_MS"
+        );
+        return Ok(None);
+    };
+    let ms = spec
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|ms| (0.0..=1000.0).contains(ms))
+        .ok_or_else(|| {
+            anyhow::anyhow!("VICTORY_FRAME_INTERVAL_MS expects 0 to 1000 milliseconds")
+        })?;
+    let title_fps = match title_rate.map(str::trim) {
+        Some("off") => None,
+        Some(rate) => Some(
+            rate.parse::<u32>()
+                .ok()
+                .filter(|&rate| rate <= 1000)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("VICTORY_TITLE_FPS expects 0 to 1000 frames per second or off")
+                })?,
+        ),
+        None if ms == 0.0 => Some(0),
+        None => Some(((1000.0 / ms).round() as u32).clamp(1, 1000)),
+    };
+    Ok(Some(FrameOverride {
+        interval: std::time::Duration::from_nanos((ms * 1_000_000.0).round() as u64),
+        title_fps,
+    }))
+}
+
+#[cfg(any(windows, test))]
+fn render_scale(spec: &str) -> Result<f32> {
+    spec.trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|scale| (0.5..=2.0 / 3.0).contains(scale))
+        .ok_or_else(|| {
+            anyhow::anyhow!("VICTORY_RENDER_SCALE expects 0.5 through the stock scale (two thirds)")
+        })
+}
+
+#[cfg(windows)]
+fn configure_render_profile(image: &victory_loader::LoadedImage, console: Console) -> Result<()> {
+    let setting = |name| match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading {name}")),
+    };
+    for name in ["VICTORY_OUTPUT", "VICTORY_FFX_SCALE", "VICTORY_UPSCALER"] {
+        anyhow::ensure!(
+            std::env::var_os(name).is_none(),
+            "{name} is not supported; use the title's output and upscaler settings"
+        );
+    }
+    let scale = setting("VICTORY_RENDER_SCALE")?
+        .as_deref()
+        .map(render_scale)
+        .transpose()?;
+    anyhow::ensure!(
+        scale.is_none() || matches!(console, Console::SeriesX),
+        "VICTORY_RENDER_SCALE is only supported on the Series X profile"
+    );
+    let frame = frame_override(
+        setting("VICTORY_FRAME_INTERVAL_MS")?.as_deref(),
+        setting("VICTORY_TITLE_FPS")?.as_deref(),
+    )?;
+    if scale.is_some() || frame.is_some() {
+        let fps = frame.as_ref().and_then(|frame| frame.title_fps);
+        // SAFETY: all images have been bound, and the executable has not been entered yet.
+        unsafe { image.apply_render_profile(scale, fps) }?;
+        if let Some(frame) = frame {
+            victory_hle::set_frame_interval_override(frame.interval);
+            let title_rate = fps.map_or_else(|| "unchanged".to_owned(), |fps| fps.to_string());
+            println!(
+                "frame override {:?}, title rate {title_rate}",
+                frame.interval
+            );
+        }
+        if let Some(scale) = scale {
+            println!("render scale   {scale}");
+        }
+    }
     Ok(())
 }
 
@@ -562,5 +669,55 @@ mod cpu_check_tests {
     #[test]
     fn skip_env_var_bypasses_missing_avx2() {
         assert!(check_cpu_features_with(false, Some("1")).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod render_profile_tests {
+    use super::{FrameOverride, frame_override, render_scale};
+    use std::time::Duration;
+
+    #[test]
+    fn no_frame_override_by_default() {
+        assert_eq!(frame_override(None, None).unwrap(), None);
+        assert!(frame_override(None, Some("60")).is_err());
+    }
+
+    #[test]
+    fn pacing_and_title_rate_can_be_set_together_or_independently() {
+        assert_eq!(
+            frame_override(Some("16.667"), None).unwrap(),
+            Some(FrameOverride {
+                interval: Duration::from_micros(16_667),
+                title_fps: Some(60)
+            })
+        );
+        assert_eq!(
+            frame_override(Some("0"), Some("120")).unwrap(),
+            Some(FrameOverride {
+                interval: Duration::ZERO,
+                title_fps: Some(120)
+            })
+        );
+        assert_eq!(
+            frame_override(Some("0"), Some("off"))
+                .unwrap()
+                .unwrap()
+                .title_fps,
+            None
+        );
+        assert!(frame_override(Some("16"), Some("ten")).is_err());
+        for spec in ["NaN", "-1", "inf", "1001"] {
+            assert!(frame_override(Some(spec), None).is_err());
+        }
+    }
+
+    #[test]
+    fn render_scale_cannot_request_more_than_stock_capacity() {
+        assert_eq!(render_scale("0.5").unwrap(), 0.5);
+        assert_eq!(render_scale("0.6666667").unwrap(), 2.0 / 3.0);
+        for spec in ["1.0", "NaN", "0.49"] {
+            assert!(render_scale(spec).is_err());
+        }
     }
 }

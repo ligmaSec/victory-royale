@@ -29,6 +29,7 @@ pub struct LoadedImage {
     module: HMODULE,
     path: PathBuf,
     info: ImageInfo,
+    original_hash: blake3::Hash,
 }
 
 // SAFETY: HMODULE is a process-wide handle (the base address); using it from
@@ -80,6 +81,7 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         module,
         path,
         info: prepared.info.clone(),
+        original_hash: prepared.original_hash,
     };
     // A DLL indexes its TLS properly; only an exe assumes index 0.
     if !loaded.info.is_dll() {
@@ -311,6 +313,23 @@ impl LoadedImage {
     /// Parsed from the original image (imports, entry point, TLS callbacks).
     pub fn info(&self) -> &ImageInfo {
         &self.info
+    }
+
+    /// Applies explicit render settings only to the exact supported build.
+    ///
+    /// # Safety
+    /// Imports must already be bound, and no title code may run during this call.
+    pub unsafe fn apply_render_profile(&self, scale: Option<f32>, fps: Option<u32>) -> Result<()> {
+        // SAFETY: this handle identifies the image whose original hash was recorded at load.
+        unsafe {
+            crate::render_profile::apply(
+                self.base(),
+                self.info.size_of_image as usize,
+                self.original_hash,
+                scale,
+                fps,
+            )
+        }
     }
 
     /// Address of an export of the image, if it has one by that name.

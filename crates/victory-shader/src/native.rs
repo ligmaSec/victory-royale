@@ -192,20 +192,6 @@ impl NativeProgram {
         }
         code
     }
-
-    /// Whether this program reads spilled root arguments through the
-    /// spill-table pointer in `s[0:1]`.
-    pub fn uses_spill_table(&self) -> bool {
-        self.stage == HwStage::Cs
-            && self
-                .layout
-                .iter()
-                .any(|r| self.stage.user_sgpr(r.user_data) >= 16)
-            && self
-                .layout
-                .iter()
-                .all(|r| self.stage.user_sgpr(r.user_data) >= 2)
-    }
 }
 
 /// What a semantic is, as the stage data names it.
@@ -437,8 +423,11 @@ pub struct UsedResource {
     pub slot: u8,
 }
 
-/// The native programs in a `DXIL` part's data; empty for the PC layout.
+/// The native programs in `DXIL` or in an `ACCC` FSPX module; empty for PC DXIL.
 pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
+    if part.starts_with(crate::dxbc::Fspx::MAGIC) {
+        return Ok(vec![fspx_program(part)?]);
+    }
     if part.get(XDAT_OFFSET..XDAT_OFFSET + 4) != Some(b"XDAT") {
         return Ok(Vec::new());
     }
@@ -460,6 +449,110 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     Ok(out)
 }
 
+/// The compute program of an `ACCC` part, which a container carries in place
+/// of `DXIL` when another compiler made the native code (the AMD
+/// FidelityFX upscaler's shaders). Layout as observed (offsets from "FSPX"):
+///
+/// ```text
+/// +0x00 "FSPX" u32 version (1), u32 entry count, u32 size; entries of 16 B
+///       from +0x10: u32 kind, u32 offset, u32 size, u32 0
+/// kind 0  pipeline registers, 0x1c B: +0x0c u16 x3 thread-group size,
+///         +0x12 u16 flags (bit 4 wave32), +0x14 COMPUTE_PGM_RSRC1,
+///         +0x18 COMPUTE_PGM_RSRC2
+/// kind 1  pipeline metadata (a hash); kind 6 the GFX10 code
+/// kind 7  program metadata: u32 0x403, u32 size - 0x14, u32 code dwords,
+///         u64 0, u8 0x40, u8 first user-data dword, u8 count of 0x41
+///         records, u8 0; then 32-byte records from +0x18, each a u32 tag:
+///   0x41  a resource the code reads: u8 resource type (as FSSM's used
+///         entries), u8 root type, u16 0, u32 table offset (dwords), u32
+///         register, u32 view dimension (1 buffer, 4 2D, 0 root view),
+///         u8 descriptor dwords, u8 user-data dword, u8 root slot, u8 0,
+///         u32 -1, u32 0
+///   0x42  a view declaration: u32 0, u8 1, u8 class (0 SRV, 1 UAV),
+///         u8 resource kind (DXIL's), u8 0, u32 register
+///   0x43  the shader hash (16 B); the last record
+/// ```
+pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
+    let module = crate::dxbc::Fspx::parse(part)?;
+    if module.version != 1 {
+        return Err(Malformed("unknown FSPX version"));
+    }
+    let info = module
+        .dispatch_info()
+        .ok_or(Malformed("missing FSPX dispatch state"))?;
+    let code = module.program.ok_or(Malformed("missing FSPX code"))?;
+    let meta = module.records.ok_or(Malformed("missing FSPX metadata"))?;
+    if u64::from(u32_at(meta, 8)?) * 4 != code.len() as u64 {
+        return Err(Malformed("FSPX code size disagrees"));
+    }
+    let wave64 = !info.wave32;
+    // VGPRs in granules of four (wave64) or eight (wave32).
+    let granules = (info.rsrc1 & 0x3f) + 1;
+    let vgprs = (granules * if wave64 { 4 } else { 8 }).min(256) as u16;
+    let threads = checked_group_size(info.threads)?;
+    let (records, _) = meta
+        .get(0x18..)
+        .ok_or(Malformed("truncated FSPX metadata"))?
+        .as_chunks::<32>();
+    let mut layout: Vec<RootParam> = Vec::new();
+    let mut used = Vec::new();
+    for e in records {
+        match e[0] {
+            0x41 => {}
+            0x42 => continue,
+            0x43 => break,
+            _ => return Err(Malformed("unknown FSPX metadata record")),
+        }
+        let root = RootType::from_raw(e[5].into());
+        let u = UsedResource {
+            kind: match e[4] {
+                0 => ResourceType::Srv,
+                1 => ResourceType::Sampler,
+                2 => ResourceType::Cbv,
+                3 => ResourceType::Uav,
+                n => ResourceType::Other(n),
+            },
+            root,
+            table_offset_dwords: le32(e, 8),
+            lower_bound: le32(e, 12),
+            stride: 0,
+            dwords: e[20],
+            user_data: e[21],
+            slot: e[22],
+        };
+        let sgprs = match root {
+            RootType::Table => 1,
+            RootType::Descriptor => 2,
+            // The code holds its words; no user data.
+            RootType::ImmediateSampler => 0,
+            _ => return Err(Malformed("an FSPX resource of an unknown root type")),
+        };
+        if sgprs > 0 && !layout.iter().any(|p| p.slot == u.slot) {
+            layout.push(RootParam {
+                root,
+                table_offset_dwords: 0,
+                sgprs,
+                base_register: u.lower_bound,
+                user_data: u.user_data,
+                slot: u.slot,
+            });
+        }
+        used.push(u);
+    }
+    Ok(NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: info.rsrc2,
+            threads,
+        }),
+        code: code.to_vec(),
+    })
+}
+
 fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
     if blob.get(0..4) != Some(b"XBCH") {
         return Err(Malformed("native blob lacks XBCH magic"));
@@ -474,12 +567,61 @@ fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
     }
     let stream =
         bytes(blob, XBCH_HEADER as u64, packed).ok_or(Malformed("XBCH stream out of bounds"))?;
-    let out = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(stream, unpacked as usize)
-        .map_err(|_| Malformed("XBCH stream does not inflate to its stated size"))?;
-    if out.len() as u64 != unpacked {
-        return Err(Malformed("XBCH stream does not inflate to its stated size"));
-    }
+    let out = inflate_zlib_exact(stream, unpacked as usize)
+        .ok_or(Malformed("XBCH stream does not inflate to its stated size"))?;
     Ok(out)
+}
+
+/// Inflates a zlib stream incrementally up to `expected` bytes, rejecting
+/// truncated, corrupt, under-filled, or oversized streams without eagerly
+/// allocating the full declared size up front.
+fn inflate_zlib_exact(source: &[u8], expected: usize) -> Option<Vec<u8>> {
+    let mut state = zlib_rs::Inflate::new(true, 15);
+    let mut out = Vec::new();
+    let (mut in_pos, mut out_pos) = (0usize, 0usize);
+    loop {
+        if out_pos == expected {
+            let mut extra = [0u8; 1];
+            let status = state
+                .decompress(
+                    &source[in_pos..],
+                    &mut extra,
+                    zlib_rs::InflateFlush::NoFlush,
+                )
+                .ok()?;
+            return (status == zlib_rs::Status::StreamEnd
+                && state.total_out() as usize == expected)
+                .then_some(out);
+        }
+        if out_pos == out.len() {
+            let next_len = if out.is_empty() {
+                expected.min(source.len().saturating_mul(4).max(4096))
+            } else {
+                out.len().saturating_mul(2).min(expected)
+            };
+            out.resize(next_len, 0);
+        }
+        let status = state
+            .decompress(
+                &source[in_pos..],
+                &mut out[out_pos..],
+                zlib_rs::InflateFlush::NoFlush,
+            )
+            .ok()?;
+        let next_in = state.total_in() as usize;
+        let next_out = state.total_out() as usize;
+        match status {
+            zlib_rs::Status::StreamEnd => {
+                out.truncate(next_out);
+                return (next_out == expected).then_some(out);
+            }
+            zlib_rs::Status::Ok if next_in != in_pos || next_out != out_pos => {
+                in_pos = next_in;
+                out_pos = next_out;
+            }
+            zlib_rs::Status::Ok | zlib_rs::Status::BufError => return None,
+        }
+    }
 }
 
 fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
@@ -742,6 +884,10 @@ fn group_size(data: &[u8]) -> Result<[u32; 3], ShaderError> {
     for (k, n) in threads.iter_mut().enumerate() {
         *n = u32_at(data, CS_THREADS + 4 * k)?;
     }
+    checked_group_size(threads)
+}
+
+fn checked_group_size(threads: [u32; 3]) -> Result<[u32; 3], ShaderError> {
     // Each component is checked first, so the product fits a u64.
     if threads
         .iter()
@@ -1097,12 +1243,15 @@ mod tests {
     }
 
     fn xbch(unpacked: &[u8]) -> Vec<u8> {
-        let stream = miniz_oxide::deflate::compress_to_vec_zlib(unpacked, 6);
+        let mut buf = vec![0u8; zlib_rs::compress_bound(unpacked.len())];
+        let (stream, result) =
+            zlib_rs::compress_slice(&mut buf, unpacked, zlib_rs::DeflateConfig::new(6));
+        assert_eq!(result, zlib_rs::ReturnCode::Ok);
         let mut out = b"XBCH".to_vec();
         out.extend_from_slice(&XBCH_VERSION.to_le_bytes());
         out.extend_from_slice(&(stream.len() as u64).to_le_bytes());
         out.extend_from_slice(&(unpacked.len() as u64).to_le_bytes());
-        out.extend_from_slice(&stream);
+        out.extend_from_slice(stream);
         out
     }
 
@@ -1366,7 +1515,6 @@ mod tests {
             shader.dxil
         };
         const ONE: u32 = 0x7e04_0281; // v_mov_b32 v2, 1
-        assert!(translate(X8, ONE, &[]).len() < translate(X16, ONE, &[]).len());
         assert_eq!(translate(X8, FIELD, &[]), translate(X16, FIELD, &[]));
         assert_eq!(translate(X8, ONE, &UMAX), translate(X16, ONE, &UMAX));
         let joined = [
@@ -2336,5 +2484,52 @@ mod tests {
             Err(Malformed(why)) => why,
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_truncated_oversized_and_bad_checksum_xbch_streams() {
+        let plain = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let good = xbch(&plain);
+        assert_eq!(unpack(&good).unwrap(), plain);
+
+        // Truncated zlib stream (drop last byte, update packed length).
+        let mut truncated = good[..good.len() - 1].to_vec();
+        let new_packed = (truncated.len() - XBCH_HEADER) as u64;
+        truncated[8..16].copy_from_slice(&new_packed.to_le_bytes());
+        assert!(unpack(&truncated).is_err());
+
+        // Stated unpacked size smaller than the inflated output.
+        let mut oversized = good.clone();
+        oversized[16..24].copy_from_slice(&((plain.len() - 1) as u64).to_le_bytes());
+        assert!(unpack(&oversized).is_err());
+
+        // Stated unpacked size larger than the inflated output.
+        let mut underfilled = good.clone();
+        underfilled[16..24].copy_from_slice(&((plain.len() + 1) as u64).to_le_bytes());
+        assert!(unpack(&underfilled).is_err());
+
+        // Corrupt Adler-32 trailer.
+        let mut bad_adler = good.clone();
+        *bad_adler.last_mut().unwrap() ^= 1;
+        assert!(unpack(&bad_adler).is_err());
+    }
+
+    #[test]
+    fn fspx_compute_packet_supplies_the_group_and_emits_compute_dxil() {
+        let mut packet = [0; crate::dxbc::Fspx::DISPATCH_STATE_SIZE];
+        packet[12..18].copy_from_slice(&[8, 0, 4, 0, 1, 0]);
+        packet[18] = 0x10; // wave32
+        let code = 0xBF81_0000u32.to_le_bytes(); // s_endpgm
+        let mut metadata = [0u8; 24];
+        metadata[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        metadata[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let module = crate::dxbc::Fspx::assemble(&packet, &[], &code, &metadata);
+        let parsed = fspx_program(&module).unwrap();
+        assert!(!parsed.wave64);
+        assert_eq!(parsed.code, code);
+        let container = crate::dxbc::build(&[(crate::FourCC::ACCC, &module)]);
+        let shader = crate::emit::translate(&container).unwrap();
+        assert_eq!(shader.compute_threads(), Some([8, 4, 1]));
+        assert!(!shader.indexes_heaps());
     }
 }

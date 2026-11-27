@@ -34,15 +34,23 @@ done
 
 python3 - "$release" <<'PYTHON'
 from pathlib import Path
+import re
 import sys
 
 release = Path(sys.argv[1])
 binary = (release / "victory.exe").read_bytes()
-for name in ("argument_clamp", "rect_expand", "rect_rewrite"):
-    shaders = list(release.glob(f"build/victory-gpu-*/out/{name}.dxil"))
-    if len(shaders) != 1 or not shaders[0].is_file() or shaders[0].resolve() != shaders[0]:
-        raise SystemExit(f"Expected one regular GPU helper: {name}")
-    data = shaders[0].read_bytes()
+manifests = list(release.glob("build/victory-gpu-*/out/package-hlsl.list"))
+if len(manifests) != 1 or not manifests[0].is_file() or manifests[0].resolve() != manifests[0]:
+    raise SystemExit("Expected one regular embedded GPU helper manifest")
+manifest = manifests[0]
+names = manifest.read_text(encoding="ascii").splitlines()
+if not names or len(names) != len(set(names)) or any(not re.fullmatch(r"[a-z0-9_]+", n) for n in names):
+    raise SystemExit("Invalid embedded GPU helper manifest")
+for name in names:
+    shader = manifest.with_name(f"{name}.dxil")
+    if not shader.is_file() or shader.resolve() != shader:
+        raise SystemExit(f"Expected regular GPU helper: {name}")
+    data = shader.read_bytes()
     if not data.startswith(b"DXBC") or data not in binary:
         raise SystemExit(f"Missing embedded GPU helper: {name}")
 PYTHON

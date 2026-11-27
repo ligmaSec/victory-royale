@@ -1314,14 +1314,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
- "miniz_oxide",
  "tempfile",
  "tracing",
+ "victory-core",
  "victory-formats",
  "victory-pipeline",
  "victory-shader",
  "windows",
  "windows-sys",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -1339,6 +1340,7 @@ dependencies = [
  "windows",
  "windows-core",
  "windows-sys",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -1390,11 +1392,11 @@ name = "victory-shader"
 version = "0.1.0"
 dependencies = [
  "memchr",
- "miniz_oxide",
  "tempfile",
  "thiserror",
  "windows",
  "windows-sys",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -1578,6 +1580,12 @@ dependencies = [
  "serde_json",
  "walkdir",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zmij"

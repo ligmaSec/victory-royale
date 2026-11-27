@@ -135,17 +135,8 @@ impl Host {
                 let filter = std::env::var("VICTORY_ADAPTER")
                     .ok()
                     .filter(|s| !s.trim().is_empty());
-                match pick_adapter(filter.as_deref()) {
-                    Ok(adapter) => {
-                        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
-                            .map_err(err)?;
-                    }
-                    Err(e) if filter.is_some() => return Err(e),
-                    Err(_) => {
-                        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)
-                            .map_err(err)?;
-                    }
-                }
+                let adapter = pick_adapter(filter.as_deref())?;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             }
             let device = device.ok_or("no device")?;
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
@@ -202,8 +193,7 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        // Root views by slot: constant buffers (0), then raw buffers read
-        // (1), then raw buffers written (2).
+        // By slot, then kind: 0 CBV, 1 SRV, 2 UAV.
         let mut views: Vec<(u8, u8)> = stages
             .iter()
             .flat_map(|(s, _)| {
@@ -214,41 +204,12 @@ impl Host {
             .collect();
         views.sort_unstable();
         views.dedup();
-        let uav_ranges: Vec<_> = views
-            .iter()
-            .filter(|(_, kind)| *kind == 2)
-            .map(|&(slot, _)| D3D12_DESCRIPTOR_RANGE1 {
-                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
-                NumDescriptors: 1,
-                BaseShaderRegister: u32::from(slot),
-                RegisterSpace: super::ROOT_CBV_SPACE,
-                Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
-                    | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
-                OffsetInDescriptorsFromTableStart: 0,
-            })
-            .collect();
-        let mut uav_ranges = uav_ranges.iter();
         for (slot, kind) in views {
-            // Match the runtime's bounded, single-view UAV table.
-            if kind == 2 {
-                let range = uav_ranges.next().expect("range for each root UAV");
-                params.push(D3D12_ROOT_PARAMETER1 {
-                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
-                            NumDescriptorRanges: 1,
-                            pDescriptorRanges: range,
-                        },
-                    },
-                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-                });
-                continue;
-            }
             params.push(D3D12_ROOT_PARAMETER1 {
-                ParameterType: if kind == 0 {
-                    D3D12_ROOT_PARAMETER_TYPE_CBV
-                } else {
-                    D3D12_ROOT_PARAMETER_TYPE_SRV
+                ParameterType: match kind {
+                    1 => D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    2 => D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    _ => D3D12_ROOT_PARAMETER_TYPE_CBV,
                 },
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
@@ -260,12 +221,24 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        // Older runtimes may not recognize OPTIONS19; that means no support.
+        let aniso_point_mip_supported = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.AnisoFilterWithPointMipSupported.as_bool();
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
                 let [u, v, w] = d.address.map(|a| D3D12_TEXTURE_ADDRESS_MODE(a as i32));
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(d.filter as i32),
+                    Filter: D3D12_FILTER(d.filter_for_host(aniso_point_mip_supported) as i32),
                     AddressU: u,
                     AddressV: v,
                     AddressW: w,
@@ -643,6 +616,7 @@ pub(super) fn position_vs() -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        root_indexed_views: Vec::new(),
     }
 }
 
@@ -736,6 +710,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        root_indexed_views: Vec::new(),
     }
 }
 
@@ -754,6 +729,8 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+    /// A root UAV over a writable buffer, numbered among writable views.
+    Uav(usize),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -1011,7 +988,7 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1190,7 +1167,7 @@ pub enum View<'a> {
     Texture(u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F texture SRV with mip levels, largest first.
     TextureMips(u32, u32, u16, &'a [[f32; 4]]),
-    /// An RGBA32F cube SRV (face size, mip count, texels by face then mip).
+    /// An RGBA32F cube SRV (face size, mip count, texels in D3D subresource order).
     Cube(u32, u16, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
@@ -1200,6 +1177,12 @@ pub enum View<'a> {
     UintTextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
+    /// A typed buffer UAV pre-filled with `data` (`format`, bytes per element).
+    TypedUav {
+        data: &'a [u32],
+        format: DXGI_FORMAT,
+        elem_bytes: u32,
+    },
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
@@ -1366,23 +1349,22 @@ impl Host {
                 at.ptr += i * view_size;
                 match *v {
                     View::Texture(..) | View::TextureMips(..) | View::Cube(..) => {
-                        let (w, h, texels, faces, levels) = match *v {
+                        let (w, h, mut texels, faces, mips) = match *v {
                             View::Texture(w, h, t) => (w, h, t, 1, 1),
-                            View::TextureMips(w, h, levels, t) => (w, h, t, 1, levels),
-                            View::Cube(n, levels, t) => (n, n, t, 6, levels),
+                            View::TextureMips(w, h, mips, t) => (w, h, t, 1, mips),
+                            View::Cube(n, mips, t) => (n, n, t, 6, mips),
                             _ => unreachable!(),
                         };
                         let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
                         desc.DepthOrArraySize = faces as u16;
-                        desc.MipLevels = levels;
+                        desc.MipLevels = mips;
                         let tex = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &desc,
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        let mut start = 0;
-                        for sub in 0..faces * u32::from(levels) {
-                            let mip = sub % u32::from(levels);
+                        for sub in 0..u32::from(mips) * faces {
+                            let mip = sub % u32::from(mips);
                             let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
                             let pitch = (w as usize * 16).next_multiple_of(256);
                             let upload = make(
@@ -1392,10 +1374,10 @@ impl Host {
                             )?;
                             let mut p = std::ptr::null_mut();
                             upload.Map(0, None, Some(&mut p)).map_err(err)?;
-                            let pixels = &texels[start..start + (w * h) as usize];
-                            start += pixels.len();
+                            let (level, rest) = texels.split_at((w * h) as usize);
+                            texels = rest;
                             for y in 0..h as usize {
-                                let row = &pixels[y * w as usize..(y + 1) * w as usize];
+                                let row = &level[y * w as usize..(y + 1) * w as usize];
                                 std::ptr::copy_nonoverlapping(
                                     row.as_ptr().cast::<u8>(),
                                     p.cast::<u8>().add(y * pitch),
@@ -1426,7 +1408,7 @@ impl Host {
                             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                                 TextureCube: D3D12_TEXCUBE_SRV {
-                                    MipLevels: u32::from(levels),
+                                    MipLevels: u32::from(mips),
                                     ..Default::default()
                                 },
                             },
@@ -1465,6 +1447,46 @@ impl Host {
                                 Buffer: D3D12_BUFFER_UAV {
                                     NumElements: elements,
                                     Flags: flags,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        uavs.push((b, None, n, rb));
+                    }
+                    View::TypedUav {
+                        data,
+                        format,
+                        elem_bytes,
+                    } => {
+                        let n = data.len() as u32;
+                        let bytes = u64::from(n) * 4;
+                        let elements = (bytes / u64::from(elem_bytes)) as u32;
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let up = upload(data)?;
+                        list.CopyBufferRegion(&b, 0, &up, 0, bytes);
+                        list.ResourceBarrier(&[transition(
+                            &b,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )]);
+                        keep.push(up);
+                        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: format,
+                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_UAV {
+                                    NumElements: elements,
+                                    Flags: D3D12_BUFFER_UAV_FLAG_NONE,
                                     ..Default::default()
                                 },
                             },
@@ -1603,6 +1625,13 @@ impl Host {
                             list.SetComputeRootConstantBufferView(*param, va);
                         }
                         keep.push(b);
+                    }
+                    Root::Uav(index) => {
+                        let (b, _, _, _) = uavs
+                            .get(*index)
+                            .filter(|(_, size, _, _)| size.is_none())
+                            .ok_or("root UAV does not name a writable buffer")?;
+                        list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
                     }
                 }
             }

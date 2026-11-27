@@ -1,7 +1,7 @@
 //! The PC container around emitted DXIL: feature flags (`SFI0`), the
 //! signatures (`ISG1`, `OSG1`), pipeline state validation (`PSV0`) and the
-//! program (`DXIL`), laid out as validator versions 1.6 and 1.8 lay them out,
-//! plus the container hash that D3D12 checks.
+//! program (`DXIL`), laid out as validator version 1.6 lays them out, plus
+//! the container hash that D3D12 checks.
 
 /// One signature element: one row (D3D12 links stages by semantic).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,32 +25,29 @@ pub(crate) struct SigElement {
 }
 
 impl SigElement {
-    fn system_value(&self) -> Option<(u32, &'static str)> {
+    fn system_value(&self) -> u32 {
         match self.kind {
-            1 => Some((6, "SV_VertexID")),
-            2 => Some((8, "SV_InstanceID")),
-            3 => Some((1, "SV_Position")),
-            4 => Some((4, "SV_RenderTargetArrayIndex")),
-            5 => Some((5, "SV_ViewportArrayIndex")),
-            6 => Some((2, "SV_ClipDistance")),
-            7 => Some((3, "SV_CullDistance")),
-            10 => Some((7, "SV_PrimitiveID")),
-            12 => Some((10, "SV_SampleIndex")),
-            13 => Some((9, "SV_IsFrontFace")),
-            14 => Some((66, "SV_Coverage")),
-            15 => Some((70, "SV_InnerCoverage")),
-            16 => Some((64, "SV_Target")),
-            17 => Some((65, "SV_Depth")),
-            18 => Some((68, "SV_DepthLessEqual")),
-            19 => Some((67, "SV_DepthGreaterEqual")),
-            20 => Some((69, "SV_StencilRef")),
-            30 => Some((25, "SV_CullPrimitive")),
-            _ => None,
+            1 => 6,  // vertex id
+            2 => 8,  // instance id
+            3 => 1,  // position
+            4 => 4,  // render target array index
+            5 => 5,  // viewport array index
+            6 => 2,  // clip distance
+            7 => 3,  // cull distance
+            10 => 7, // primitive id
+            12 => 10,
+            13 => 9, // front face
+            14 => 66,
+            15 => 70,
+            16 => 64, // target
+            17 => 65, // depth
+            18 => 68,
+            19 => 67,
+            20 => 69,
+            28 => 23, // barycentrics
+            30 => 25, // cull primitive
+            _ => 0,
         }
-    }
-
-    pub(super) fn semantic_name(&self) -> &str {
-        self.system_value().map_or(&self.name, |(_, name)| name)
     }
 
     fn sig_comp(&self) -> u32 {
@@ -63,109 +60,7 @@ impl SigElement {
     }
 
     fn mask(&self) -> u8 {
-        ((1u8 << self.cols) - 1) << self.row.map_or(0, |_| self.col)
-    }
-}
-
-/// The console packs elements of different interpolation modes into one
-/// row (a constant front face beside a linear coordinate, say); DXIL needs
-/// one mode per row. Each later mode of a row moves to a free row of its
-/// own, shared by that row's elements of the mode. Code addresses elements
-/// by id and stages link by semantic, so only the signatures change.
-/// Elements without a mode (0) are left where they are.
-pub(crate) fn separate_interpolation(elements: &mut [SigElement]) {
-    let mut next = elements
-        .iter()
-        .filter_map(|e| e.row)
-        .max()
-        .map_or(0, |r| r + 1);
-    // (row, the row's first mode)
-    let mut first: Vec<(u32, u8)> = Vec::new();
-    // ((old row, mode), new row)
-    let mut moved: Vec<((u32, u8), u32)> = Vec::new();
-    for e in elements.iter_mut() {
-        let (Some(row), mode) = (e.row, e.interp) else {
-            continue;
-        };
-        if mode == 0 {
-            continue;
-        }
-        match first.iter().find(|f| f.0 == row) {
-            None => first.push((row, mode)),
-            Some(&(_, m)) if m == mode => {}
-            Some(_) => {
-                let to = match moved.iter().find(|m| m.0 == (row, mode)) {
-                    Some(&(_, to)) => to,
-                    None => {
-                        moved.push(((row, mode), next));
-                        next += 1;
-                        next - 1
-                    }
-                };
-                e.row = Some(to);
-            }
-        }
-    }
-}
-
-/// Input, output and primitive signatures follow the resource and string tables
-/// in PSV version 1 and later. Select the producer's per-vertex output records.
-fn producer_records(mut data: &[u8], stage: u8) -> Option<std::slice::ChunksExact<'_, u8>> {
-    fn take<'a>(data: &mut &'a [u8], bytes: usize) -> Option<&'a [u8]> {
-        let (head, rest) = data.split_at_checked(bytes)?;
-        *data = rest;
-        Some(head)
-    }
-    fn word(data: &mut &[u8]) -> Option<usize> {
-        Some(u32::from_le_bytes(take(data, 4)?.try_into().ok()?) as usize)
-    }
-    let info_size = word(&mut data)?;
-    let info = take(&mut data, info_size)?;
-    if *info.get(24)? != stage {
-        return None;
-    }
-    let inputs = usize::from(*info.get(28)?);
-    let outputs = usize::from(*info.get(29)?);
-    let resources = word(&mut data)?;
-    if resources > 0 {
-        let stride = word(&mut data)?;
-        take(&mut data, resources.checked_mul(stride)?)?;
-    }
-    let names = word(&mut data)?;
-    take(&mut data, names)?;
-    let indices = word(&mut data)?;
-    take(&mut data, indices.checked_mul(4)?)?;
-    let stride = word(&mut data)?;
-    if stride < 16 {
-        return None;
-    }
-    take(&mut data, inputs.checked_mul(stride)?)?;
-    Some(take(&mut data, outputs.checked_mul(stride)?)?.chunks_exact(stride))
-}
-
-/// Preserve declared interpolation for user semantics, including flat floats.
-/// Signature chunks sort by register, while PSV records follow element order.
-pub(super) fn producer_interpolation(data: &[u8], stage: u8, outputs: &mut [SigElement]) {
-    let Some(records) = producer_records(data, stage) else {
-        return;
-    };
-    for record in records {
-        let (rows, start, packing) = (record[8], record[9], record[10]);
-        let (kind, comp, mode) = (record[11], record[12], record[13]);
-        if kind != 0 || packing & 0x40 == 0 || !(1..=7).contains(&mode) {
-            continue;
-        }
-        for e in outputs.iter_mut().filter(|e| {
-            e.kind == 0
-                && e.sig_comp() == u32::from(comp)
-                && e.col == (packing >> 4) & 3
-                && e.cols == packing & 15
-                && e.row.is_some_and(|row| {
-                    (u32::from(start)..u32::from(start) + u32::from(rows)).contains(&row)
-                })
-        }) {
-            e.interp = mode;
-        }
+        ((1u8 << self.cols) - 1) << self.col
     }
 }
 
@@ -177,8 +72,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows stably sorted by register (unallocated last). Elements
-    // sharing a register keep their metadata order, regardless of column.
+    // the rows sorted by register (unallocated last), then name offset.
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -189,24 +83,23 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         match shared {
             Some(j) => offsets.push(offsets[j]),
             None => {
-                let name = e.semantic_name();
                 offsets.push(next);
-                next += name.len() as u32 + 1;
-                names.push(name);
+                next += e.name.len() as u32 + 1;
+                names.push(&e.name);
             }
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| elements[i].row.unwrap_or(u32::MAX));
+    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), offsets[i]));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
-        let used = e.usage << e.row.map_or(0, |_| e.col) & e.mask();
+        let used = e.usage << e.col;
         let rw = if input { used } else { !used & 0xf };
         for v in [
             0,
             offset,
             e.index,
-            e.system_value().map_or(0, |(value, _)| value),
+            e.system_value(),
             e.sig_comp(),
             e.row.unwrap_or(u32::MAX),
         ] {
@@ -222,10 +115,27 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     out
 }
 
+/// The most a mesh shader's outputs may take, in bytes (D3D12).
+pub(crate) const MESH_OUTPUT_LIMIT: u64 = 32 * 1024;
+
+/// A mesh shader's output size as the DXIL validator measures it against
+/// [`MESH_OUTPUT_LIMIT`]: 4 bytes per component of every vertex element
+/// and primitive element, times the maxima rounded up to multiples of 32.
+pub(crate) fn mesh_output_bytes(
+    vertex: &[SigElement],
+    primitive: &[SigElement],
+    max_vertices: u32,
+    max_primitives: u32,
+) -> u64 {
+    let scalars = |els: &[SigElement]| els.iter().map(|e| u64::from(e.cols)).sum::<u64>();
+    let align = |n: u32| u64::from(n).next_multiple_of(32);
+    4 * (scalars(vertex) * align(max_vertices) + scalars(primitive) * align(max_primitives))
+}
+
 /// A resource bound by register, as `PSV0` lists it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Binding {
-    /// PSV resource type: 1 sampler, 2 CBV.
+    /// PSV resource type: 1 sampler, 2 CBV, 4 raw SRV, 7 raw UAV.
     pub kind: u32,
     pub space: u32,
     pub register: u32,
@@ -234,7 +144,7 @@ pub(crate) struct Binding {
 }
 
 pub(crate) struct Psv<'a> {
-    /// PSV shader kind: 0 pixel, 1 vertex, 5 compute.
+    /// PSV shader kind: 0 pixel, 1 vertex, 2 geometry, 5 compute.
     pub stage: u8,
     /// Vertex: writes `SV_Position`. Pixel: writes depth.
     pub flag: bool,
@@ -251,11 +161,9 @@ pub(crate) struct Psv<'a> {
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
     pub wave_size: Option<u32>,
-    /// Validator 1.8: runtime info 3 and the entry-point name.
-    pub validator18: bool,
 }
 
-/// `PSV0` with runtime info version 2, or 3 for validator 1.8.
+/// `PSV0` with runtime info version 2 (validator 1.6).
 pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let vectors = |els: &[SigElement]| {
         els.iter()
@@ -271,9 +179,8 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend(v.to_le_bytes());
         }
     };
-    let info_size = if p.validator18 { 52 } else { 48 };
-    u32s(&mut out, &[info_size]);
-    let mut info = [0u8; 52];
+    u32s(&mut out, &[48]);
+    let mut info = [0u8; 48];
     info[0] = u8::from(p.flag);
     if p.stage == 0 {
         // PSInfo.SampleFrequency: an input interpolated per sample, or the
@@ -312,11 +219,7 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[12] = u8::from(p.flag);
         info[26..28].copy_from_slice(&(max_vertices as u16).to_le_bytes());
     }
-    if p.validator18 {
-        // Runtime info 3 names the entry point at offset 1 in the strings.
-        info[48..52].copy_from_slice(&1u32.to_le_bytes());
-    }
-    out.extend(&info[..info_size as usize]);
+    out.extend(info);
     u32s(&mut out, &[p.bindings.len() as u32]);
     if !p.bindings.is_empty() {
         u32s(&mut out, &[24]);
@@ -327,25 +230,16 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             );
         }
     }
-    // The optional entry point and arbitrary semantics (system values use ""),
-    // then indices.
-    let mut strings = if p.validator18 {
-        b"\0main\0".to_vec()
-    } else {
-        vec![0]
-    };
+    // Arbitrary names occur once per element (repeats included); system values use "". Indices follow.
+    let mut strings = vec![0u8];
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
         let name = if e.kind == 0 {
             let needle: Vec<u8> = e.name.bytes().chain([0]).collect();
-            match find(&strings, &needle) {
-                Some(at) => at,
-                None => {
-                    strings.extend(&needle);
-                    strings.len() - needle.len()
-                }
-            }
+            let at = strings.len();
+            strings.extend(needle);
+            at
         } else {
             0
         };
@@ -402,10 +296,6 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         }
     }
     out
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// The container: parts in order, hashed.
@@ -471,21 +361,88 @@ pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
 
 fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
     const S: [u32; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
-    let x: Vec<u32> = block
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| u32::from_le_bytes(*c))
-        .collect();
+    const K: [u32; 64] = [
+        0xd76a_a478,
+        0xe8c7_b756,
+        0x2420_70db,
+        0xc1bd_ceee,
+        0xf57c_0faf,
+        0x4787_c62a,
+        0xa830_4613,
+        0xfd46_9501,
+        0x6980_98d8,
+        0x8b44_f7af,
+        0xffff_5bb1,
+        0x895c_d7be,
+        0x6b90_1122,
+        0xfd98_7193,
+        0xa679_438e,
+        0x49b4_0821,
+        0xf61e_2562,
+        0xc040_b340,
+        0x265e_5a51,
+        0xe9b6_c7aa,
+        0xd62f_105d,
+        0x0244_1453,
+        0xd8a1_e681,
+        0xe7d3_fbc8,
+        0x21e1_cde6,
+        0xc337_07d6,
+        0xf4d5_0d87,
+        0x455a_14ed,
+        0xa9e3_e905,
+        0xfcef_a3f8,
+        0x676f_02d9,
+        0x8d2a_4c8a,
+        0xfffa_3942,
+        0x8771_f681,
+        0x6d9d_6122,
+        0xfde5_380c,
+        0xa4be_ea44,
+        0x4bde_cfa9,
+        0xf6bb_4b60,
+        0xbebf_bc70,
+        0x289b_7ec6,
+        0xeaa1_27fa,
+        0xd4ef_3085,
+        0x0488_1d05,
+        0xd9d4_d039,
+        0xe6db_99e5,
+        0x1fa2_7cf8,
+        0xc4ac_5665,
+        0xf429_2244,
+        0x432a_ff97,
+        0xab94_23a7,
+        0xfc93_a039,
+        0x655b_59c3,
+        0x8f0c_cc92,
+        0xffef_f47d,
+        0x8584_5dd1,
+        0x6fa8_7e4f,
+        0xfe2c_e6e0,
+        0xa301_4314,
+        0x4e08_11a1,
+        0xf753_7e82,
+        0xbd3a_f235,
+        0x2ad7_d2bb,
+        0xeb86_d391,
+    ];
+    let x: [u32; 16] = std::array::from_fn(|i| {
+        u32::from_le_bytes([
+            block[4 * i],
+            block[4 * i + 1],
+            block[4 * i + 2],
+            block[4 * i + 3],
+        ])
+    });
     let [mut a, mut b, mut c, mut d] = *state;
-    for i in 0..64 {
+    for (i, &k) in K.iter().enumerate() {
         let (f, g) = match i / 16 {
             0 => ((b & c) | (!b & d), i),
             1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
             2 => (b ^ c ^ d, (3 * i + 5) % 16),
             _ => (c ^ (b | !d), (7 * i) % 16),
         };
-        let k = ((i as f64 + 1.0).sin().abs() * 4_294_967_296.0) as u32;
         let rotated = a
             .wrapping_add(f)
             .wrapping_add(k)
@@ -503,66 +460,92 @@ mod tests {
     use super::*;
 
     #[test]
-    fn flat_float_retains_its_packed_producer_row() {
-        let flat = SigElement {
-            name: "VALUE".into(),
+    fn packed_vertex_outputs_preserve_name_order_and_declared_interpolation() {
+        let integer = SigElement {
+            name: "TEXCOORD".into(),
+            index: 1,
+            kind: 0,
+            comp: 5,
+            interp: 1,
+            row: Some(0),
+            col: 2,
+            cols: 2,
+            usage: 3,
+            half: false,
+        };
+        let flat_float = SigElement {
+            name: "COLOR".into(),
+            index: 0,
+            comp: 9,
+            col: 0,
+            ..integer.clone()
+        };
+        let smooth_float = SigElement {
+            index: 2,
+            row: Some(1),
+            interp: 2,
+            comp: 9,
+            ..integer.clone()
+        };
+        let outputs = [integer, flat_float, smooth_float];
+        let mut recovered = super::super::signature(&signature(&outputs, false)).unwrap();
+        // DXC orders the row by semantic-name offset even though TEXCOORD
+        // occupies z/w and COLOR occupies x/y.
+        assert_eq!(recovered[0].name, "TEXCOORD");
+        assert_eq!(recovered[1].name, "COLOR");
+        // PSV records can be in a different order again.
+        let psv = psv(&Psv {
+            stage: 1,
+            flag: false,
+            inputs: &[],
+            outputs: &[outputs[2].clone(), outputs[1].clone(), outputs[0].clone()],
+            prims: &[],
+            mesh: None,
+            geometry: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+        });
+        recovered[1].interp = 2;
+        super::super::vertex_output_interpolation(&psv, &mut recovered).unwrap();
+        assert_eq!(
+            recovered.iter().map(|e| e.interp).collect::<Vec<_>>(),
+            [1, 1, 2]
+        );
+        assert!(
+            super::super::vertex_output_interpolation(&psv[..psv.len() - 1], &mut recovered)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn psv_keeps_repeated_arbitrary_semantic_names() {
+        let element = SigElement {
+            name: "TEXCOORD".into(),
             index: 0,
             kind: 0,
             comp: 9,
-            interp: 1,
-            row: Some(2),
-            col: 3,
-            cols: 1,
-            usage: 1,
+            interp: 2,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
             half: false,
         };
-        let integer = SigElement {
-            col: 0,
-            cols: 3,
-            comp: 5,
-            index: 1,
-            ..flat.clone()
-        };
-        let linear = SigElement {
-            row: Some(4),
-            interp: 2,
-            ..flat.clone()
-        };
-        let binding = Binding {
-            kind: 2,
-            space: 0,
-            register: 0,
-            dxil_kind: 13,
-        };
-        for stage in [1, 13] {
-            let meta = psv(&Psv {
-                stage,
-                flag: false,
-                inputs: std::slice::from_ref(&linear),
-                outputs: &[integer.clone(), linear.clone(), flat.clone()],
-                prims: &[],
-                mesh: None,
-                geometry: None,
-                bindings: std::slice::from_ref(&binding),
-                threads: [1; 3],
-                wave_size: None,
-                validator18: true,
-            });
-            let mut outputs = [
-                SigElement {
-                    interp: 2,
-                    ..flat.clone()
-                },
-                integer.clone(),
-                linear.clone(),
-            ];
-            producer_interpolation(&meta, 5, &mut outputs);
-            assert_eq!(outputs[0].interp, 2);
-            producer_interpolation(&meta[..meta.len() / 2], stage, &mut outputs);
-            assert_eq!(outputs[0].interp, 2);
-            producer_interpolation(&meta, stage, &mut outputs);
-            assert_eq!(outputs, [flat.clone(), integer.clone(), linear.clone()]);
-        }
+        let psv = psv(&Psv {
+            stage: 1,
+            flag: false,
+            inputs: std::slice::from_ref(&element),
+            outputs: std::slice::from_ref(&element),
+            prims: &[],
+            mesh: None,
+            geometry: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+        });
+        let strings = u32::from_le_bytes(psv[56..60].try_into().unwrap()) as usize;
+        assert_eq!(&psv[60..60 + strings], b"\0TEXCOORD\0TEXCOORD\0\0");
     }
 
     #[test]
@@ -580,36 +563,5 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
-    }
-
-    fn element(name: &str, row: u32, col: u8, interp: u8) -> SigElement {
-        SigElement {
-            name: name.into(),
-            index: 0,
-            kind: 0,
-            comp: 9,
-            interp,
-            row: Some(row),
-            col,
-            cols: 1,
-            usage: 1,
-            half: false,
-        }
-    }
-
-    #[test]
-    fn rows_of_mixed_interpolation_are_separated() {
-        let mut e = vec![
-            element("A", 0, 0, 2),
-            element("B", 0, 1, 1),
-            element("C", 1, 0, 2),
-            element("D", 0, 2, 1),
-            element("E", 0, 3, 2),
-            element("F", 1, 1, 0),
-        ];
-        separate_interpolation(&mut e);
-        let rows: Vec<u32> = e.iter().map(|e| e.row.unwrap()).collect();
-        // B and D (constant) share a new row; A and E stay; F has no mode.
-        assert_eq!(rows, [0, 2, 1, 2, 0, 1]);
     }
 }

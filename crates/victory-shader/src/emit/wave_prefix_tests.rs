@@ -426,6 +426,7 @@ fn build_prefix_cs(wave64: bool, float: bool, inclusive: bool, mode: Mode) -> Ho
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        root_indexed_views: Vec::new(),
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -809,6 +810,7 @@ fn wave_prefix_sum_f32_pixel_quad_all_backends() {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        root_indexed_views: Vec::new(),
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

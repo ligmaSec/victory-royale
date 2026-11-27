@@ -1,7 +1,7 @@
 //! Synthetic normalized MTBUF loads. gfx1036 measurements in #1060 found
 //! correctly rounded results for all twenty formats, including packed fields.
 
-use super::{Emission, HostShader, StructuredBinding, ViewStride, emit_with_view_strides};
+use super::{HostShader, SLOT_TABLE_STRIDES, emit};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -39,13 +39,12 @@ fn load_shader(format: u8) -> HostShader {
         0x8003_0100, // buffer_store_dwordx4 v[1:4], v0, s[12:15], 0 offen
         0xBF81_0000, // s_endpgm
     ];
-    buffer_shader(&words, Some(0), &|_, _| None).unwrap()
+    buffer_shader(&words, Some(0)).unwrap()
 }
 
 fn buffer_shader(
     words: &[u32],
     input_stride: Option<u32>,
-    view_stride: ViewStride<'_>,
 ) -> Result<HostShader, crate::ShaderError> {
     let range = |kind, table_offset_dwords, stride| UsedResource {
         kind,
@@ -86,18 +85,7 @@ fn buffer_shader(
     let io = io::raise(&p, &native).unwrap();
     let bytes = crate::dxbc::build(&[]);
     let container = Container::parse(&bytes).unwrap();
-    emit_with_view_strides(
-        Emission {
-            c: &container,
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-        },
-        true,
-        Some(view_stride),
-    )
+    emit(&container, &native, &p, &st, &io, &res)
 }
 
 #[test]
@@ -122,7 +110,7 @@ fn raw_buffer_byte_and_halfword_loads_extend_at_every_byte_offset() {
         0x8003_0100, // store four result dwords
         0xbf81_0000,
     ];
-    let shader = buffer_shader(&words, Some(0), &|_, _| None).unwrap();
+    let shader = buffer_shader(&words, Some(0)).unwrap();
     assert!(
         Container::parse(&shader.dxil)
             .unwrap()
@@ -311,34 +299,14 @@ const STRUCTURED_READ: &[u32] = &[
 #[test]
 fn indexed_load_uses_the_view_stride_when_metadata_is_missing_or_invalid() {
     for metadata in [None, Some(0), Some(6), Some(2052)] {
-        assert!(matches!(
-            buffer_shader(STRUCTURED_READ, metadata, &|_, _| None),
-            Err(crate::ShaderError::Unsupported {
-                what: super::UNKNOWN_STRUCTURED_STRIDE,
-                ..
-            })
-        ));
-        for stride in [16, 32] {
-            let called = std::cell::Cell::new(false);
-            buffer_shader(STRUCTURED_READ, metadata, &|binding, required| {
-                if !required {
-                    return None;
-                }
-                called.set(true);
-                assert_eq!(
-                    binding,
-                    StructuredBinding {
-                        slot: 0,
-                        offset_dwords: 0,
-                        uav: false
-                    }
-                );
-                Some(stride)
-            })
-            .unwrap();
-            assert!(called.get());
-        }
+        let shader = buffer_shader(STRUCTURED_READ, metadata).unwrap();
+        assert!(
+            shader.root_srvs.contains(&SLOT_TABLE_STRIDES),
+            "{metadata:?}"
+        );
     }
+    let shader = buffer_shader(STRUCTURED_READ, Some(16)).unwrap();
+    assert!(!shader.root_srvs.contains(&SLOT_TABLE_STRIDES));
 }
 
 #[cfg(windows)]
@@ -361,10 +329,7 @@ fn undeclared_structured_stride_reads_two_view_strides() {
         })
         .collect();
     for stride in [16, 32] {
-        let mut shader = buffer_shader(STRUCTURED_READ, Some(0), &|_, required| {
-            required.then_some(stride)
-        })
-        .unwrap();
+        let mut shader = buffer_shader(STRUCTURED_READ, Some(0)).unwrap();
         let path = super::validator::Validator::default_path();
         if path.is_some() {
             super::validator::Validator::load(path.as_deref())
@@ -384,14 +349,23 @@ fn undeclared_structured_stride_reads_two_view_strides() {
                     &root,
                     &pso,
                     &Dispatch {
-                        roots: vec![(
-                            0,
-                            Root::Constants(vec![0; shader.user_data_dwords() as usize]),
-                        )],
+                        roots: vec![
+                            (
+                                0,
+                                Root::Constants(vec![0; shader.user_data_dwords() as usize]),
+                            ),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: vec![stride],
+                                },
+                            ),
+                        ],
                         views: &[
                             View::Buffer {
                                 data: &data,
-                                stride: Stride::Structured(stride),
+                                stride: Stride::Raw,
                             },
                             View::RawUav(64),
                         ],
@@ -417,22 +391,8 @@ fn indexed_store_and_atomic_use_the_structured_uav_view_stride() {
             0x8003_0000, // store / atomic_add v0, v0, s[12:15], 0 idxen offset:4
             0xBF81_0000, // s_endpgm
         ];
-        assert!(buffer_shader(&words, None, &|_, _| None).is_err());
-        let shader = buffer_shader(&words, None, &|binding, required| {
-            if !required {
-                return None;
-            }
-            assert_eq!(
-                binding,
-                StructuredBinding {
-                    slot: 0,
-                    offset_dwords: 8,
-                    uav: true
-                }
-            );
-            Some(16)
-        })
-        .unwrap();
+        let shader = buffer_shader(&words, None).unwrap();
+        assert!(shader.root_srvs.contains(&SLOT_TABLE_STRIDES));
         #[cfg(windows)]
         if let Some(path) = super::validator::Validator::default_path() {
             super::validator::Validator::load(Some(&path))

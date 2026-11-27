@@ -1,30 +1,56 @@
-//! Our own compute shaders (the indirect argument clamp, the rectangle
-//! expander), compiled at run time from HLSL with their root signature
-//! inside: by the system's compiler (`D3DCompile`, `cs_5_1`) and, when it
-//! refuses them, by DXC (`cs_6_0`). Wine's `d3dcompiler_47` (vkd3d-shader)
-//! can reject raw-buffer operations or return bytecode without the HLSL root
-//! signature. The bundled and runtime DXC paths keep those bindings.
+//! Build-time shader bytecode for the renderer's own helpers. Development
+//! builds without a build-time DXC use the system compiler or runtime DXC.
+//! Some Wine compilers omit the root signature even on success; where the
+//! helper needs it embedded, that output is not usable.
 
+use std::{borrow::Cow, ffi::CStr};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::core::{PCSTR, s};
 
-/// Compiles compute shader `source` (entry `main`) named `name` in
-/// messages: the system's compiler first, then DXC.
-pub(crate) fn compile_compute(name: &str, source: &str) -> windows::core::Result<Vec<u8>> {
-    match system_compile(name, source) {
-        Ok(code) if has_root_signature(&code) => return Ok(code),
-        Ok(_) => tracing::info!("{name}: system compiler omitted the root signature"),
-        Err((e, msg)) => {
-            tracing::info!(error = %e, "{name}: system compiler refused it ({})", msg.trim())
-        }
-    }
+#[cfg(victory_bundled_hlsl)]
+include!(concat!(env!("OUT_DIR"), "/bundled_hlsl.rs"));
+
+pub(crate) fn compile_compute(
+    name: &str,
+    source: &str,
+) -> windows::core::Result<Cow<'static, [u8]>> {
+    compile_stage(name, source, c"main", c"cs_5_1", true)
+}
+
+pub(crate) fn compile_stage(
+    name: &str,
+    source: &str,
+    entry: &CStr,
+    profile: &CStr,
+    root: bool,
+) -> windows::core::Result<Cow<'static, [u8]>> {
     #[cfg(victory_bundled_hlsl)]
-    if let Some(bytes) = bundled_shader(source) {
-        tracing::info!("{name}: using build-time DXC shader");
-        return Ok(bytes.to_vec());
+    if let Some(code) = bundled_shader(source, entry.to_bytes(), profile.to_bytes(), 0) {
+        return Ok(Cow::Borrowed(code));
     }
-    dxc_compile(name, source).inspect_err(|e| tracing::warn!(error = %e, "{name}: DXC failed"))
+    compile_runtime(name, source, entry, profile, root).map(Cow::Owned)
+}
+
+pub(crate) fn compile_clamp(
+    source: &str,
+    width: u32,
+    rest: u32,
+) -> windows::core::Result<Cow<'static, [u8]>> {
+    #[cfg(victory_bundled_hlsl)]
+    if let Some(variant) = match (width, rest) {
+        (65_535, 0) => Some(1),
+        (65_535, 1) => Some(2),
+        (1_048_576, 0) => Some(3),
+        (1_048_576, 1) => Some(4),
+        _ => None,
+    } && let Some(code) = bundled_shader(source, b"main", b"cs_5_1", variant)
+    {
+        return Ok(Cow::Borrowed(code));
+    }
+    let source = format!("#define WIDEST {width}u\n#define REST {rest}\n{source}");
+    // The clamp's layout is created in Rust and does not need a shader root signature.
+    compile_runtime("argument clamp", &source, c"main", c"cs_5_1", false).map(Cow::Owned)
 }
 
 fn has_root_signature(code: &[u8]) -> bool {
@@ -32,29 +58,35 @@ fn has_root_signature(code: &[u8]) -> bool {
     Container::parse(code).is_ok_and(|c| c.part(FourCC::RTS0).is_some())
 }
 
-// Match the source so a changed shader can never pick up another helper's bytecode.
-#[cfg(victory_bundled_hlsl)]
-fn bundled_shader(source: &str) -> Option<&'static [u8]> {
-    macro_rules! bytecode {
-        ($name:literal) => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".dxil"))
-        };
-    }
-    match source {
-        include_str!("../shaders/argument_clamp.hlsl") => Some(bytecode!("argument_clamp")),
-        include_str!("../shaders/rect_rewrite.hlsl") => Some(bytecode!("rect_rewrite")),
-        include_str!("../shaders/rect_expand.hlsl") => Some(bytecode!("rect_expand")),
-        #[cfg(test)]
-        include_str!("../shaders/table_probe.hlsl") => Some(bytecode!("table_probe")),
-        _ => None,
-    }
-}
-
-/// Compiles `source` with the system's `D3DCompile` as `cs_5_1`; on failure
-/// returns the error and the compiler's messages.
-pub(crate) fn system_compile(
+fn compile_runtime(
     name: &str,
     source: &str,
+    entry: &CStr,
+    profile: &CStr,
+    root: bool,
+) -> windows::core::Result<Vec<u8>> {
+    match system_compile(name, source, entry, profile) {
+        Ok(code) if !root || has_root_signature(&code) => return Ok(code),
+        Ok(_) => tracing::info!("{name}: system compiler omitted the root signature"),
+        Err((e, text)) => {
+            tracing::debug!(error = %e, "{name}: system compiler refused it ({})", text.trim())
+        }
+    }
+    let code = dxc_compile(name, source, entry, profile)
+        .inspect_err(|e| tracing::warn!(error = %e, "{name}: DXC failed"))?;
+    if root && !has_root_signature(&code) {
+        return Err(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::E_FAIL,
+        ));
+    }
+    Ok(code)
+}
+
+fn system_compile(
+    name: &str,
+    source: &str,
+    entry: &CStr,
+    profile: &CStr,
 ) -> Result<Vec<u8>, (windows::core::Error, String)> {
     let cname = std::ffi::CString::new(name).unwrap_or_default();
     let mut code: Option<ID3DBlob> = None;
@@ -67,8 +99,8 @@ pub(crate) fn system_compile(
             PCSTR(cname.as_ptr().cast()),
             None,
             None,
-            s!("main"),
-            s!("cs_5_1"),
+            PCSTR(entry.as_ptr().cast()),
+            PCSTR(profile.as_ptr().cast()),
             0,
             0,
             &mut code,
@@ -142,12 +174,26 @@ fn dxc_library() -> windows::core::Result<windows::Win32::Foundation::HMODULE> {
     }
 }
 
-/// Compiles compute shader `source` with DXC as `cs_6_0` (see
-/// [`dxc_library`]); `name` labels its messages.
-pub(crate) fn dxc_compile(name: &str, source: &str) -> windows::core::Result<Vec<u8>> {
+fn dxc_compile(
+    name: &str,
+    source: &str,
+    entry: &CStr,
+    profile: &CStr,
+) -> windows::core::Result<Vec<u8>> {
     use windows::Win32::Graphics::Direct3D::Dxc::*;
     use windows::Win32::System::LibraryLoader::GetProcAddress;
-    use windows::core::{Interface, w};
+    use windows::core::{HSTRING, Interface, PCWSTR, w};
+    let target = match profile.to_bytes() {
+        b"cs_5_1" => w!("cs_6_0"),
+        b"vs_5_1" => w!("vs_6_0"),
+        b"ps_5_1" => w!("ps_6_0"),
+        _ => {
+            return Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_INVALIDARG,
+            ));
+        }
+    };
+    let entry = HSTRING::from(entry.to_string_lossy().as_ref());
     type Create = unsafe extern "system" fn(
         *const windows::core::GUID,
         *const windows::core::GUID,
@@ -169,7 +215,13 @@ pub(crate) fn dxc_compile(name: &str, source: &str) -> windows::core::Result<Vec
             Size: source.len(),
             Encoding: DXC_CP_UTF8.0,
         };
-        let arguments = [w!("-T"), w!("cs_6_0"), w!("-E"), w!("main"), w!("-O3")];
+        let arguments = [
+            w!("-T"),
+            target,
+            w!("-E"),
+            PCWSTR(entry.as_ptr()),
+            w!("-O3"),
+        ];
         let result: IDxcResult = compiler.Compile(&buffer, Some(&arguments), None)?;
         if let Err(e) = result.GetStatus()?.ok() {
             if let Ok(errors) = result.GetErrorBuffer() {
@@ -202,35 +254,22 @@ mod tests {
 
     #[cfg(victory_bundled_hlsl)]
     #[test]
-    fn bundled_helpers_have_shader_code_and_root_signatures() {
+    fn bundled_helpers_have_shader_code_and_required_root_signatures() {
         use victory_shader::{Container, FourCC};
-
-        for source in [
-            include_str!("../shaders/argument_clamp.hlsl"),
-            include_str!("../shaders/rect_rewrite.hlsl"),
-            include_str!("../shaders/rect_expand.hlsl"),
-            include_str!("../shaders/table_probe.hlsl"),
-        ] {
-            let expected = bundled_shader(source).unwrap();
-            let bytes = compile_compute("bundled helper", source).unwrap();
-            assert!(has_root_signature(&bytes));
-            if !system_compile("bundled helper", source).is_ok_and(|code| has_root_signature(&code))
-            {
-                assert_eq!(bytes, expected);
-            }
-            let container = Container::parse(expected).unwrap();
-            assert!(container.part(FourCC::DXIL).is_some());
-            assert!(container.part(FourCC::RTS0).is_some());
+        for &(id, bytes, needs_root) in BUNDLED_HELPERS {
+            let container = Container::parse(bytes).unwrap_or_else(|e| panic!("{id}: {e}"));
+            assert!(container.part(FourCC::DXIL).is_some(), "{id}");
+            assert!(!needs_root || has_root_signature(bytes), "{id}");
         }
-        assert!(bundled_shader(PROBE).is_none());
+        assert!(bundled_shader(PROBE, b"main", b"cs_5_1", 0).is_none());
     }
 
     /// A raw-buffer compute shader compiles with one of the two compilers
     /// whenever either is present, and both results are DXBC containers.
     #[test]
     fn raw_buffer_shader_compiles_with_a_fallback() {
-        let system = system_compile("probe", PROBE);
-        let dxc = dxc_compile("probe", PROBE);
+        let system = system_compile("probe", PROBE, c"main", c"cs_5_1");
+        let dxc = dxc_compile("probe", PROBE, c"main", c"cs_5_1");
         for code in [system.as_ref().ok(), dxc.as_ref().ok()]
             .into_iter()
             .flatten()

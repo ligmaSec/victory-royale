@@ -35,6 +35,8 @@ pub mod media;
 pub mod net;
 /// Lexical Windows path rules, host-independent so CI covers them.
 pub(crate) mod paths;
+#[cfg(windows)]
+mod rpcrt4;
 pub mod speech;
 pub mod storage;
 pub mod xasync;
@@ -90,6 +92,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(lifecycle::module());
     #[cfg(windows)]
     all.push(net::module());
+    #[cfg(windows)]
+    all.push(rpcrt4::module());
     #[cfg(windows)]
     all.push(xmem::module());
     #[cfg(windows)]

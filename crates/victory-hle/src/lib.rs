@@ -23,6 +23,16 @@ pub mod runtime;
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
 pub use victory_gpu::console;
+#[cfg(windows)]
+pub use victory_gpu::set_frame_interval_override;
+
+/// Runs a loader-emulated title write with GPU-tracked pages open until
+/// the write finishes. The loader still validates the writable range.
+#[cfg(windows)]
+pub fn with_console_write(at: usize, len: usize, write: &mut dyn FnMut()) {
+    let _guard = victory_gpu::kernel_writing(at, len);
+    write();
+}
 
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;

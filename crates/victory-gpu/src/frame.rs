@@ -10,8 +10,8 @@
 //! the clock to presentation if a title paces by them.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::object::{HRESULT, S_FALSE, S_OK, This};
@@ -24,6 +24,14 @@ const ORIGIN: u32 = 0;
 /// frame early).
 const TOKEN_ON_TIMEOUT: u32 = 2;
 const SIXTIETH: Duration = Duration::from_micros(16_667);
+static INTERVAL_OVERRIDE: OnceLock<Duration> = OnceLock::new();
+
+/// Overrides the title's frame interval for this launch. The launcher must
+/// validate the title profile and call this before starting title threads.
+/// A zero interval makes every wait immediate.
+pub fn set_frame_interval_override(interval: Duration) {
+    let _ = INTERVAL_OVERRIDE.set(interval);
+}
 
 struct Clock {
     start: Instant,
@@ -49,11 +57,12 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    let title_interval = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    let interval = INTERVAL_OVERRIDE.get().copied().unwrap_or(title_interval);
+    tracing::info!(?interval, ?title_interval, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -84,6 +93,12 @@ pub(crate) fn current() -> u64 {
     FRAME.load(Ordering::Relaxed)
 }
 
+/// Advances time in GPU subsystem tests that do not run a title loop.
+#[cfg(all(windows, test))]
+pub(crate) fn test_advance() {
+    FRAME.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Per event kind (origin, vblank, flip and later kinds): the last tick a
 /// wait for it ended on.
 static LAST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
@@ -101,9 +116,15 @@ fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock {
         start: Instant::now(),
-        interval: SIXTIETH,
+        interval: INTERVAL_OVERRIDE.get().copied().unwrap_or(SIXTIETH),
         first: 0,
     });
+    if c.interval.is_zero() {
+        return (
+            last(kind).fetch_add(1, Ordering::Relaxed) + 1,
+            Duration::ZERO,
+        );
+    }
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
     let last_tick = last(kind).load(Ordering::Relaxed);
@@ -142,11 +163,20 @@ pub(crate) extern "system" fn wait(
     let origin = kind == ORIGIN;
     let limit = Duration::from_millis(u64::from(timeout_ms));
     let (_tick, wait) = next_tick(kind, limit);
+    let _called = crate::timeline::span("the title's frame wait");
+    #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        use crate::copystat::{C, add};
+        add(C::PaceWaits, 1);
+        add(C::PaceUs, wait.min(limit).as_micros() as u64);
+    }
     let hr = if wait > limit {
         std::thread::sleep(limit);
         TIMEOUT
     } else {
-        std::thread::sleep(wait);
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
+        }
         S_OK
     };
     // A frame begun on a time-out takes no tick: its flip still does.
@@ -269,5 +299,38 @@ mod tests {
         assert!(second > first, "{second} after {first}");
         next_tick(VBLANK, Duration::ZERO);
         assert_eq!(last(VBLANK).load(Ordering::Relaxed), second);
+    }
+
+    #[test]
+    fn a_validated_zero_interval_gives_distinct_immediate_ticks() {
+        // The launcher sets the interval once per title process.
+        const CHILD: &str = "VICTORY_TEST_ZERO_INTERVAL";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "frame::tests::a_validated_zero_interval_gives_distinct_immediate_ticks",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+        set_frame_interval_override(Duration::ZERO);
+        let null = std::ptr::null();
+        assert_eq!(set_interval(null, null, 16_667, 1, 0), S_OK);
+        let mut token = 0;
+        for expected in 1..=3 {
+            assert_eq!(wait(null, ORIGIN, 0, null.cast(), 0, &mut token), S_OK);
+            assert_eq!(token, expected);
+            assert_eq!(last(ORIGIN).load(Ordering::Relaxed), expected);
+        }
     }
 }

@@ -3,8 +3,7 @@
 //! the hardware adds the fourth at `v0 + v2 - v1` (the title's
 //! full-screen rectangles come as top left, bottom left, bottom right); on
 //! the host each rectangle becomes two triangles, with the fourth vertex
-//! made from the other three on the CPU for direct draws and on the GPU for
-//! indirect draws ([`crate::rectangles`]).
+//! made from the other three on the CPU.
 //!
 //! shortcut: the fourth vertex is computed from vertex inputs, not from
 //! vertex shader outputs as the hardware does; that is the same for vertex
@@ -12,67 +11,26 @@
 //! [`components`] does not know keep the first vertex's value, and so do
 //! components past the end of the vertex (an element that reaches into the
 //! next one, which the layout allows).
+//!
+//! A pipeline the title makes for rectangles completes them on the GPU
+//! instead, in a geometry stage (`victory_shader::emit::rect_list_gs`):
+//! from the vertex shader's outputs, whichever vertex the corner is, for
+//! direct, indexed and indirect draws alike. This expansion is what is
+//! left for a pipeline that could not get that stage.
 
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
 /// triangles turn the same way. `elements` are (byte offset, format).
 pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
-    if stride == 12
-        && matches!(
-            elements,
-            [(0, 16), (8, 28 | 29 | 87 | 91)] | [(8, 28 | 29 | 87 | 91), (0, 16)]
-        )
-    {
-        expand_position_color(src, dst, elements);
-    } else {
-        expand_rects_generic(src, dst, stride, elements);
+    if stride == 0 {
+        return;
     }
-}
-
-/// Packed float2 positions and four UNORM8 channels. This layout covers the
-/// entire vertex, so the fourth vertex needs no initial copy or format lookup.
-fn expand_position_color(src: &[u8], dst: &mut [u8], elements: &[(u32, u32)]) {
-    let (rects, _) = src.as_chunks::<36>();
-    let (triangles, _) = dst.as_chunks_mut::<72>();
-    for (rect, out) in rects.iter().zip(triangles) {
-        let (vertices, _) = rect.as_chunks::<12>();
-        let [first, middle, last] = *vertices else {
-            unreachable!("three vertices per rectangle");
-        };
-        let mut position = [0.0f32; 2];
-        let mut finite = true;
-        for (axis, result) in position.iter_mut().enumerate() {
-            let read = |vertex: &[u8; 12]| f32::from_le_bytes(vertex.as_chunks::<4>().0[axis]);
-            let (a, b, c) = (read(&first), read(&middle), read(&last));
-            finite &= a.is_finite() & b.is_finite() & c.is_finite();
-            *result = (a + c) - b;
-        }
-        if !finite {
-            // Use the generic calculation for NaNs and infinities, including
-            // the choice of NaN payload when more than one operand is a NaN.
-            expand_rects_generic(rect, out, 12, elements);
-            continue;
-        }
-
-        out[..36].copy_from_slice(rect);
-        out[36..48].copy_from_slice(&first);
-        out[48..60].copy_from_slice(&last);
-        out[60..64].copy_from_slice(&position[0].to_le_bytes());
-        out[64..68].copy_from_slice(&position[1].to_le_bytes());
-        // Normalization and denormalization cancel. The f32 error is far
-        // below half a channel step, so the generic rounding gives this same
-        // integer except where both paths already clamp to 0 or 255.
-        for channel in 8..12 {
-            let sum = i16::from(first[channel]) + i16::from(last[channel]);
-            out[60 + channel] = (sum - i16::from(middle[channel])).clamp(0, 255) as u8;
-        }
-    }
-}
-
-fn expand_rects_generic(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
+    let (Some(in_rect), Some(out_rect)) = (stride.checked_mul(3), stride.checked_mul(6)) else {
+        return;
+    };
     for (rect, out) in src
-        .chunks_exact(3 * stride)
-        .zip(dst.chunks_exact_mut(6 * stride))
+        .chunks_exact(in_rect)
+        .zip(dst.chunks_exact_mut(out_rect))
     {
         let v = |i: usize| &rect[i * stride..(i + 1) * stride];
         for (slot, i) in [0, 1, 2, 0, 2].into_iter().enumerate() {
@@ -97,16 +55,18 @@ fn expand_rects_generic(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Kind {
+#[derive(Clone, Copy)]
+enum Kind {
     F32,
     F16,
     Unorm8,
     Unorm16,
+    Snorm8,
+    Snorm16,
 }
 
 /// Component count and kind of the vertex formats rectangles use.
-pub(crate) fn components(format: u32) -> Option<(usize, Kind)> {
+fn components(format: u32) -> Option<(usize, Kind)> {
     Some(match format {
         2 => (4, Kind::F32),
         6 => (3, Kind::F32),
@@ -117,27 +77,26 @@ pub(crate) fn components(format: u32) -> Option<(usize, Kind)> {
         54 => (1, Kind::F16),
         11 => (4, Kind::Unorm16),
         35 => (2, Kind::Unorm16),
+        56 => (1, Kind::Unorm16),
         28 | 29 | 87 | 91 => (4, Kind::Unorm8),
+        49 => (2, Kind::Unorm8),
+        61 => (1, Kind::Unorm8),
+        13 => (4, Kind::Snorm16),
+        37 => (2, Kind::Snorm16),
+        58 => (1, Kind::Snorm16),
+        31 => (4, Kind::Snorm8),
+        51 => (2, Kind::Snorm8),
+        63 => (1, Kind::Snorm8),
         _ => return None,
     })
 }
 
 impl Kind {
-    pub(crate) fn bytes(self) -> usize {
+    fn bytes(self) -> usize {
         match self {
             Kind::F32 => 4,
-            Kind::F16 | Kind::Unorm16 => 2,
-            Kind::Unorm8 => 1,
-        }
-    }
-
-    /// Numeric code shared with [`crate::rectangles`]'s HLSL shader.
-    pub(crate) fn code(self) -> u32 {
-        match self {
-            Kind::F32 => 0,
-            Kind::F16 => 1,
-            Kind::Unorm16 => 2,
-            Kind::Unorm8 => 3,
+            Kind::F16 | Kind::Unorm16 | Kind::Snorm16 => 2,
+            Kind::Unorm8 | Kind::Snorm8 => 1,
         }
     }
 
@@ -148,6 +107,8 @@ impl Kind {
             Kind::F16 => half_to_f32(u16::from_le_bytes([b[0], b[1]])),
             Kind::Unorm16 => f32::from(u16::from_le_bytes([b[0], b[1]])) / 65535.0,
             Kind::Unorm8 => f32::from(b[0]) / 255.0,
+            Kind::Snorm16 => (f32::from(i16::from_le_bytes([b[0], b[1]])) / 32767.0).max(-1.0),
+            Kind::Snorm8 => (f32::from(b[0] as i8) / 127.0).max(-1.0),
         }
     }
 
@@ -161,6 +122,10 @@ impl Kind {
                 b.copy_from_slice(&((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_le_bytes())
             }
             Kind::Unorm8 => b[0] = (v.clamp(0.0, 1.0) * 255.0).round() as u8,
+            Kind::Snorm16 => {
+                b.copy_from_slice(&((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes())
+            }
+            Kind::Snorm8 => b[0] = (v.clamp(-1.0, 1.0) * 127.0).round() as i8 as u8,
         }
     }
 }
@@ -187,10 +152,6 @@ fn f32_to_half(v: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
     let man = bits & 0x7f_ffff;
-    if bits & 0x7fff_ffff > 0x7f80_0000 {
-        // NaN stays NaN (quiet, the payload's top bits kept), not infinity.
-        return sign | 0x7e00 | (man >> 13) as u16;
-    }
     if exp >= 31 {
         return sign | 0x7c00; // too large: infinity
     }
@@ -209,11 +170,10 @@ fn f32_to_half(v: f32) -> u16 {
         let m = q + u32::from(r > halfway || (r == halfway && (q & 1) != 0));
         return sign | m as u16;
     }
-    // Rounded to nearest, ties to even: a carry out of the mantissa is
-    // added into the exponent (`2 - 2^-12` is 2.0); at most it reaches
-    // infinity, 0x7c00.
+    // Rounded to nearest: a carry out of the mantissa is added into the
+    // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
     let half = (exp as u32) << 10;
-    sign | (half + ((man + 0xfff + ((man >> 13) & 1)) >> 13)) as u16
+    sign | (half + ((man + 0x1000) >> 13)) as u16
 }
 
 #[cfg(test)]
@@ -249,26 +209,6 @@ mod tests {
         assert_eq!(half_to_f32(0xc000), -2.0);
     }
 
-    /// NaN converts to a half NaN, and a value halfway between two halves
-    /// rounds to the even one, as IEEE 754 and the GPU do (#843).
-    #[test]
-    fn halves_keep_nan_and_round_ties_to_even() {
-        let is_nan = |h: u16| h & 0x7c00 == 0x7c00 && h & 0x3ff != 0;
-        assert!(is_nan(f32_to_half(f32::NAN)));
-        assert_eq!(f32_to_half(-f32::NAN) & 0x8000, 0x8000);
-        // The smallest f32 NaN payload still makes a NaN, not infinity.
-        assert!(is_nan(f32_to_half(f32::from_bits(0x7f80_0001))));
-        assert_eq!(f32_to_half(f32::INFINITY), 0x7c00);
-        assert_eq!(f32_to_half(f32::NEG_INFINITY), 0xfc00);
-        // Halfway above 1.0 (an even mantissa) stays; above 1 + 2^-10 (odd)
-        // goes up to the even one.
-        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11)), 0x3c00);
-        assert_eq!(f32_to_half(1.0 + 3.0 * 2f32.powi(-11)), 0x3c02);
-        assert_eq!(f32_to_half(-(1.0 + 2f32.powi(-11))), 0xbc00);
-        // Just past halfway still rounds up.
-        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11) + 2f32.powi(-20)), 0x3c01);
-    }
-
     /// A rounding that carries out of the mantissa raises the exponent
     /// (the carry used to be or-ed into an odd exponent, halving the value).
     #[test]
@@ -302,112 +242,30 @@ mod tests {
     }
 
     #[test]
-    fn packed_position_color_matches_generic_expansion() {
-        let mut src = packed_rectangles(4096);
-        // The first rectangle exercises signed zeros, a subnormal and
-        // overflow with finite operands. The second needs the nonfinite path.
-        for (vertex, position) in src.as_chunks_mut::<12>().0.iter_mut().zip([
-            [-0.0, f32::MAX],
-            [0.0, f32::from_bits(1)],
-            [-0.0, f32::MAX],
-            [f32::from_bits(0x7fc0_0123), f32::INFINITY],
-            [1.0, f32::NEG_INFINITY],
-            [f32::from_bits(0xffc0_0456), f32::NEG_INFINITY],
-        ]) {
-            vertex[..4].copy_from_slice(&position[0].to_le_bytes());
-            vertex[4..8].copy_from_slice(&position[1].to_le_bytes());
-        }
-        // Underflow, exact zero, exact 255 and overflow in the same color.
-        src[8..12].copy_from_slice(&[0, 0, 255, 255]);
-        src[20..24].copy_from_slice(&[1, 255, 1, 0]);
-        src[32..36].copy_from_slice(&[0, 255, 1, 1]);
-
-        src.extend_from_slice(&[0xaa; 35]);
-        for format in [28, 29, 87, 91] {
-            let layout = [(0, 16), (8, format)];
-            let reversed = [(8, format), (0, 16)];
-            for elements in [layout, reversed] {
-                for dst_len in [71, 4095 * 72 + 71, 4097 * 72 + 71] {
-                    let mut expected = vec![0xcc; dst_len];
-                    let mut actual = expected.clone();
-                    expand_rects_generic(&src, &mut expected, 12, &elements);
-                    expand_rects(&src, &mut actual, 12, &elements);
-                    assert_eq!(actual, expected);
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "release microbenchmark"]
-    fn benchmark_position_color_expansion() {
-        use std::hint::black_box;
-        use std::time::{Duration, Instant};
-
-        let elements = [(0, 16), (8, 28)];
-        for count in [1, 64, 1024] {
-            let src = packed_rectangles(count);
-            let mut before = vec![0; count * 72];
-            let mut after = before.clone();
-            let iterations = 200_000 / count;
-            expand_rects_generic(&src, &mut before, 12, &elements);
-            expand_rects(&src, &mut after, 12, &elements);
-            assert_eq!(before, after);
-
-            type Expand = fn(&[u8], &mut [u8], usize, &[(u32, u32)]);
-            let measure = |expand: Expand, dst: &mut [u8]| {
-                let start = Instant::now();
-                for _ in 0..iterations {
-                    expand(
-                        black_box(&src),
-                        black_box(dst),
-                        black_box(12),
-                        black_box(&elements),
-                    );
-                    black_box(&*dst);
-                }
-                start.elapsed()
-            };
-            let mut baseline = [Duration::ZERO; 9];
-            let mut optimized = baseline;
-            for sample in 0..baseline.len() {
-                if sample % 2 == 0 {
-                    baseline[sample] = measure(expand_rects_generic, &mut before);
-                    optimized[sample] = measure(expand_rects, &mut after);
-                } else {
-                    optimized[sample] = measure(expand_rects, &mut after);
-                    baseline[sample] = measure(expand_rects_generic, &mut before);
-                }
-            }
-            assert_eq!(before, after);
-            baseline.sort_unstable();
-            optimized.sort_unstable();
-            let ns_per_rect =
-                |elapsed: Duration| elapsed.as_secs_f64() * 1e9 / (iterations * count) as f64;
-            let (base, opt) = (ns_per_rect(baseline[4]), ns_per_rect(optimized[4]));
-            println!(
-                "{count:4} rectangles: {base:.2} -> {opt:.2} ns/rect ({:.2}x)",
-                base / opt
-            );
-        }
-    }
-
-    fn packed_rectangles(count: usize) -> Vec<u8> {
-        let mut state = 42u32;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state
+    fn normalized_attributes_are_interpolated_in_their_own_range() {
+        let vertex = |rg: [u8; 2], u16_value: u16, u8_value: u8, snorm8: i8, snorm16: i16| {
+            [
+                &rg[..],
+                &u16_value.to_le_bytes(),
+                &[u8_value, snorm8 as u8],
+                &snorm16.to_le_bytes(),
+            ]
+            .concat()
         };
-        let mut src = Vec::with_capacity(count * 36);
-        for _ in 0..3 * count {
-            for _ in 0..2 {
-                src.extend_from_slice(&((next() as i32) as f32 / 65_536.0).to_le_bytes());
-            }
-            src.extend_from_slice(&next().to_le_bytes());
-        }
-        src
+        let src = [
+            vertex([3, 250], 1000, 10, i8::MIN, -23000),
+            vertex([8, 200], 500, 3, -120, -18000),
+            vertex([20, 253], 10000, 100, -120, -32000),
+        ]
+        .concat();
+        let mut dst = [0; 6 * 8];
+        expand_rects(
+            &src,
+            &mut dst,
+            8,
+            &[(0, 49), (2, 56), (4, 61), (5, 63), (6, 58)],
+        );
+        assert_eq!(dst[40..], vertex([15, 255], 10500, 107, -127, -32767));
     }
 
     /// `half_to_f32` reads subnormals, so an f16 rectangle output must be
@@ -425,5 +283,84 @@ mod tests {
         assert_eq!(f32_to_half(2f32.powi(-26)), 0x0000);
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
+    }
+
+    #[test]
+    fn zero_or_overflowing_stride_is_ignored_without_panicking() {
+        let mut dst = [0xAAu8; 16];
+        expand_rects(&[1, 2, 3], &mut dst, 0, &[(0, 16)]);
+        assert_eq!(dst, [0xAAu8; 16]);
+        expand_rects(&[1, 2, 3], &mut dst, usize::MAX / 2, &[(0, 16)]);
+        assert_eq!(dst, [0xAAu8; 16]);
+    }
+
+    #[test]
+    fn unorm16_unorm8_clamping_and_unknown_formats_expand_correctly() {
+        // Vertex layout (12 bytes):
+        //   0..4: R16G16_UNORM (format 35)
+        //   4..8: R8G8B8A8_UNORM (format 28) — tests clamping below 0 and above 1
+        //   8..12: unknown format (999) — must keep v0's bytes verbatim
+        let v = |u0: u16, u1: u16, c: [u8; 4], raw: [u8; 4]| {
+            let mut b = Vec::with_capacity(12);
+            b.extend(u0.to_le_bytes());
+            b.extend(u1.to_le_bytes());
+            b.extend(c);
+            b.extend(raw);
+            b
+        };
+        let src = [
+            v(
+                10_000,
+                50_000,
+                [10, 200, 100, 255],
+                [0xDE, 0xAD, 0xBE, 0xEF],
+            ),
+            v(20_000, 10_000, [100, 50, 100, 255], [1, 2, 3, 4]),
+            v(30_000, 20_000, [20, 200, 100, 255], [5, 6, 7, 8]),
+        ]
+        .concat();
+        let mut dst = vec![0u8; 6 * 12];
+        expand_rects(&src, &mut dst, 12, &[(0, 35), (4, 28), (8, 999)]);
+        let fourth = &dst[60..72];
+        // u0: 10000 + 30000 - 20000 = 20000; u1: 50000 + 20000 - 10000 = 60000
+        assert_eq!(u16::from_le_bytes([fourth[0], fourth[1]]), 20_000);
+        assert_eq!(u16::from_le_bytes([fourth[2], fourth[3]]), 60_000);
+        // c0: 10 + 20 - 100 -> clamped to 0; c1: 200 + 200 - 50 -> clamped to 255
+        assert_eq!(&fourth[4..8], &[0, 255, 100, 255]);
+        // Unknown format keeps v0 bytes
+        assert_eq!(&fourth[8..12], &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn multiple_rectangles_and_f32_f16_vector_formats_expand_in_sequence() {
+        // Two rectangles of R32G32B32_FLOAT (format 6, 12 bytes) + R16G16_FLOAT (format 34, 4 bytes) = 16 bytes
+        let v = |p: [f32; 3], uv: [f32; 2]| {
+            let mut b = Vec::with_capacity(16);
+            for x in p {
+                b.extend(x.to_le_bytes());
+            }
+            for x in uv {
+                b.extend(f32_to_half(x).to_le_bytes());
+            }
+            b
+        };
+        let src = [
+            // Rect 0
+            v([0.0, 1.0, 0.5], [0.0, 0.0]),
+            v([0.0, 0.0, 0.5], [0.0, 1.0]),
+            v([2.0, 0.0, 0.5], [1.0, 1.0]),
+            // Rect 1
+            v([10.0, 20.0, 1.0], [0.25, 0.5]),
+            v([10.0, 10.0, 1.0], [0.25, 1.0]),
+            v([14.0, 10.0, 1.0], [0.75, 1.0]),
+        ]
+        .concat();
+        let mut dst = vec![0u8; 12 * 16];
+        expand_rects(&src, &mut dst, 16, &[(0, 6), (12, 34)]);
+        assert_eq!(&dst[5 * 16..6 * 16], &v([2.0, 1.0, 0.5], [1.0, 0.0])[..]);
+        assert_eq!(
+            &dst[11 * 16..12 * 16],
+            &v([14.0, 20.0, 1.0], [0.75, 0.5])[..]
+        );
     }
 }

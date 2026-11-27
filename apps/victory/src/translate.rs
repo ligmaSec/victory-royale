@@ -144,6 +144,7 @@ struct Tally {
     io_programs: usize,
     io_raised: usize,
     interpolated: usize,
+    weighted_steps: usize,
     vertex_values: usize,
     /// Exports by target kind.
     exports: BTreeMap<&'static str, usize>,
@@ -277,10 +278,11 @@ impl Tally {
             ),
             format!(
                 "I/O          {} of {} vertex and pixel programs raised ({} interpolations, \
-                 {} vertex values; exports {:?}, {} still f16 pairs)",
+                 {} weighted steps, {} vertex values; exports {:?}, {} still f16 pairs)",
                 self.io_raised,
                 self.io_programs,
                 self.interpolated,
+                self.weighted_steps,
                 self.vertex_values,
                 self.exports,
                 self.compressed
@@ -345,6 +347,7 @@ impl Tally {
         self.io_programs += other.io_programs;
         self.io_raised += other.io_raised;
         self.interpolated += other.interpolated;
+        self.weighted_steps += other.weighted_steps;
         self.vertex_values += other.vertex_values;
         self.compressed += other.compressed;
         self.emit_programs += other.emit_programs;
@@ -541,7 +544,7 @@ fn tally_program(
     checks: &mut Checks,
 ) {
     t.programs += 1;
-    match ir::build_with(&p.patched_code(), p.wave64, p.vgprs, p.uses_spill_table()) {
+    match victory_shader::spill::build(p) {
         Ok(program) => {
             t.translated += 1;
             t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
@@ -762,6 +765,7 @@ fn tally_io(r: &io::Io, t: &mut Tally) {
     for (_, i) in &r.interps {
         match i {
             io::Interp::Interpolated { .. } => t.interpolated += 1,
+            io::Interp::Weighted { .. } => t.weighted_steps += 1,
             io::Interp::Vertex { .. } => t.vertex_values += 1,
         }
     }
