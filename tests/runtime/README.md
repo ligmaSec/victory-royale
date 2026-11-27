@@ -1,8 +1,9 @@
 # Synthetic runtime conformance under Wine
 
-This opt-in integration harness builds synthetic x86-64 PE fixtures
-from original source and executes them directly under Wine and through
-VIctory's Windows loader.
+This integration harness builds synthetic x86-64 PE fixtures from original
+source. It runs selected fixtures directly under Wine, then exercises
+VIctory's Windows loader. Distribution CI also runs it against the packaged
+Windows executable. [Distribution workflow](../../.github/workflows/proton.yml)
 
 ## Requirements
 
@@ -11,7 +12,8 @@ VIctory's Windows loader.
 - AVX2 and FMA support in the execution environment.
 - Python 3, Bash, clang, lld-link, llvm-dlltool and llvm-readobj.
 
-The compiler and linker tools must be on PATH.
+Put the LLVM tools on PATH. If Wine needs a display on a headless Linux host,
+run the command under `xvfb-run -a` as distribution CI does.
 
 ## Running
 
@@ -41,8 +43,9 @@ are never intended for inclusion in the repository.
 - Missing import reporting and zero-return stub behavior.
 - Map-only operation and alternate title exit codes.
 
-The runner records individual results and writes a JSON summary.
-A failed or blocked case produces a nonzero exit status.
+The runner prints the temporary directory, writes case logs to its `logs/`
+subdirectory and writes `summary.json` in the temporary directory after the
+checks. A failed or blocked case produces a nonzero exit status.
 
 ## Initial validation
 
