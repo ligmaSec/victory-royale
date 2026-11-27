@@ -98,8 +98,8 @@ fn branch(before: &[u32], inside: &[u32], after: &[u32]) -> Vec<u32> {
 }
 
 /// Lowers a wave32 compute shader with the UAV table at s0 and the branch
-/// limit in s2. `wide` uses the same retry as opt-in wave-wide translation.
-fn lowered(words: &[u32], wide: bool) -> Result<(HostShader, Option<u32>), crate::ShaderError> {
+/// limit in s2. `None` uses the runtime's default wave retry policy.
+fn lowered(words: &[u32], wide: Option<bool>) -> Result<HostShader, crate::ShaderError> {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -144,18 +144,14 @@ fn lowered(words: &[u32], wide: bool) -> Result<(HostShader, Option<u32>), crate
         version: (1, 0),
         parts: Vec::new(),
     };
-    if wide {
-        return super::widen(&c, &native, &p, false, false);
-    }
     let st = structure::structure(&p)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native)?;
-    super::emit_program(&c, &native, &p, &st, &io, &res)
+    super::emit_with_wave_policy(&c, &native, &p, &st, &io, &res, wide)
 }
 
-fn build(words: &[u32], wide: bool) -> HostShader {
-    let (shader, wave_size) = lowered(words, wide).expect("lower");
-    assert_eq!(wave_size, Some(32));
+fn build(words: &[u32], wide: Option<bool>) -> HostShader {
+    let shader = lowered(words, wide).expect("lower");
     assert_test_wave_size(&shader, 32);
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -168,7 +164,7 @@ fn build(words: &[u32], wide: bool) -> HostShader {
 
 fn build_after_widening(words: &[u32]) -> HostShader {
     lower::take_needs();
-    let Err(error) = lowered(words, false) else {
+    let Err(error) = lowered(words, Some(false)) else {
         panic!("a per-lane join would give some lanes the wrong SGPR value");
     };
     assert!(
@@ -185,7 +181,7 @@ fn build_after_widening(words: &[u32]) -> HostShader {
         !lower::take_needs().is_empty(),
         "no divergent arm was named"
     );
-    build(words, true)
+    build(words, None)
 }
 
 /// On each backend that supports wave32, dispatches every case and compares
@@ -263,7 +259,7 @@ fn a_negated_compare_counts_the_lanes_outside_its_branch() {
             ],
             &[],
         ),
-        false,
+        None,
     );
     check(&shader, &[(10, below_ten(27, 0))]);
 }
@@ -274,7 +270,7 @@ fn a_negated_compare_counts_the_lanes_outside_its_branch() {
 fn the_lanes_that_skipped_a_branch_read_as_a_number_inside_it() {
     let shader = build(
         &branch(&[], &[s_andn2_b32(20, 6, EXEC_LO), v_mov_b32(1, 20)], &[]),
-        false,
+        None,
     );
     check(
         &shader,

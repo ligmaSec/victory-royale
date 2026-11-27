@@ -407,6 +407,11 @@ comparing a GPU test failure with the software adapter. WARP
 is not a real GPU, so behaviour that depends on the hardware (wave size,
 driver quirks) is only settled by a run on that hardware.
 
+For 32-lane compute shaders with a `32×1×1` thread group, the translator
+can retry a refused numeric lane-mask join using only subgroup operations.
+Use `VICTORY_WAVE_WIDE=0` to disable the retry for comparisons. Widening
+that can require barriers across host waves remains opt-in.
+
 Run one crate or one test on its own:
 
 ```powershell

@@ -528,11 +528,13 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
-    match emit_with_wave_policy(c, native, p, st, io, res) {
+    let wide = std::env::var_os("VICTORY_WAVE_WIDE").map(|v| v == "1");
+    let attempt = || emit_with_wave_policy(c, native, p, st, io, res, wide);
+    match attempt() {
         Err(ShaderError::Unsupported {
             what: lower::FIRST_HALF,
             ..
-        }) => lower::with_first_half_pairs(|| emit_with_wave_policy(c, native, p, st, io, res)),
+        }) => lower::with_first_half_pairs(attempt),
         other => other,
     }
 }
@@ -544,14 +546,13 @@ fn emit_with_wave_policy(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+    wide: Option<bool>,
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
     // A wave-wide branch that requires a synthetic group barrier is opt-in.
-    let wide_on = std::env::var_os("VICTORY_WAVE_WIDE")
-        .as_ref()
-        .map_or_else(|| WIDE_HERE.get(), |v| v == "1");
+    let wide_on = wide.unwrap_or_else(|| WIDE_HERE.get());
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -779,23 +780,35 @@ fn emit_with_wave_policy(
             }
         }
     }
-    // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
-    // trace programs): right once the wave takes that skip together ([`widen`]; the
-    // lowering has named the skipped blocks).
+    // A scalar mask join is exact when the subgroup takes the branch together
+    // ([`widen`]; the lowering has named the blocks it needs). A linear group
+    // of 32 guest lanes uses one host wave and inserts no group barrier.
     let original = match original {
-        Err(ShaderError::Unsupported { what, .. })
-            if native.stage == HwStage::Cs && what == lower::LANE_MASK && wide_on =>
-        {
-            let again = widen(
-                c,
-                native,
-                p,
-                std::env::var_os("VICTORY_WAVE_WHY").is_some(),
-                false,
-            );
-            match again {
-                Ok(_) => again,
-                Err(_) => emit_program(c, native, p, st, io, res),
+        Err(
+            error @ ShaderError::Unsupported {
+                what: lower::LANE_MASK,
+                ..
+            },
+        ) if native.stage == HwStage::Cs => {
+            let subgroup_only = || {
+                wide.is_none()
+                    && !native.wave64
+                    && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads == [32, 1, 1])
+                    // Zero means no device queried yet; the DXIL still pins WaveSize(32).
+                    && !matches!(lower::host_max_wave(), 1..=31)
+                    && !lower::take_needs().is_empty()
+            };
+            if !wide_on && !subgroup_only() {
+                Err(error)
+            } else {
+                widen(
+                    c,
+                    native,
+                    p,
+                    std::env::var_os("VICTORY_WAVE_WHY").is_some(),
+                    false,
+                )
+                .or(Err(error))
             }
         }
         other => other,
