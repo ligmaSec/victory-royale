@@ -36,9 +36,10 @@ LLVM, and the MSVC Rust target installed, build one using
 From the checkout in Bash, with the cross-build tools and Linux DXC above,
 build and check the same distribution CI publishes. The packager requires
 Python 3, the full Git revision, and a new output directory outside the
-checkout whose parent already exists. It checks the three embedded GPU
-helpers before shipping only the executable, launcher, example configuration,
-license, launcher regression test, and revision.
+checkout whose parent already exists. It checks that every production GPU
+helper compiled by DXC is embedded in the executable. It ships only the
+executable, launcher, example configuration, license, launcher regression
+test, and revision.
 
 ```sh
 (

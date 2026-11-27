@@ -28,9 +28,10 @@ merged Git tree matches the one the job tested. Direct code pushes and merges
 without matching test evidence rerun it. The regression gate verifies the
 expected jobs for each path. A docs-only merge does not publish a binary.
 
-The distribution job builds the x86-64 Windows release on Linux and checks the
-embedded DXIL for `argument_clamp`, `rect_expand` and `rect_rewrite`. It unpacks the
-archive, exercises the offline launcher checks and pinned runtime selection with
+The distribution job builds the x86-64 Windows release on Linux and checks
+that it embeds the GPU helper shaders used by presentation, readback and
+indirect execution. It unpacks the archive, exercises the offline launcher
+checks and pinned runtime selection with
 a fake UMU, and runs the packaged executable under Wine against
 [synthetic PE fixtures](../tests/runtime/README.md). The suite checks import
 binding, TLS, threads, memory, DLL loading, and expected title return codes.
@@ -212,8 +213,9 @@ runtime choice for all runs you intend to compare.
 `--keys` passes an optional `VICTORY_KEYS` schedule unchanged to each build.
 It requires a diagnostics-enabled build. The point syntax above holds each key
 for 0.2 seconds at the specified time after input starts, not after process
-launch. Use range syntax such as `10-10.5:Enter` only with builds that support
-it. With no `--keys`, the runner does not inherit an ambient `VICTORY_KEYS`.
+launch. The integrated diagnostics build also accepts a held range, such as
+`10-10.5:Enter`. Use point syntax for older builds. With no `--keys`, the
+runner does not inherit an ambient `VICTORY_KEYS`.
 Close each game normally when your scenario is finished; the runner does not
 enforce a timeout. Verify gameplay and that a new save resumes manually, using
 a separate persistent test profile for the create-and-resume check: local
@@ -229,6 +231,62 @@ neither a boot log nor a zero exit proves gameplay or a successful save. The
 runner finishes normal exits serially and returns the first nonzero status, if
 any. It does not archive saves or upload the results. Keep this folder private:
 its unfiltered logs can contain sensitive information.
+
+## Player acceptance
+
+Use the exact tested package revisions and verify `SHA256SUMS` before launch.
+Report the OS, driver, GPU selected in the log, Proton and vkd3d-proton
+versions where applicable, console profile, actual swap-chain resolution,
+and cache state. On hybrid systems select the intended adapter with
+`VICTORY_ADAPTER` (a case-insensitive name fragment) and check the log.
+Apply the same settings and input sequence to all builds being compared.
+
+| Physical adapter under test | First comparison | Minimum target |
+| --- | --- | --- |
+| High-end discrete AMD or NVIDIA | 3840×2160 output, Series X | 30 FPS average, p95 ≤ 50 ms |
+| AMD or NVIDIA at lower resolution; feature-capable Intel Arc | 1920×1080 output, Series S | 30 FPS average, p95 ≤ 50 ms |
+| Integrated GPU that meets the same feature requirements | 1920×1080 output, Series S | 30 FPS average, p95 ≤ 50 ms; exploratory |
+
+These are test targets, not verified hardware tiers. Repeat on native Windows
+and Linux/Proton with the same GPU where possible. Set the test display to the
+requested resolution and record the actual swap-chain size from the log: a
+smaller window or Series S alone does not guarantee 1080p output. If the
+system cannot present at the specified size or initialize the required D3D12
+capabilities, record that result separately. WARP runs qualify only as
+functional checks, never as performance results.
+
+1. Run the [clean-data comparison](#compare-extracted-builds-locally) on the
+   candidate. Complete setup, change a setting that is easy to check later,
+   and start a new game. Watch the intro without skipping it. Mark the time
+   from starting or resuming the game until camera or movement input changes
+   a rendered world frame. If input never changes the scene, report no first
+   control, not the time of the first present.
+2. From the [copied save](#run-a-hardware-test), turn the camera, walk across a
+   doorway, return, and reach the next available checkpoint. Look for scene
+   geometry, materials, lighting, characters, and effects. Repeat the same
+   indoor–outdoor route for at least ten minutes or until blocked. Record the
+   last point actually played, visual faults, resets or crashes, and process
+   memory and GPU memory at the same locations after repeated transitions.
+3. Repeat one checkpoint in a separate persistent test profile using the
+   [packaged Windows command](#ci-and-build-downloads) or the
+   [packaged Proton launcher](proton-launcher.md#launch). Set
+   `VICTORY_DATA_DIR` and `VICTORY_CACHE_DIR` to writable paths outside the
+   checkout (Windows paths, including under Proton); use a separate
+   `WINEPREFIX` on Linux. Keep the same test profile when relaunching. Save
+   using the game's available save or checkpoint, quit normally, reopen the
+   game, and verify that both progress and the chosen setting persist. Files
+   on disk alone do not establish a successful resume.
+4. Report the load time separately from a fixed segment after first control.
+   For both cold and warm runs, include average FPS, p95 and worst frame time,
+   and counts over 100 ms and one second. Include the sample length. Any crash,
+   device removal, persistent corruption, or one-second stall fails the
+   sustained-play check even if average FPS meets the target.
+
+Return a written summary with revisions, setting values, timing aggregates,
+and the observed blocker to the issue or PR. Keep game files, saves, captures,
+raw logs, and local paths out of public replies. Use the
+[private report workflow](#receive-private-hardware-reports) only for reviewed,
+filtered diagnostics requested by a maintainer.
 
 ## Receive private hardware reports
 

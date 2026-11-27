@@ -17,13 +17,14 @@ available from [successful main CI runs that package a build](docs/testing.md#ci
 
 ## Status
 
-Boot, first-time setup, menus, and intro video work. The title can enter the
-world, but the scene can render mostly black, run slowly, or hang the GPU.
-World gameplay remains unplayable. On Windows a GPU hang can trigger a display
-driver reset. Use the diagnostics build with `VICTORY_D3D12_WARP=1` to
-investigate on the software adapter.
+Boot, setup, and menus are testable. World rendering can still have missing
+geometry, corrupted lighting, long stalls, or a GPU hang. A clean launch, a
+short saved scene, or a successful software-adapter test does not establish
+playability. On Windows, a GPU hang may reset the display driver.
 
-Testing a pull request on Windows or Linux/Proton? The [interactive hardware test](docs/testing.md#run-a-hardware-test) runs both builds from separate copies of your own standard `7952987A` save. It keeps the raw logs local and lets you review a filtered ZIP before sharing.
+For Windows and Linux/Proton, see the [player acceptance checklist](docs/testing.md#player-acceptance)
+and [interactive hardware comparison](docs/testing.md#run-a-hardware-test).
+Both keep raw logs and game files local.
 
 ## Run on Linux
 
@@ -181,9 +182,10 @@ checkout for captures and dumps.
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
 | `VICTORY_PROFILE=<ms>` | sample busy threads at the specified interval and log per-thread CPU time and stack samples |
 | `VICTORY_TRACE_PIPELINES=1` | log shader identities and the compiling thread in release builds too. Diagnostics adds the host pipeline name |
+| `VICTORY_PRESENT_LOG=1` | records each successful host present, also in release builds; does not identify player control |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_KEYS=30:Enter,35-36:X` | taps Enter for 0.2 s and holds X for 1 s, relative to input startup; diagnostics only |
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves power-of-two presented frames plus any listed in `VICTORY_CAPTURE_FRAMES=<list>` |
@@ -197,12 +199,9 @@ checkout for captures and dumps.
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_LOG=victory_gpu::draw=debug` | on explicitly listed frames and the two world follow-ups, logs each draw or dispatch with its targets (named as in the `VICTORY_DUMP_TARGETS` files) and, if it was dropped, why |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
-| `VICTORY_SKIP_HOST_PSOS=<name>,...` | omit a host pipeline whose 32-digit library name matches exactly; get names and worker thread IDs with `VICTORY_TRACE_PIPELINES=1` |
-| `VICTORY_SKIP_WAVE64=mesh,compute` | omit draws and dispatches whose pipeline has a program of a listed stage written for 64-lane waves (on hosts with 32-lane waves, such as NVIDIA's, these can hang the GPU) |
 | `VICTORY_SLOT67_HR=<name>` | what the device's `DeserializeComputePipelineStateX` (slot 67, used by the AMD upscaler with GFX10 compute programs we do not translate) returns: `E_FAIL` (the default, also without this build), `E_INVALIDARG`, `E_NOTIMPL` or `S_OK` (a pipeline whose dispatches are dropped); the title's reaction to each shows whether it has a fallback |
 | `VICTORY_FSPX_REJECT_SLOT62=1` | fail `CreateComputePipelineStateX` (slot 62) with `E_FAIL` for FSPX compute modules instead of making a pipeline whose dispatches are dropped |
 | `VICTORY_GPU_TIMING=1` | times each submission list separately. Enable `VICTORY_D3D12_DRED=1` to record command detail for slow lists |
-| `VICTORY_WAIT_TIMEOUT_MS=<ms>` | override the 2000 ms fail-open timeout for mid-list GPU memory waits |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_ADAPTER=<name>` | select a D3D12 adapter by case-insensitive substring (default: the first GPU, in high-performance order, with shader model 6.6, resource binding tier 3 and mesh shaders; the log says what is missing when none has all three) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); lowering the limit changes shader execution, so check the rendered result alongside frame times |
@@ -264,6 +263,10 @@ our own functions, error codes and timings are enough to start.
 A first contribution can be a test result from your machine. The
 [testing and reporting guide](CONTRIBUTING.md#help-by-testing) covers how to
 pick a test, confirm an existing issue, or report a new failure.
+
+The shader, GPU memory and submission, and loading runtime builds on
+[DoubleGhosty/cool_fox and its contributors](https://github.com/DoubleGhosty/cool_fox/tree/7cc053173e6bfc99ce9beb8a3fff3033fa467dde).
+VIctory Royale retains its own distribution, diagnostics, and regression gate.
 
 ## License
 
