@@ -108,6 +108,7 @@ pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
+    pub const VIEWPORT_RT_INDEX: u64 = 1 << 9;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     /// Unordered views in a vertex, geometry or mesh program.
@@ -848,6 +849,13 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
+        if self.threads.is_none()
+            && !self.pixel
+            && self.geometry.is_none()
+            && self.outputs.iter().any(|o| matches!(o.kind, 4 | 5))
+        {
+            self.flags |= flags::VIEWPORT_RT_INDEX;
+        }
         // Entry properties: shader flags (tag 0), geometry state (1),
         // thread-group size (4), wave size (11).
         let mut props = Vec::new();
@@ -953,6 +961,9 @@ impl Shader {
         if self.flags & flags::ROVS != 0 {
             features |= 0x1000;
         }
+        if self.flags & flags::VIEWPORT_RT_INDEX != 0 {
+            features |= 0x2000;
+        }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
         }
@@ -1038,7 +1049,7 @@ impl Shader {
             };
             let ops = vec![
                 c32(self, id as u32),
-                Some(self.m.md_str(&e.name)),
+                Some(self.m.md_str(e.semantic_name())),
                 c8(self, e.comp),
                 c8(self, e.kind),
                 indices,
