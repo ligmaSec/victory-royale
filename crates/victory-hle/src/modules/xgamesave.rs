@@ -26,7 +26,7 @@ use std::sync::Mutex;
 
 use super::xasync::{self, AsyncBlock, E_INVALIDARG};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, query_interface, text,
 };
 use super::{storage, xuser};
 use crate::runtime;
@@ -37,7 +37,7 @@ pub const PROVIDER: Guid = Guid::new(
     0x4cc2,
     [0xb1, 0x97, 0x30, 0x51, 0x1b, 0x99, 0x6f, 0xe2],
 );
-/// As the title (2026) asks for it; every slot it calls takes
+/// As the title asks for it; every slot it calls takes
 /// the public API's arguments in the same order as under the provider's
 /// own id (older titles).
 pub const IID_2026: Guid = Guid::new(
@@ -47,7 +47,7 @@ pub const IID_2026: Guid = Guid::new(
     [0x8e, 0x35, 0x9a, 0xda, 0x90, 0x65, 0x93, 0xf9],
 );
 
-pub static OBJECT: Object = Object::new("game save", &VTABLE);
+pub static OBJECT: Object = Object::with_iids("game save", &VTABLE, &[PROVIDER, IID_2026]);
 pub const INTERFACES: &[Interface] =
     &[(PROVIDER, PROVIDER, &OBJECT), (PROVIDER, IID_2026, &OBJECT)];
 
@@ -135,9 +135,7 @@ fn valid_container(name: &str) -> bool {
 /// A committed version of a container.
 struct Version {
     dir: PathBuf,
-    /// The highest version number any entry in the container's folder
-    /// carries, readable or not; the next commit goes above it.
-    highest: u64,
+    number: u64,
     name: String,
     display: String,
     /// Blob names; blob `i` is the file `i`.
@@ -179,73 +177,49 @@ fn parse_manifest(bytes: &[u8]) -> Option<Vec<String>> {
     (out.len() >= 2).then_some(out)
 }
 
-/// The number of a version folder exactly as [`commit`] names it (`v1`,
-/// `v2`, ...); `None` for anything else, such as `v01`, `v+1` or `v0`.
+/// Only `v<N>` with canonical decimal digits names a generation. An alias
+/// such as `v01` must not be mistaken for a committed save during cleanup.
 fn version_number(file: &str) -> Option<u64> {
-    let n = file.strip_prefix('v')?.parse::<u64>().ok()?;
-    (n > 0 && format!("v{n}") == file).then_some(n)
+    let digits = file.strip_prefix('v')?;
+    let number = digits.parse::<u64>().ok()?;
+    (number.to_string() == digits).then_some(number)
 }
 
-/// The names in version folder `dir`: container, display, blobs; `None` if
-/// its manifest is missing or does not parse.
-fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
-    let bytes = match std::fs::read(dir.join(MANIFEST)) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let Some(mut names) = parse_manifest(&bytes) else {
-        return Ok(None);
-    };
-    let blobs = names.split_off(2);
-    let [name, display] = <[String; 2]>::try_from(names).expect("two names, checked by the parser");
-    Ok(Some((name, display, blobs)))
-}
-
-/// The container's newest readable committed version, if any. Removes what
-/// a crash left: unfinished versions, and versions older than that one.
-/// An unreadable newer folder (a stray, or a broken manifest) is neither
-/// taken nor removed, and never costs the version below it.
+/// The newest committed version, if any. A bad newest manifest is an
+/// error, not an empty slot or permission to discard older versions.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let mut committed = Vec::new();
-    let mut highest = 0;
     for entry in std::fs::read_dir(dir)?.flatten() {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
             std::fs::remove_dir_all(entry.path())?;
         } else if let Some(n) = version_number(&file) {
-            highest = highest.max(n);
-            if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                committed.push(n);
-            }
+            committed.push(n);
         }
     }
-    committed.sort_unstable_by(|a, b| b.cmp(a));
-    if committed.is_empty() {
+    committed.sort_unstable();
+    let Some(&number) = committed.last() else {
         return Ok(None);
+    };
+    let version = dir.join(format!("v{number}"));
+    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
+    // Once the version directory exists, a missing manifest is corruption,
+    // not a missing container. Callers distinguish these cases.
+    let manifest = std::fs::read(version.join(MANIFEST)).map_err(|_| bad())?;
+    let mut names = parse_manifest(&manifest).ok_or_else(bad)?;
+    let blobs = names.split_off(2);
+    let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad())?;
+    for old in &committed[..committed.len() - 1] {
+        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
     }
-    for (at, &number) in committed.iter().enumerate() {
-        let version = dir.join(format!("v{number}"));
-        let Some((name, display, blobs)) = load(&version)? else {
-            continue;
-        };
-        for old in &committed[at + 1..] {
-            std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
-        }
-        return Ok(Some(Version {
-            dir: version,
-            highest,
-            name,
-            display,
-            blobs,
-        }));
-    }
-    // Versions exist but none reads: keep them all, and refuse.
-    Err(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "no save version has a readable manifest",
-    ))
+    Ok(Some(Version {
+        dir: version,
+        number,
+        name,
+        display,
+        blobs,
+    }))
 }
 
 /// The version of container `name` in `dir`; none for a missing container
@@ -294,7 +268,7 @@ fn commit(
             Source::Data(data) => write(path, data)?,
             // Files are never changed in place, so sharing one is safe.
             Source::Kept(from) => {
-                std::fs::hard_link(from, &path).or_else(|_| write(path, &std::fs::read(from)?))?
+                std::fs::hard_link(from, &path).or_else(|_| std::fs::copy(from, &path).map(drop))?
             }
         }
         step();
@@ -398,6 +372,11 @@ fn take<T>(handle: *mut T) {
     }
 }
 
+/// A failed creation leaves a null handle so the caller can close it.
+fn clear<T>(out: *mut *mut T) {
+    let _ = put(out, std::ptr::null_mut());
+}
+
 impl Provider {
     /// The provider for the only user and `config` (the service
     /// configuration id), under `saves`. An empty id names no
@@ -441,7 +420,9 @@ fn remaining(root: &Path) -> u64 {
 /// new version is written before the old one goes, so nothing it replaces
 /// counts there).
 fn no_room(written: u64, replaced: u64, used: u64, free: u64) -> Option<HRESULT> {
-    if written > QUOTA.saturating_sub(used) + replaced {
+    // Credit the replaced bytes before clamping the free quota; clamping
+    // first would forgive any excess in the kept data.
+    if written > QUOTA.saturating_sub(used.saturating_sub(replaced)) {
         Some(QUOTA_EXCEEDED)
     } else if written > free {
         Some(OUT_OF_LOCAL_STORAGE)
@@ -511,7 +492,7 @@ impl Update {
         }
         let display = self.display.as_deref();
         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
-        let number = current.as_ref().map_or(1, |v| v.highest + 1);
+        let number = current.as_ref().map_or(1, |v| v.number + 1);
         if let Err(e) = commit(&self.dir, number, &self.name, display.unwrap_or(""), &blobs) {
             return io_error(&self.dir, &e);
         }
@@ -687,6 +668,7 @@ extern "system" fn initialize_result(
     block: *mut AsyncBlock,
     out: *mut *mut Provider,
 ) -> HRESULT {
+    clear(out);
     xasync::result(block, (&raw const INIT).cast(), out)
 }
 extern "system" fn close_provider(_: This, provider: *mut Provider) {
@@ -764,6 +746,7 @@ extern "system" fn create_container(
     name: *const c_char,
     out: *mut *mut Container,
 ) -> HRESULT {
+    clear(out);
     let (Some(p), Some(name)) = (get(provider), text(name)) else {
         return E_INVALIDARG;
     };
@@ -813,11 +796,14 @@ extern "system" fn read_blobs(
     size: usize,
     out: *mut u8,
 ) -> HRESULT {
+    if count.is_null() {
+        return E_INVALIDARG;
+    }
     let Some(c) = get(container) else {
         return E_INVALIDARG;
     };
-    // SAFETY: the title passes its count.
-    let wanted = unsafe { count.as_ref() }.copied().unwrap_or(0);
+    // SAFETY: the title supplies the required count, checked above for null.
+    let wanted = unsafe { count.read() };
     let blobs = match read(c, names(blob_names, wanted)) {
         Ok(blobs) => blobs,
         Err(hr) => return hr,
@@ -853,6 +839,9 @@ extern "system" fn read_result(
     out: *mut u8,
     count: *mut u32,
 ) -> HRESULT {
+    if count.is_null() {
+        return E_INVALIDARG;
+    }
     let mut used = 0;
     let hr = xasync::XAsyncGetResult(block, (&raw const READ).cast(), size, out.cast(), &mut used);
     // The documented error for a small buffer; the result stays for a
@@ -888,6 +877,7 @@ extern "system" fn create_update(
     display: *const c_char,
     out: *mut *mut Update,
 ) -> HRESULT {
+    clear(out);
     let Some(c) = get(container) else {
         return E_INVALIDARG;
     };
@@ -922,6 +912,10 @@ extern "system" fn write_blob(
     if size > MAX_UPDATE {
         return UPDATE_TOO_BIG;
     }
+    if update.changes.iter().any(|(n, _)| *n == name) {
+        // The GDK permits only one write or delete of a blob per update.
+        return E_INVALIDARG;
+    }
     let data = if size == 0 {
         Vec::new()
     } else {
@@ -935,7 +929,9 @@ extern "system" fn write_blob(
 extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char) -> HRESULT {
     // SAFETY: as in `write_blob`.
     match (unsafe { update.as_mut() }, text(name)) {
-        (Some(update), Some(name)) if !name.is_empty() => {
+        (Some(update), Some(name))
+            if !name.is_empty() && !update.changes.iter().any(|(n, _)| *n == name) =>
+        {
             update.changes.push((name, None));
             S_OK
         }
@@ -953,7 +949,7 @@ extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
 }
 
 static VTABLE: Methods<30> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     missing::<3> as *const (),         // 0x18 initialize (blocking)
@@ -1033,6 +1029,23 @@ mod tests {
         assert_eq!(no_room(mb, 0, 0, mb), None);
     }
 
+    #[test]
+    fn replacements_do_not_hide_an_existing_quota_excess() {
+        let mb = 1 << 20;
+        let used = QUOTA + mb;
+        let free = u64::MAX;
+        assert_eq!(no_room(mb, mb, used, free), Some(QUOTA_EXCEEDED));
+        assert_eq!(no_room(1, mb, used, free), Some(QUOTA_EXCEEDED));
+        assert_eq!(no_room(mb, 2 * mb, used, free), None);
+        assert_eq!(no_room(mb + 1, 2 * mb, used, free), Some(QUOTA_EXCEEDED));
+        // Deleting blobs must remain possible even before all excess is gone.
+        assert_eq!(no_room(0, mb / 2, used, free), None);
+        assert_eq!(
+            no_room(mb, 2 * mb, used, mb - 1),
+            Some(OUT_OF_LOCAL_STORAGE)
+        );
+    }
+
     fn update(root: &Path, display: &str, changes: &[(&str, Option<&str>)]) -> HRESULT {
         Update {
             name: "Slot".into(),
@@ -1053,6 +1066,28 @@ mod tests {
         let blobs = read(&c, None).unwrap();
         let text = |(n, d): (String, Vec<u8>)| (n, String::from_utf8(d).unwrap());
         Some((display, blobs.into_iter().map(text).collect()))
+    }
+
+    #[test]
+    fn unreadable_latest_manifest_preserves_previous_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = dir.path().join("v1");
+        let latest = dir.path().join("v2");
+        std::fs::create_dir(&older).unwrap();
+        std::fs::create_dir(&latest).unwrap();
+        std::fs::write(older.join(MANIFEST), manifest("Slot", "Previous", &[])).unwrap();
+
+        assert!(current(dir.path()).is_err());
+        assert!(older.join(MANIFEST).is_file());
+
+        std::fs::write(latest.join(MANIFEST), []).unwrap();
+        assert!(current(dir.path()).is_err());
+        assert!(older.join(MANIFEST).is_file());
+
+        std::fs::write(latest.join(MANIFEST), manifest("Slot", "Latest", &[])).unwrap();
+        let loaded = current(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.number, 2);
+        assert!(!older.exists());
     }
 
     fn old_state() -> Option<(String, Vec<(String, String)>)> {
@@ -1173,6 +1208,47 @@ mod tests {
         assert_eq!(std::fs::read(links.path().join("0")).unwrap(), b"old b");
     }
 
+    /// Numeric aliases must not displace or be removed with a committed save.
+    #[test]
+    fn a_folder_named_like_a_version_does_not_remove_the_save() {
+        for good in ["v0", "v1", "v10", "v18446744073709551615"] {
+            assert!(version_number(good).is_some(), "{good}");
+        }
+        for bad in [
+            "v01", "v001", "v+1", "v-1", "v 1", "v", "1", "V1", "v1.new", "v1x",
+        ] {
+            assert_eq!(version_number(bad), None, "{bad}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
+        let slot = container_dir(root, "Slot");
+        assert!(slot.join("v1").is_dir());
+        let strays = ["v01", "v001", "v+1"];
+        for stray in strays {
+            std::fs::create_dir(slot.join(stray)).unwrap();
+        }
+        assert_eq!(state(root), old_state());
+        assert!(slot.join("v1").is_dir());
+        for stray in strays {
+            assert!(slot.join(stray).is_dir(), "{stray}");
+        }
+
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK);
+        assert!(slot.join("v2").is_dir() && !slot.join("v1").exists());
+        assert_eq!(
+            state(root),
+            Some((
+                "two".into(),
+                vec![("a".into(), "new a".into()), ("b".into(), "old b".into())],
+            ))
+        );
+    }
+
     #[test]
     fn names_are_exact() {
         for name in ["Save_1", "slot/2", "a.b c%", "\u{e9}t\u{e9}"] {
@@ -1266,10 +1342,7 @@ mod tests {
             ]
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
-        assert_eq!(
-            (v.dir.file_name(), v.display.as_str()),
-            (Some("v1".as_ref()), "Chapter 1")
-        );
+        assert_eq!((v.number, v.display.as_str()), (1, "Chapter 1"));
     }
 
     /// An empty configuration id names none. As a folder name it would be
@@ -1295,6 +1368,61 @@ mod tests {
         let other = Provider::open(saves.path(), Some("other")).unwrap();
         assert_eq!(state(&other.root), None);
         assert_eq!(state(&scid.root), kept);
+    }
+
+    #[test]
+    fn the_save_object_answers_both_interfaces_and_iunknown() {
+        use crate::modules::xgameruntime::{E_NOINTERFACE, E_POINTER, IID_IUNKNOWN};
+
+        type Query = extern "system" fn(*mut Object, *const Guid, *mut *mut c_void) -> HRESULT;
+        let query = method::<Query>(&OBJECT, 0);
+        let this = std::ptr::from_ref(&OBJECT).cast_mut();
+        for iid in [PROVIDER, IID_2026, IID_IUNKNOWN] {
+            let mut out = std::ptr::null_mut();
+            assert_eq!(query(this, &iid, &mut out), S_OK);
+            assert_eq!(out, this.cast());
+        }
+        let unknown = Guid::new(0, 0, 0, [0; 8]);
+        let mut out = this.cast();
+        assert_eq!(query(this, &unknown, &mut out), E_NOINTERFACE);
+        assert!(out.is_null());
+        out = this.cast();
+        assert_eq!(query(this, std::ptr::null(), &mut out), E_POINTER);
+        assert!(out.is_null());
+    }
+
+    #[test]
+    fn a_failed_create_leaves_a_null_handle() {
+        let this: This = &OBJECT;
+        let saves = tempfile::tempdir().unwrap();
+        let provider = give(Provider::open(saves.path(), Some("scid")).unwrap());
+        // What an uninitialized handle variable may hold.
+        fn garbage<T>() -> *mut T {
+            std::ptr::without_provenance_mut(0x1234)
+        }
+
+        let mut container = garbage();
+        let bad = c"bad name".as_ptr();
+        let hr = create_container(this, provider, bad, &mut container);
+        assert_eq!(hr, INVALID_CONTAINER_NAME);
+        assert!(container.is_null());
+
+        let mut update = garbage();
+        let hr = create_update(this, std::ptr::null(), c"x".as_ptr(), &mut update);
+        assert_eq!(hr, E_INVALIDARG);
+        assert!(update.is_null());
+
+        let mut b = block();
+        xasync::finished_with(&mut b, (&raw const INIT).cast(), Err(NO_ACCESS));
+        let mut opened = garbage();
+        let hr = initialize_result(this, &mut b, &mut opened);
+        assert_eq!(hr, NO_ACCESS);
+        assert!(opened.is_null());
+
+        close_container(this, container);
+        close_update(this, update);
+        close_provider(this, opened);
+        close_provider(this, provider);
     }
 
     #[test]
@@ -1345,7 +1473,13 @@ mod tests {
         type Delete = extern "system" fn(This, *mut Update, *const c_char) -> HRESULT;
         assert_eq!(
             method::<Delete>(&OBJECT, 0xd0)(this, update, c"gone".as_ptr()),
-            S_OK
+            E_INVALIDARG,
+            "the same blob was already written in this update"
+        );
+        assert_eq!(
+            write(this, update, c"world".as_ptr(), b"again".as_ptr(), 5),
+            E_INVALIDARG,
+            "a second write of the same blob is refused too"
         );
         type Submit = extern "system" fn(This, *const Update, *mut AsyncBlock) -> HRESULT;
         let mut b = block();
@@ -1379,7 +1513,7 @@ mod tests {
             enumerate_containers(this, provider, context, Some(seen)),
             S_OK
         );
-        assert_eq!(found, [("Slot_1".into(), "Chapter 1".into(), 2, 7)]);
+        assert_eq!(found, [("Slot_1".into(), "Chapter 1".into(), 3, 8)]);
 
         let mut container = std::ptr::null_mut();
         assert_eq!(
@@ -1401,6 +1535,17 @@ mod tests {
         );
         let mut buffer = vec![0u64; size.div_ceil(8)];
         let mut count = 0;
+        assert_eq!(
+            read_result(
+                this,
+                &mut b,
+                size,
+                buffer.as_mut_ptr().cast(),
+                std::ptr::null_mut()
+            ),
+            E_INVALIDARG
+        );
+        assert!(buffer.iter().all(|&word| word == 0));
         assert_eq!(
             read_result(this, &mut b, 8, buffer.as_mut_ptr().cast(), &mut count),
             BUFFER_TOO_SMALL
@@ -1439,6 +1584,19 @@ mod tests {
                 *mut u8,
             ) -> HRESULT,
         >(&OBJECT, 0xa0);
+        buffer.fill(0);
+        assert_eq!(
+            read_now(
+                this,
+                container,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                size,
+                buffer.as_mut_ptr().cast()
+            ),
+            E_INVALIDARG
+        );
+        assert!(buffer.iter().all(|&word| word == 0));
         assert_eq!(
             read_now(
                 this,
@@ -1483,71 +1641,6 @@ mod tests {
         assert!(found.is_empty());
         close_container(this, container);
         close_provider(this, provider);
-    }
-
-    /// Only `v<N>` as `commit` writes it is a version: `v01` and the like
-    /// are neither read, counted nor removed (#870).
-    #[test]
-    fn a_noncanonical_folder_does_not_remove_a_committed_save() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        assert_eq!(
-            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
-            S_OK
-        );
-        let slot = container_dir(root, "Slot");
-        for stray in ["v01", "v001", "v+1", "v0", "v02"] {
-            std::fs::create_dir(slot.join(stray)).unwrap();
-        }
-        assert_eq!(state(root), old_state());
-        assert!(slot.join("v1").is_dir());
-        for stray in ["v01", "v001", "v+1", "v0", "v02"] {
-            assert!(slot.join(stray).exists(), "{stray} was removed");
-        }
-    }
-
-    /// A newer version folder that does not read (an empty folder, a file,
-    /// a broken manifest) neither hides the committed save, nor removes it,
-    /// nor blocks the next update, which goes above it.
-    #[test]
-    fn an_unreadable_newer_version_does_not_cost_the_save() {
-        type Make = fn(&Path);
-        let strays: [(&str, Make); 3] = [
-            ("empty folder", |p| std::fs::create_dir(p).unwrap()),
-            ("file", |p| std::fs::write(p, b"not a version").unwrap()),
-            ("broken manifest", |p| {
-                std::fs::create_dir(p).unwrap();
-                std::fs::write(p.join(MANIFEST), [9, 0, 0, 0, b'x']).unwrap();
-            }),
-        ];
-        for (what, make) in strays {
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path();
-            assert_eq!(
-                update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
-                S_OK
-            );
-            let slot = container_dir(root, "Slot");
-            make(&slot.join("v2"));
-
-            assert_eq!(state(root), old_state(), "{what}: read");
-            assert!(slot.join("v1").is_dir(), "{what}: v1 was removed");
-
-            assert_eq!(
-                update(root, "two", &[("a", Some("new a"))]),
-                S_OK,
-                "{what}: update"
-            );
-            let blobs = vec![("a".into(), "new a".into()), ("b".into(), "old b".into())];
-            let after = Some(("two".into(), blobs));
-            assert_eq!(state(root), after, "{what}: after the update");
-            assert!(
-                slot.join("v3").is_dir(),
-                "{what}: the update did not go above v2"
-            );
-            // Read again: the new version stays the container.
-            assert_eq!(state(root), after, "{what}: second read");
-        }
     }
 
     /// With no readable version at all, reads and updates fail and nothing

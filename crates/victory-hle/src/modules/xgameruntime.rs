@@ -34,6 +34,10 @@ pub type HRESULT = i32;
 pub const S_OK: HRESULT = 0;
 /// `HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)`.
 pub const NOT_SUPPORTED: HRESULT = 0x8007_0032_u32 as i32;
+/// `E_NOINTERFACE`.
+pub const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
+/// `E_POINTER`.
+pub const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +59,9 @@ impl Guid {
     }
 }
 
+/// `IUnknown` (`00000000-0000-0000-C000-000000000046`).
+pub const IID_IUNKNOWN: Guid = Guid::new(0, 0, 0, [0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
+
 impl std::fmt::Display for Guid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let d = self.data4;
@@ -73,16 +80,27 @@ pub struct Object {
     vtable: *const *const (),
     /// Named in the log when a title calls a method we lack.
     area: &'static str,
+    /// Interface IDs this object answers besides [`IID_IUNKNOWN`].
+    iids: &'static [Guid],
 }
 
-// SAFETY: the table is a static array of function addresses.
+// SAFETY: the method table and interface IDs both have static lifetimes.
 unsafe impl Sync for Object {}
 
 impl Object {
     pub const fn new<const N: usize>(area: &'static str, methods: &'static Methods<N>) -> Object {
+        Object::with_iids(area, methods, &[])
+    }
+
+    pub const fn with_iids<const N: usize>(
+        area: &'static str,
+        methods: &'static Methods<N>,
+        iids: &'static [Guid],
+    ) -> Object {
         Object {
             vtable: methods.0.as_ptr(),
             area,
+            iids,
         }
     }
 }
@@ -115,6 +133,34 @@ const AREAS: &[&[Interface]] = &[
 /// `AddRef` and `Release`.
 pub extern "system" fn add_ref(_: *const Object) -> u32 {
     1
+}
+
+/// Slot 0: `QueryInterface`. A null `out` or `iid` is `E_POINTER`;
+/// [`IID_IUNKNOWN`] and the object's registered IDs succeed and add a
+/// reference. Other IDs clear `*out` and return `E_NOINTERFACE`.
+pub extern "system" fn query_interface(
+    this: *mut Object,
+    iid: *const Guid,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    if this.is_null() || iid.is_null() {
+        let _ = put(out, std::ptr::null_mut());
+        return E_POINTER;
+    }
+    // SAFETY: the title calls methods on objects we handed out and supplies a readable IID.
+    let (object, iid) = unsafe { (&*this, *iid) };
+    if iid != IID_IUNKNOWN && !object.iids.contains(&iid) {
+        let _ = put(out, std::ptr::null_mut());
+        return E_NOINTERFACE;
+    }
+    type AddRef = extern "system" fn(*mut Object) -> u32;
+    // SAFETY: every object's method table has AddRef at slot 1.
+    let add_ref: AddRef = unsafe { std::mem::transmute(*object.vtable.add(1)) };
+    add_ref(this);
+    put(out, this.cast())
 }
 
 /// A slot nobody has needed yet; logged with its area. Wrong for a slot

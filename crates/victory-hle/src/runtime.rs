@@ -107,13 +107,20 @@ impl Title {
                 .find(|(p, _)| p == path)
                 .map(|(_, text)| text.as_str())
         };
-        let id = get("Game/TitleId").and_then(|v| u32::from_str_radix(v, 16).ok());
-        let storage_mb = get("Game/PersistentLocalStorage/SizeMB").and_then(|v| v.parse().ok());
+        let id = get("Game/TitleId").and_then(|v| {
+            let v = v
+                .strip_prefix("0x")
+                .or_else(|| v.strip_prefix("0X"))
+                .unwrap_or(v);
+            u32::from_str_radix(v, 16).ok()
+        });
+        let storage_mb =
+            get("Game/PersistentLocalStorage/SizeMB").and_then(|v| v.parse::<u64>().ok());
         Title {
             id: id.unwrap_or(0),
             store_id: get("Game/StoreId").unwrap_or_default().to_owned(),
             storage: PathBuf::new(),
-            storage_bytes: storage_mb.unwrap_or(0) << 20,
+            storage_bytes: storage_mb.unwrap_or(0).saturating_mul(1024 * 1024),
         }
     }
 
@@ -150,10 +157,8 @@ fn field_text(rest: &str) -> String {
     out.trim().to_owned()
 }
 
-/// Each element of an XML text as its path from the root (`Game/TitleId`)
-/// and its trimmed text up to the first child, the predefined entities
-/// decoded; comments, CDATA sections, declarations and attributes are
-/// skipped.
+/// Each element's path, with its trimmed text and predefined entities
+/// decoded. Self-closing elements have no text.
 fn elements(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut path: Vec<&str> = Vec::new();
@@ -186,7 +191,11 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .next()
             .unwrap_or("");
         path.push(name);
-        let body = field_text(rest);
+        let body = if closed {
+            String::new()
+        } else {
+            field_text(rest)
+        };
         let body = [
             ("&lt;", "<"),
             ("&gt;", ">"),
@@ -324,6 +333,43 @@ mod tests {
         assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 1024 << 20));
         assert_eq!(t.store_id, "9&C");
         assert_eq!(Title::from_manifest("").storage_bytes, 0);
+    }
+
+    #[test]
+    fn parses_title_id_with_or_without_a_hex_prefix() {
+        for id in ["1234ABCD", "0x1234ABCD", "0X1234abcd"] {
+            let text = format!("<Game><TitleId>{id}</TitleId></Game>");
+            assert_eq!(Title::from_manifest(&text).id, 0x1234_ABCD, "{id}");
+        }
+        assert_eq!(
+            Title::from_manifest("<Game><TitleId>0x</TitleId></Game>").id,
+            0
+        );
+    }
+
+    #[test]
+    fn self_closing_elements_do_not_capture_trailing_text() {
+        let text = "<Game><StoreId /> trailing &amp; text <TitleId>1234</TitleId></Game>";
+        let title = Title::from_manifest(text);
+        assert_eq!(title.store_id, "");
+        assert_eq!(title.id, 0x1234);
+    }
+
+    #[test]
+    fn storage_quota_saturates_when_megabytes_exceed_u64_bytes() {
+        let max_mb = u64::MAX / (1024 * 1024);
+        let at_limit = format!(
+            "<Game><PersistentLocalStorage><SizeMB>{max_mb}</SizeMB></PersistentLocalStorage></Game>"
+        );
+        assert_eq!(
+            Title::from_manifest(&at_limit).storage_bytes,
+            max_mb * 1024 * 1024
+        );
+        let above_limit = format!(
+            "<Game><PersistentLocalStorage><SizeMB>{}</SizeMB></PersistentLocalStorage></Game>",
+            max_mb + 1
+        );
+        assert_eq!(Title::from_manifest(&above_limit).storage_bytes, u64::MAX);
     }
 
     #[test]
