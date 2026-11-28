@@ -481,14 +481,20 @@ last stable staged pixels and retry rather than block the submitting thread.
 First fills and exact refreshes still wait for a stable mapping. For a
 matched blocking-path diagnostic, set `VICTORY_TEXTURE_NO_WAIT=0`.
 
-Small transient descriptor tables share a chunk within one command-list
-recording, so finishing that list frees a contiguous range. Closing it
-returns only the unused tail; submitted descriptors remain live until GPU
-completion. Near capacity, new allocations request only the needed slots.
+Small transient descriptor tables share a chunk within one host command
+list, so its completion frees a contiguous range. Closing it returns only
+the unused tail. When a wait splits a title command list, each host part
+owns its slots and releases them after its own GPU work completes, not
+when a later part completes. Near capacity, only the needed slots are
+allocated.
 The allocator fills the smallest range that fits, preserving larger runs
 for larger tables. A failed retry logs the requested run, total free
 slots, and largest free run, so a draw lost to fragmentation is distinct
 from one lost to capacity.
+Equal table records in one host part share a live snapshot even if copied
+to another guest address in the same heap. Different records or a new
+part get a different snapshot; earlier work keeps its own descriptors.
+A final allocation failure also reports slots held by the requesting part.
 
 For donor parity diagnostics, `VICTORY_SHADER_ROLES` can point to a private
 text file outside the checkout. Each nonempty line maps a full BLAKE3 shader

@@ -142,6 +142,7 @@ struct List {
 struct Part {
     waits: Vec<ValueWait>,
     host: crate::host::HostList,
+    descriptors: crate::draw::PartDescriptors,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -162,7 +163,7 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
 
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
-/// keeps them: its state goes with its last part.
+/// transfers each part's slots on detachment instead.
 #[cfg(windows)]
 pub(crate) fn tables_done(lists: &[This]) {
     for &this in lists {
@@ -439,16 +440,23 @@ fn cut(this: This, wait: ValueWait) {
             "a list is cut at a wait for a memory value"
         );
     }
+    cut_part(list, fresh, vec![wait]);
+}
+
+/// Starts a new host part without extending the earlier part's descriptor
+/// lifetime to the end of the title list.
+#[cfg(windows)]
+fn cut_part(list: &mut List, fresh: crate::host::HostList, next_waits: Vec<ValueWait>) {
     if let Some(done) = list.host.replace(fresh) {
-        let waits = std::mem::replace(&mut list.gate, vec![wait]);
-        list.earlier.push(Part { waits, host: done });
-    }
-    // What the title set so far, on the new host list.
-    if let Some(host) = list.host.as_ref() {
-        list.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .replay(host);
+        let waits = std::mem::replace(&mut list.gate, next_waits);
+        let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+        let descriptors = state.take_part_descriptors();
+        list.earlier.push(Part {
+            waits,
+            host: done,
+            descriptors,
+        });
+        state.replay(list.host.as_ref().expect("new host list part"));
     }
 }
 
@@ -528,7 +536,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
                     Detached {
                         host: part.host,
                         _uploads: Vec::new(),
-                        _state: Default::default(),
+                        _state: crate::draw::State::with_part_descriptors(part.descriptors),
                     },
                 )
             })
@@ -2375,18 +2383,7 @@ fn value_written(this: This, address: u64, value: u64) {
             return;
         };
         current.close();
-        if let Some(done) = list.host.replace(fresh) {
-            // The part so far keeps its waits; nothing stands before the
-            // next one but this part itself.
-            let waits = std::mem::take(&mut list.gate);
-            list.earlier.push(Part { waits, host: done });
-        }
-        if let Some(host) = list.host.as_ref() {
-            list.state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .replay(host);
-        }
+        cut_part(list, fresh, Vec::new());
     }
     #[cfg(not(windows))]
     let _ = (this, address, value);

@@ -594,45 +594,58 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     host_heaps_set: bool,
-    /// Tables made afresh in this list: (table, slot count, contents) → first
-    /// dynamic slot.
+    /// Tables made afresh in this host part: (heap, slot count, digest).
+    /// Hits must also match `fresh_words` exactly.
     fresh_tables: std::collections::HashMap<
         (u64, u32, u64),
         FreshTable,
         std::hash::BuildHasherDefault<crate::host::AddressHash>,
     >,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// Packed record words of this part's snapshots, plus the probe at
+    /// the tail until its reuse or allocation has been decided.
+    fresh_words: Vec<[u32; 3]>,
+    descriptors: PartDescriptors,
     /// Unassigned slots at the end of the last dynamic reservation.
     dynamic_spare: u32,
-    /// Root SRVs bound as one-view tables in this list: (title heap, title
-    /// address; 0 for none) → dynamic slot, and the host copy the slot
-    /// shows: later draws of the list bring that one up to date, whatever
-    /// copy the address would find by then (`shadow.rs` `tails`).
-    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
-    /// Root UAVs bound as one-view tables in this list, likewise.
-    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
-    /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
+    /// This part's identity for [`crate::descriptor::host::HostHeap::make_listed`]
     /// (0: it has none yet).
     recording: u64,
 }
 
-impl Drop for State {
-    fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
+/// Dynamic ranges and the root-view backing they name, owned by one host
+/// part until its submission completes or it is discarded before submit.
+#[derive(Default)]
+pub(crate) struct PartDescriptors {
+    ranges: Vec<(usize, u32, u32)>,
+    /// For each (title heap, title address), the slot and its original
+    /// backing copy. It stays live even if the title remaps the address.
+    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+}
+
+impl PartDescriptors {
+    fn release(&mut self) {
+        for (heap, first, n) in self.ranges.drain(..) {
             crate::descriptor::release_dynamic(heap, first, n);
         }
+        self.root_srv_slots.clear();
+        self.root_uav_slots.clear();
+    }
+}
+
+impl Drop for PartDescriptors {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
 const TABLE_CHUNK: u32 = 64;
 
 impl State {
-    /// Packs small tables of the same recording together, so interleaved
-    /// recordings don't leave isolated slots when one list finishes first.
+    /// Packs small tables of the same host part together so independent
+    /// completions don't leave isolated slots.
     fn take_dynamic(
         &mut self,
         heap: usize,
@@ -640,7 +653,7 @@ impl State {
         n: u32,
     ) -> Option<u32> {
         if self.dynamic_spare >= n
-            && let Some(&(owner, first, count)) = self.dynamic.last()
+            && let Some(&(owner, first, count)) = self.descriptors.ranges.last()
             && owner == heap
         {
             let start = first + count - self.dynamic_spare;
@@ -651,27 +664,70 @@ impl State {
         if n <= TABLE_CHUNK / 2
             && let Some(first) = host.reserve_dynamic(TABLE_CHUNK)
         {
-            self.dynamic.push((heap, first, TABLE_CHUNK));
+            self.descriptors.ranges.push((heap, first, TABLE_CHUNK));
             self.dynamic_spare = TABLE_CHUNK - n;
             return Some(first);
         }
-        let first = host.dynamic(n).or_else(|| {
+        let Some(first) = host.dynamic(n).or_else(|| {
             crate::host::settle_for_fence();
             host.dynamic_after_settle(n)
-        })?;
-        self.dynamic.push((heap, first, n));
+        }) else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                let slots_here: u32 = self
+                    .descriptors
+                    .ranges
+                    .iter()
+                    .filter(|&&(owner, _, _)| owner == heap)
+                    .map(|&(_, _, slots)| slots)
+                    .sum();
+                tracing::warn!(
+                    requested = n,
+                    slots_here,
+                    "transient slots still held by the requesting host list part"
+                );
+            });
+            return None;
+        };
+        self.descriptors.ranges.push((heap, first, n));
         Some(first)
     }
 
-    /// Releases only the unused tail. Recorded descriptors remain reserved
-    /// until all the parts of this recording have run or been discarded.
+    /// Releases only the unused tail of the current part. Its recorded
+    /// descriptors remain reserved until that part runs or is discarded.
     pub(crate) fn seal_tables(&mut self) {
         let spare = std::mem::take(&mut self.dynamic_spare);
         if spare != 0 {
-            let (heap, first, count) = self.dynamic.last_mut().expect("reserved descriptor tail");
+            let (heap, first, count) = self
+                .descriptors
+                .ranges
+                .last_mut()
+                .expect("reserved descriptor tail");
             *count -= spare;
             crate::descriptor::release_dynamic(*heap, *first + *count, spare);
         }
+    }
+
+    /// A cut closes this part's recording. The next part must use its own
+    /// slots and constant fills, so the old part can retire independently.
+    pub(crate) fn take_part_descriptors(&mut self) -> PartDescriptors {
+        self.seal_tables();
+        self.clear_part_cache();
+        std::mem::take(&mut self.descriptors)
+    }
+
+    pub(crate) fn with_part_descriptors(descriptors: PartDescriptors) -> Self {
+        Self {
+            descriptors,
+            ..Self::default()
+        }
+    }
+
+    fn clear_part_cache(&mut self) {
+        self.fresh_tables.clear();
+        self.fresh_words.clear();
+        self.ambient_tables.clear();
+        self.recording = 0;
     }
 
     /// The list's submission has run (submissions are waited for): the
@@ -682,7 +738,7 @@ impl State {
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
-        if self.tables_gone && self.dynamic.is_empty() {
+        if self.tables_gone && self.descriptors.ranges.is_empty() {
             return;
         }
         if self.tables_gone {
@@ -691,14 +747,9 @@ impl State {
                 tracing::warn!("a list ran again after its descriptor tables were given back")
             });
         }
-        for (heap, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
+        self.descriptors.release();
         self.dynamic_spare = 0;
-        self.fresh_tables.clear();
-        self.recording = 0;
-        self.root_srv_slots.clear();
-        self.root_uav_slots.clear();
+        self.clear_part_cache();
         self.tables_gone = true;
     }
 }
@@ -1600,8 +1651,8 @@ impl State {
     /// draw or dispatch (`bind`, which is told here that the host list has
     /// none); root arguments, vertex and index buffers are set by every
     /// draw anyway. The dynamic descriptor slots and the tables made in
-    /// them stay: the parts before the cut have not run yet, and they are
-    /// given back when the title's list is reset.
+    /// them go with the earlier part and stay live until its submission
+    /// completes; the new part cannot reuse its cached table bindings.
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
@@ -2340,7 +2391,7 @@ impl State {
             return false;
         };
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
-        let (index, shadow) = match self.root_uav_slots.get(&key) {
+        let (index, shadow) = match self.descriptors.root_uav_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
@@ -2367,7 +2418,8 @@ impl State {
                 if shadow.is_none() {
                     host.null_raw_uav_at(index);
                 }
-                self.root_uav_slots
+                self.descriptors
+                    .root_uav_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 (index, shadow)
             }
@@ -2415,14 +2467,15 @@ impl State {
             std::ptr::from_ref(heap) as usize,
             address.unwrap_or(0) | u64::from(biased) << 63,
         );
-        let (index, shadow) = match self.root_srv_slots.get(&key) {
+        let (index, shadow) = match self.descriptors.root_srv_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = self.take_dynamic(key.0, host, 1) else {
                     return false;
                 };
-                self.root_srv_slots
+                self.descriptors
+                    .root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
                     Some((a, s)) => {
@@ -4254,10 +4307,10 @@ impl State {
     /// console only 16. Returns those tables' new byte offsets by root
     /// parameter; the other tables' slots are made from the title's.
     ///
-    /// Within a list, the same table holding the same descriptors is made
-    /// once: its constant data is copied at submission either way, and the
-    /// big tables the world binds would otherwise take hundreds of slots per
-    /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    /// Within a host part, equal descriptor records in the same heap
+    /// share one snapshot, including copies at different title addresses.
+    /// The data for their constant buffers is copied at submission either
+    /// way. Reuse never shortens the snapshot's GPU lifetime.
     /// Only valid fresh ranges participate: direct heap users keep their
     /// original binding, and an invalid stage cannot enlarge another stage.
     fn table_extents<'a>(
@@ -4364,25 +4417,43 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
-            // The table and what its entries hold (record words).
-            let key = {
-                let mut h = RecordHash::default();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
-                }
-                (table, n, h.0)
+            // Capture the exact words once. The digest locates a possible
+            // snapshot, but a collision must never bind somebody else's view.
+            let words_at = self.fresh_words.len();
+            let mut hash = RecordHash::default();
+            self.fresh_words.extend((0..n).map(|k| {
+                let words =
+                    crate::descriptor::record_at(table + u64::from(k) * 32).unwrap_or_default();
+                hash.add(words);
+                words
+            }));
+            let key = (host.heap.as_raw() as u64, n, hash.0);
+            // Readiness includes the title address: an alias still has
+            // to mark and mirror its own title slots when read.
+            let reader = FreshReader {
+                table,
+                stage: std::ptr::from_ref(plan) as usize,
+                direct: plan.direct.len(),
+                stores: STORES.get(),
+                depth: TESTED_DEPTH.get().0,
             };
-            // Who reads of it, and as what, as far as [`readable`] goes by it.
-            let reader = (
-                std::ptr::from_ref(plan) as usize,
-                plan.direct.len(),
-                STORES.get(),
-                TESTED_DEPTH.get().0,
-            );
-            if let Some(known) = self.fresh_tables.get_mut(&key) {
+            let cached = self.fresh_tables.get(&key);
+            let remember = cached.is_none();
+            if let Some(known) = cached.filter(|entry| {
+                self.fresh_words[entry.words_at..entry.words_at + n as usize]
+                    == self.fresh_words[words_at..]
+            }) {
+                self.fresh_words.truncate(words_at);
                 let first = known.first;
+                if known.table != table {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::info!(
+                            slots = n,
+                            "identical title tables share a live descriptor snapshot"
+                        );
+                    });
+                }
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
                 let once = ready_once() && selected.is_empty() && !group.has_uav;
@@ -4391,7 +4462,7 @@ impl State {
                     && let Some((_, depth)) = known.ready.iter().find(|(r, _)| *r == reader)
                 {
                     if *depth {
-                        TESTED_DEPTH.set((reader.3, true));
+                        TESTED_DEPTH.set((reader.depth, true));
                     }
                     made.push((slot, first * 32));
                     continue;
@@ -4455,19 +4526,24 @@ impl State {
                 continue;
             }
             let Some(first) = self.take_dynamic(std::ptr::from_ref(heap) as usize, host, n) else {
+                self.fresh_words.truncate(words_at);
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(
-                key,
-                FreshTable {
-                    first,
-                    epoch: 0,
-                    ready: Vec::new(),
-                },
-            );
+            if remember {
+                self.fresh_tables.insert(
+                    key,
+                    FreshTable {
+                        first,
+                        words_at,
+                        table,
+                        epoch: 0,
+                        ready: Vec::new(),
+                    },
+                );
+            }
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap
@@ -4491,10 +4567,11 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
+                let words = self.fresh_words[words_at + k as usize];
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
                 if list_views
-                    && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
+                    && words[0] != 0
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
                     let kind = group
@@ -4543,7 +4620,7 @@ impl State {
                     continue;
                 }
                 let used = group.entry(k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                match crate::descriptor::view_of_record(words) {
                     Some(View::Constant(address, size)) => {
                         // Renderer port 5: title memory in place is the
                         // card's to read where it is; nothing is copied.
@@ -4607,6 +4684,9 @@ impl State {
                         }
                     }
                 }
+            }
+            if !remember {
+                self.fresh_words.truncate(words_at);
             }
             made.push((slot, first * 32));
         }
@@ -5344,13 +5424,24 @@ impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
 
 /// A table made afresh in dynamic slots, in a list ([`State::tables`]).
 struct FreshTable {
+    words_at: usize,
+    table: u64,
     first: u32,
     /// The list's epoch ([`HostList::epoch`]) at which all its entries that
     /// these readers (a stage's list of what it reads, whether it stores, the
     /// tested depth target) read were brought up to date, and whether that read the
     /// tested depth target.
     epoch: u64,
-    ready: Vec<((usize, usize, bool, usize), bool)>,
+    ready: Vec<(FreshReader, bool)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FreshReader {
+    table: u64,
+    stage: usize,
+    direct: usize,
+    stores: bool,
+    depth: usize,
 }
 
 /// Whether a table a list reads again, with nothing changed in the list
@@ -5977,13 +6068,56 @@ mod shared_table_tests {
         }
     }
 
-    /// Different stage extents formerly exhausted a heap with 130 slots
-    /// left (6 + 128). Both now read the original slots from one snapshot,
-    /// including constants written between recording and submission.
+    #[test]
+    fn completed_part_returns_its_slots_without_retiring_the_next_part() {
+        let host = crate::host::host().expect("D3D12 device required for this regression");
+        let title = title_heap(1);
+        let heap = crate::descriptor::heap(title.0);
+        let h = heap.host().unwrap();
+        let reserved = h.dynamic_capacity() - 2;
+        let held = h.dynamic(reserved).unwrap();
+        #[repr(C, align(256))]
+        struct Constants([u32; 64]);
+        let data = Constants([0; 64]);
+        let address = data.0.as_ptr() as u64;
+        crate::descriptor::create_cbv(
+            std::ptr::null_mut(),
+            &[address as u32, (address >> 32) as u32, 256, 0],
+            heap.start,
+        );
+        let plan = TablePlan::new(&[cbv(0, 0)], &[]);
+        let mut state = State::default();
+        state.heaps = [title.0 as usize, 0];
+        state.graphics = vec![Root::Table(heap.start)];
+
+        let before_cut = host.new_list().unwrap();
+        let a = state.tables(&before_cut, &plan, false)[0].1;
+        before_cut.close();
+        let mut earlier = State::with_part_descriptors(state.take_part_descriptors());
+        let after_cut = host.new_list().unwrap();
+        state.replay(&after_cut);
+        let b = state.tables(&after_cut, &plan, false)[0].1;
+        assert_ne!(a, u32::MAX);
+        assert_ne!(b, u32::MAX);
+        assert_ne!(a, b, "the next part needs its own constant copy");
+        assert_eq!(h.dynamic(1), None, "both parts' slots are live");
+
+        earlier.tables_done();
+        assert_eq!(h.dynamic(1), Some(a / 32));
+        assert_eq!(h.dynamic(1), None, "the next part is still live");
+        h.release(a / 32, 1);
+        state.tables_done();
+        h.release(held, reserved);
+        assert!(h.dynamic(h.dynamic_capacity()).is_some());
+    }
+
+    /// Different stage extents and equal copies at different title addresses
+    /// must fit in the same 130 available slots. The GPU reads the correct
+    /// constants through the alias, including writes made before submission.
     #[test]
     fn stages_share_a_snapshot_under_descriptor_pressure() {
         let host = crate::host::host().expect("D3D12 device required for this regression");
-        let title = title_heap(128);
+        let title = title_heap(256);
         let heap = crate::descriptor::heap(title.0);
         let h = heap.host().unwrap();
         let reserved = h.dynamic_capacity() - 130;
@@ -5999,19 +6133,21 @@ mod shared_table_tests {
         struct Constants([u32; 64]);
         let mut a = Box::new(Constants([0; 64]));
         let mut b = Box::new(Constants([0; 64]));
-        for (slot, data) in [(5, &a.0), (127, &b.0)] {
-            let address = data.as_ptr() as u64;
-            crate::descriptor::create_cbv(
-                std::ptr::null_mut(),
-                &[address as u32, (address >> 32) as u32, 256, 0],
-                heap.start + slot * 32,
-            );
+        for start in [0, 128] {
+            for (slot, data) in [(5, &a.0), (127, &b.0)] {
+                let address = data.as_ptr() as u64;
+                crate::descriptor::create_cbv(
+                    std::ptr::null_mut(),
+                    &[address as u32, (address >> 32) as u32, 256, 0],
+                    heap.start + (start + slot) * 32,
+                );
+            }
         }
         let vs = TablePlan::new(&[cbv(0, 5)], &[]);
         let ps = TablePlan::new(&[cbv(0, 127)], &[]);
         let mut state = State::default();
         state.heaps = [title.0 as usize, 0];
-        state.graphics = vec![Root::Table(heap.start)];
+        state.graphics = vec![Root::Table(heap.start + 128 * 32)];
         // Establish the old separate-allocation failure without dispatching it.
         {
             let list = host.new_list().unwrap();
@@ -6051,8 +6187,21 @@ mod shared_table_tests {
         let p = state.tables_with_extents(&list, &ps, false, &extents);
         assert_eq!(&*v, &*p);
         assert_ne!(v[0].1, u32::MAX);
-        assert_eq!(state.dynamic.len(), 1);
-        assert_eq!(state.dynamic[0].2, 128);
+        state.graphics[0] = Root::Table(heap.start);
+        let alias = state.tables_with_extents(&list, &ps, false, &extents);
+        assert_eq!(&*alias, &*v, "an identical copy must fit under pressure");
+
+        let address = a.0.as_ptr() as u64;
+        crate::descriptor::create_cbv(
+            std::ptr::null_mut(),
+            &[address as u32, (address >> 32) as u32, 256, 0],
+            heap.start + 127 * 32,
+        );
+        assert_eq!(
+            state.tables_with_extents(&list, &ps, false, &extents)[0].1,
+            u32::MAX,
+            "different records must not reuse that live snapshot"
+        );
 
         const SOURCE: &str = r#"
 #define RS "DescriptorTable(CBV(b0, numDescriptors=128)), UAV(u0)"
@@ -6087,7 +6236,7 @@ void main() { output.Store(0, a); output.Store(4, b); }
             list.list.SetComputeRootSignature(&root);
             list.list.SetPipelineState(&pso);
             list.list
-                .SetComputeRootDescriptorTable(0, h.gpu_handle(v[0].1 / 32));
+                .SetComputeRootDescriptorTable(0, h.gpu_handle(alias[0].1 / 32));
             list.list
                 .SetComputeRootUnorderedAccessView(1, output.GetGPUVirtualAddress());
             list.list.ResourceBarrier(&[crate::host::transition(

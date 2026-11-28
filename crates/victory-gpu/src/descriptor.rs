@@ -1437,7 +1437,12 @@ pub(crate) fn view(handle: u64) -> Option<View> {
         return None;
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
-    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    view_of_record(words)
+}
+
+/// Resolves the view named by a record already captured by a draw.
+pub(super) fn view_of_record([tag, i, generation]: [u32; 3]) -> Option<View> {
     if tag != VIEW_TAG {
         return None;
     }
