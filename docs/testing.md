@@ -485,6 +485,10 @@ Small transient descriptor tables share a chunk within one command-list
 recording, so finishing that list frees a contiguous range. Closing it
 returns only the unused tail; submitted descriptors remain live until GPU
 completion. Near capacity, new allocations request only the needed slots.
+The allocator fills the smallest range that fits, preserving larger runs
+for larger tables. A failed retry logs the requested run, total free
+slots, and largest free run, so a draw lost to fragmentation is distinct
+from one lost to capacity.
 
 For donor parity diagnostics, `VICTORY_SHADER_ROLES` can point to a private
 text file outside the checkout. Each nonempty line maps a full BLAKE3 shader

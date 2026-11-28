@@ -657,7 +657,7 @@ impl State {
         }
         let first = host.dynamic(n).or_else(|| {
             crate::host::settle_for_fence();
-            host.dynamic(n)
+            host.dynamic_after_settle(n)
         })?;
         self.dynamic.push((heap, first, n));
         Some(first)
@@ -5918,6 +5918,32 @@ mod shared_table_tests {
         second.tables_done();
         heap.release(held, ballast);
         assert!(heap.dynamic(heap.dynamic_capacity()).is_some());
+    }
+
+    #[test]
+    fn small_table_reuses_a_hole_without_stranding_a_large_table() {
+        let title = title_heap(4);
+        let heap = crate::descriptor::heap(title.0).host().unwrap();
+        let capacity = heap.dynamic_capacity();
+        let large = heap.dynamic(15).unwrap();
+        let live = heap.dynamic(1).unwrap();
+        let small = heap.dynamic(4).unwrap();
+        let rest = heap.dynamic(capacity - 20).unwrap();
+        heap.release(large, 15);
+        heap.release(small, 4);
+
+        let a = heap.dynamic(4).unwrap();
+        let b = heap
+            .dynamic(15)
+            .expect("the small table must not split the only large hole");
+        assert_eq!((a, b), (small, large));
+        assert_eq!(heap.dynamic(1), None);
+
+        heap.release(a, 4);
+        heap.release(b, 15);
+        heap.release(live, 1);
+        heap.release(rest, capacity - 20);
+        assert_eq!(heap.dynamic(capacity), Some(large));
     }
 
     #[test]
