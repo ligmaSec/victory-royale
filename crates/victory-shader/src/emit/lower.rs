@@ -1426,6 +1426,45 @@ thread_local! {
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
+    reads_mask_data_from(st, i, |v| is_mask_word(st, v))
+}
+
+fn is_mask_word(st: &Structured, v: Value) -> bool {
+    st.masks.contains_key(&v) || st.highs.contains_key(&v)
+}
+
+/// Scalar phis read numerically are not necessarily marked as masks by
+/// structuring. Track ballots through those phis before choosing wave size.
+fn mask_data_phis(p: &Program, st: &Structured) -> HashSet<Value> {
+    let phis = || {
+        p.blocks
+            .iter()
+            .flat_map(|b| &b.phis)
+            .filter(|phi| matches!(phi.reg, Reg::S(c) if c != EXEC && c != EXEC + 1))
+    };
+    let mut masks: HashSet<_> = phis()
+        .filter(|phi| phi.args.iter().any(|&v| is_mask_word(st, v)))
+        .map(|phi| phi.value)
+        .collect();
+    if masks.is_empty() {
+        return masks;
+    }
+    let mut users = HashMap::<Value, Vec<Value>>::new();
+    for phi in phis().filter(|phi| !masks.contains(&phi.value)) {
+        for &arg in &phi.args {
+            users.entry(arg).or_default().push(phi.value);
+        }
+    }
+    let mut work: Vec<_> = masks.iter().copied().collect();
+    while let Some(v) = work.pop() {
+        if let Some(next) = users.remove(&v) {
+            work.extend(next.into_iter().filter(|&w| masks.insert(w)));
+        }
+    }
+    masks
+}
+
+fn reads_mask_data_from(st: &Structured, i: &Inst, is_mask: impl Fn(Value) -> bool) -> bool {
     // A scalar select uses the condition of the whole guest wave, even
     // when the preceding mask operation has no scalar-dword consumers.
     if matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_))
@@ -1434,8 +1473,7 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     {
         return true;
     }
-    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
-    let ops: Vec<&Operand> = match &i.fields {
+    let ops: &[Operand] = match &i.fields {
         // A mask operation (its result a mask) is no data use.
         Fields::Sop { .. }
             if i.writes
@@ -1444,16 +1482,16 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
         {
             return false;
         }
-        Fields::Sop { src, .. } => src.iter().collect(),
+        Fields::Sop { src, .. } => src,
         Fields::Valu(v)
             if !matches!(i.name(), "v_cndmask_b32") && !i.name().contains("_co_ci_") =>
         {
-            v.src.iter().collect()
+            &v.src
         }
         _ => return false,
     };
-    ops.into_iter().any(|op| match *op {
-        Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(is_mask),
+    ops.iter().any(|op| match *op {
+        Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(&is_mask),
         _ => false,
     })
 }
@@ -1683,6 +1721,10 @@ impl<'a> Lower<'a> {
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
+            let mask_phis = mask_data_phis(p, x.st);
+            let reads_mask_data = |i: &Inst| {
+                reads_mask_data_from(x.st, i, |v| is_mask_word(x.st, v) || mask_phis.contains(&v))
+            };
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
@@ -1694,7 +1736,7 @@ impl<'a> Lower<'a> {
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
-                    || reads_mask_as_data(x.st, i)
+                    || reads_mask_data(i)
             }) || lane_constant_masks(x.st)
                 // (a branch the wave takes together asks the wave)
                 || !x.st.wide.is_empty();
@@ -1719,7 +1761,7 @@ impl<'a> Lower<'a> {
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                         || n.starts_with("ds_permute")
                         || n.starts_with("ds_bpermute")
-                        || reads_mask_as_data(x.st, i)
+                        || reads_mask_data(i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
                 if !crosses && (s.lds_dwords == 0 || group <= 32) {
@@ -1782,7 +1824,7 @@ impl<'a> Lower<'a> {
                             "v_writelane"
                         } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
                             "ds_(b)permute"
-                        } else if reads_mask_as_data(x.st, i) {
+                        } else if reads_mask_data(i) {
                             "mask as data"
                         } else {
                             continue;
@@ -5949,16 +5991,23 @@ impl<'a> Lower<'a> {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as dword-aligned and in bounds
-        // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        // LDS accesses are taken as in bounds (out-of-bounds console
+        // accesses read zero and drop writes).
+        let byte_addr = |l: &mut Self, bytes: u32| -> V {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
-            let at = l.s.m.bin(c, Bin::Add, a, o);
+            l.s.m.bin(c, Bin::Add, a, o)
+        };
+        let dword_at = |l: &mut Self, at: V| -> V {
+            let c = l.cur;
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
             let lds = l.s.lds();
             l.s.m.element(c, lds, index)
+        };
+        let dword = |l: &mut Self, bytes: u32| -> V {
+            let at = byte_addr(l, bytes);
+            dword_at(l, at)
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -5976,10 +6025,9 @@ impl<'a> Lower<'a> {
                 (u32::from(*offset1) * scale, w),
             ]
         };
-        // Bytes and halves: the dword holding them, and their bit position
-        // in it (naturally aligned, so they never straddle dwords).
-        // `_d16` reads fill a register's low half (`_d16_hi` its high half)
-        // and keep the other; `_d16_hi` writes take the data's high half.
+        // A halfword at byte offset 3 continues into the next dword.
+        // `_d16` reads replace one destination half; `_d16_hi` writes take
+        // the source's high half.
         let base = name.trim_end_matches("_hi").trim_end_matches("_d16");
         let sub = match base {
             "ds_read_u8" | "ds_read_i8" | "ds_write_b8" => Some(8u32),
@@ -5992,9 +6040,8 @@ impl<'a> Lower<'a> {
                 || name.ends_with("_d16_hi")
         });
         if let Some(bits) = sub {
-            let p = dword(self, offset);
-            let o = self.s.m.i32(offset);
-            let at = self.s.m.bin(c, Bin::Add, a, o);
+            let at = byte_addr(self, offset);
+            let p = dword_at(self, at);
             let three = self.s.m.i32(3);
             let byte = self.s.m.bin(c, Bin::And, at, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
@@ -6002,7 +6049,20 @@ impl<'a> Lower<'a> {
             if name.starts_with("ds_read") {
                 let reg = dst_reg.ok_or("an LDS read result")?;
                 let w = self.s.m.load(c, p);
-                let x = self.s.m.bin(c, Bin::LShr, w, sh);
+                let mut x = self.s.m.bin(c, Bin::LShr, w, sh);
+                if bits == 16 {
+                    // (at + 1) still addresses the first dword when the
+                    // halfword fits, including at the end of LDS.
+                    let one = self.s.m.i32(1);
+                    let at_hi = self.s.m.bin(c, Bin::Add, at, one);
+                    let p_hi = dword_at(self, at_hi);
+                    let w_hi = self.s.m.load(c, p_hi);
+                    let eight = self.s.m.i32(8);
+                    let hi = self.s.m.bin(c, Bin::Shl, w_hi, eight);
+                    let both = self.s.m.bin(c, Bin::Or, x, hi);
+                    let straddles = self.s.m.cmp(c, pred::EQ, byte, three);
+                    x = self.s.m.select(c, straddles, both, x);
+                }
                 let x = if base.contains("_i") {
                     let k = self.s.m.i32(32 - bits);
                     let x = self.s.m.bin(c, Bin::Shl, x, k);
@@ -6038,16 +6098,29 @@ impl<'a> Lower<'a> {
                     let k16 = self.s.m.i32(16);
                     x = self.s.m.bin(c, Bin::LShr, x, k16);
                 }
-                let x = self.s.m.bin(c, Bin::And, x, mask);
-                let x = self.s.m.bin(c, Bin::Shl, x, sh);
+                let val = self.s.m.bin(c, Bin::And, x, mask);
+                let x = self.s.m.bin(c, Bin::Shl, val, sh);
                 let m = self.s.m.bin(c, Bin::Shl, mask, sh);
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, m, ones);
                 use super::bitcode::Rmw;
-                let at = self.begin_guarded(guard);
+                let guarded = self.begin_guarded(guard);
                 self.s.m.atomic(self.cur, Rmw::And, p, keep);
                 self.s.m.atomic(self.cur, Rmw::Or, p, x);
-                self.end_guarded(at, &[]);
+                if bits == 16 {
+                    let straddles = self.s.m.cmp(self.cur, pred::EQ, byte, three);
+                    let second = self.begin_guarded(Some(straddles));
+                    let one = self.s.m.i32(1);
+                    let at_hi = self.s.m.bin(self.cur, Bin::Add, at, one);
+                    let p_hi = dword_at(self, at_hi);
+                    let eight = self.s.m.i32(8);
+                    let hi = self.s.m.bin(self.cur, Bin::LShr, val, eight);
+                    let keep_hi = self.s.m.i32(0xFFFF_FF00);
+                    self.s.m.atomic(self.cur, Rmw::And, p_hi, keep_hi);
+                    self.s.m.atomic(self.cur, Rmw::Or, p_hi, hi);
+                    self.end_guarded(second, &[]);
+                }
+                self.end_guarded(guarded, &[]);
             }
             return Ok(());
         }

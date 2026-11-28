@@ -415,6 +415,10 @@ can retry a refused numeric lane-mask join using only subgroup operations.
 Use `VICTORY_WAVE_WIDE=0` to disable the retry for comparisons. Widening
 that can require barriers across host waves remains opt-in.
 
+The shader readback fixtures check that numeric mask joins retain the console
+wave width and that halfword LDS accesses spanning two dwords preserve the
+surrounding bytes.
+
 Run one crate or one test on its own:
 
 ```powershell
