@@ -412,9 +412,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     true
 }
 
-/// With `VICTORY_TEXTURE_NO_WAIT=1`, a contended refresh may keep the
-/// previous complete staging contents for the next refresh. The first
-/// fill and an exact refresh always wait for a stable mapping.
+/// Reuse the last stable staging contents when a repeat refresh would wait
+/// behind a title remap. A first fill or an exact refresh must still wait.
+/// `VICTORY_TEXTURE_NO_WAIT=0` makes repeat refreshes wait as well.
 ///
 /// A successful kernel read during a remap did not prove that all pages
 /// belonged to the same mapping. Nor could a later residency query prove
@@ -422,7 +422,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// read and the detiler's residency queries.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|v| v == "1"))
 }
 
 /// Warm, non-exact refreshes deferred while title memory was remapping,
@@ -2087,8 +2087,11 @@ mod title_memory_tests {
 
     #[test]
     fn a_contended_texture_refresh_keeps_the_last_stable_pixels() {
+        use std::sync::{atomic::Ordering::Relaxed, mpsc};
+        use std::time::Duration;
         use windows_sys::Win32::System::Memory::*;
         if crate::host::host().is_none() {
+            eprintln!("no host GPU; skipped");
             return;
         }
         let desc = [
@@ -2133,26 +2136,46 @@ mod title_memory_tests {
             // only after a synchronous refresh.
             unsafe { (staging.data.cast::<[u8; 128]>()).read() }
         };
-        staging.refresh_timed(|| true);
+        staging.refresh();
         assert_eq!(pixels(), [0x35; 128]);
 
-        {
-            let _change = crate::watch::title_memory_remapping();
-            fill(0xc7);
-            staging.refresh_timed(|| true);
-            assert_eq!(
-                pixels(),
-                [0x35; 128],
-                "an intermediate mapping never reaches staging"
-            );
-            fill(0x61);
-        }
-        staging.refresh_timed(|| true);
-        assert_eq!(
-            pixels(),
-            [0x61; 128],
-            "the next refresh must take the coherent bytes"
-        );
+        let remap = |old, intermediate, coherent, defers: bool| {
+            std::thread::scope(|scope| {
+                let change = crate::watch::title_memory_remapping();
+                fill(intermediate);
+                let staging = &staging;
+                let (began, started) = mpsc::channel();
+                let (done, completed) = mpsc::channel();
+                let worker = scope.spawn(move || {
+                    began.send(()).unwrap();
+                    staging.refresh();
+                    done.send(()).unwrap();
+                });
+                started.recv().unwrap();
+                let limit = if defers {
+                    Duration::from_secs(3)
+                } else {
+                    Duration::from_millis(50)
+                };
+                let returned = completed.recv_timeout(limit).is_ok();
+                let previous = returned.then(pixels);
+                fill(coherent);
+                drop(change);
+                worker.join().unwrap();
+                assert_eq!(returned, defers, "refresh completion during the remap");
+                if let Some(previous) = previous {
+                    assert_eq!(previous, [old; 128], "never stage part of the remap");
+                }
+            });
+            if defers {
+                staging.refresh();
+            }
+            assert_eq!(pixels(), [coherent; 128], "stage the next stable contents");
+        };
+        let defers = std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|value| value == "1");
+        remap(0x35, 0xc7, 0x61, defers);
+        staging.exact.store(true, Relaxed);
+        remap(0x61, 0xa9, 0x81, false);
 
         drop(staging);
         drop(copy);

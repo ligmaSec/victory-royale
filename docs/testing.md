@@ -476,6 +476,11 @@ budget for a title frame. One thread waiting for a pipeline no longer
 forces another to drop its draw while time remains. Keep general and
 screen-pass limits the same in matched cache comparisons.
 
+When the title is remapping memory, a repeat texture refresh can reuse its
+last stable staged pixels and retry rather than block the submitting thread.
+First fills and exact refreshes still wait for a stable mapping. For a
+matched blocking-path diagnostic, set `VICTORY_TEXTURE_NO_WAIT=0`.
+
 For donor parity diagnostics, `VICTORY_SHADER_ROLES` can point to a private
 text file outside the checkout. Each nonempty line maps a full BLAKE3 shader
 container ID to one role, with whitespace between them and an optional `#`
