@@ -38,16 +38,25 @@ MS = rb"([0-9]{1,9}\.[0-9]{2})"
 INTERVAL = re.compile(rb"present intervals: ([0-9]{1,4}) frames, mean " + MS + rb" ms, median " + MS
                       + rb" ms, p95 " + MS + rb" ms, longest " + MS
                       + rb" ms, ([0-9]{1,4}) over 100 ms, ([0-9]{1,4}) over 1 s$")
-# The release logger emits one sample of submission cost per reporting period.
-# Match the full message so a format change cannot shift values between columns.
-SUBMISSION_FORMAT = (b"%f fps, %f ms/frame (%f preparing: copies %f ms %f MB, textures %f ms %f MB; "
-                     b"%f on the GPU; %f copying back %f MB), %i draws/frame, dropped %i without a "
-                     b"host pipeline (%i being made) and %i indirect")
-SUBMISSION = re.compile(rb"(?<![0-9.+-])" + re.escape(SUBMISSION_FORMAT)
-                        .replace(b"%f", rb"([0-9]{1,10}\.[0-9])").replace(b"%i", rb"([0-9]{1,10})") + rb"$")
+SUBMISSION_START = (b"%f fps, %f ms/frame (%f preparing: copies %f ms %f MB, textures %f ms %f MB; "
+                    b"%f on the GPU; %f copying back %f MB), %i draws/frame, ")
+SUBMISSION_END = b" (%i being made) and %i indirect"
+
+
+def submission_pattern(operations, extra=b""):
+    # Accept a complete numeric sample before the known renderer detail suffix.
+    # Its detail text is never copied into the report.
+    fmt = SUBMISSION_START + operations + SUBMISSION_END + extra
+    fields = re.escape(fmt).replace(b"%f", rb"([0-9]{1,10}\.[0-9])").replace(b"%i", rb"([0-9]{1,10})")
+    return re.compile(rb"(?<![0-9.+-])" + fields + rb"(?=; heap buffers |$)")
+
+
+SUBMISSION = submission_pattern(b"unsubmitted %i", b"; BVH builder blocked %i")
+LEGACY_SUBMISSION = submission_pattern(b"dropped %i without a host pipeline")
 SUBMISSION_COLUMNS = ("fps", "ms_per_frame", "preparing_ms", "buffer_copy_ms", "buffer_copy_mb",
                       "texture_ms", "texture_mb", "gpu_wait_ms", "copy_back_ms", "copy_back_mb",
-                      "draws_per_frame", "dropped_per_frame", "pipelines_being_made", "indirect_per_frame")
+                      "draws_per_frame", "dropped_per_frame", "pipelines_being_made", "indirect_per_frame",
+                      "bvh_builder_blocked_per_frame")
 # vkd3d-proton reports the shader and adapter ranges at pipeline creation.
 # Accept only legal lane counts, so the summary never copies driver text.
 LANES = rb"(4|8|16|32|64|128)"
@@ -542,11 +551,16 @@ def read_metrics(stream, frame_log, submission_log, timeline):
                 slow += over100
                 stalls += over1000
         elif b" ms/frame (" in raw:
-            match = SUBMISSION.search(ANSI.sub(b"", raw).rstrip())
-            if match:
-                submission_log.writerow([value.decode("ascii") for value in match.groups()])
-                submissions += 1
-                timeline.record(ANSI.sub(b"", raw), "submission sample", sample=submissions)
+            line = ANSI.sub(b"", raw).rstrip()
+            if match := SUBMISSION.search(line):
+                fields = match.groups()
+            elif match := LEGACY_SUBMISSION.search(line):
+                fields = (*match.groups(), b"")
+            else:
+                continue
+            submission_log.writerow(value.decode("ascii") for value in fields)
+            submissions += 1
+            timeline.record(line, "submission sample", sample=submissions)
         elif b"Required WaveSize range" in raw:
             if limits := wave_range(raw):
                 wave_ranges[limits] += 1

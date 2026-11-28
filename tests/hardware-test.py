@@ -501,10 +501,13 @@ class HardwareRequest(unittest.TestCase):
         private = b"private_name private@example.test /home/private/ C:\\Users\\private 192.0.2.10 secret=value"
         window = (b"present intervals: 2 frames, mean 750.00 ms, median 750.00 ms, p95 1400.00 ms, "
                   b"longest 1400.00 ms, 1 over 100 ms, 1 over 1 s")
-        submission = (b"2.0 fps, 500.0 ms/frame (400.5 preparing: copies 380.0 ms 10.5 MB, "
-                      b"textures 5.0 ms 1.0 MB; 33.0 on the GPU; 4.0 copying back 2.0 MB), 123 draws/frame, "
-                      b"dropped 4 without a host pipeline (2 being made) and 1 indirect")
-        log = b"\n".join([private, submission, submission + private, b"host D3D12 device ready adapter=" + private + b" vendor=0x1002",
+        submission_prefix = (b"2.0 fps, 500.0 ms/frame (400.5 preparing: copies 380.0 ms 10.5 MB, "
+                             b"textures 5.0 ms 1.0 MB; 33.0 on the GPU; 4.0 copying back 2.0 MB), 123 draws/frame, ")
+        legacy = submission_prefix + b"dropped 4 without a host pipeline (2 being made) and 1 indirect"
+        current = submission_prefix + b"unsubmitted 4 (2 being made) and 1 indirect; BVH builder blocked 3"
+        detail = b"; heap buffers 1.0 passes 0.1 ms; trailing detail: " + private
+        log = b"\n".join([private, legacy + detail, legacy + private, current + detail, current + private,
+                          b"host D3D12 device ready adapter=" + private + b" vendor=0x1002",
                           b"shader does not translate: " + private, window, window + b" " + private])
         for windows in (True, False):
             destination = self.root / str(windows)
@@ -528,8 +531,12 @@ class HardwareRequest(unittest.TestCase):
             self.assertIn("Launcher exit: unreported", body)
             self.assertIn("1,2,750.0,750.0,1400.0,1400.0,1,1", timings)
             submissions = (destination / "main-submissions.csv").read_text().splitlines()
-            self.assertEqual(len(submissions), 2)
-            self.assertEqual(submissions[-1], "2.0,500.0,400.5,380.0,10.5,5.0,1.0,33.0,4.0,2.0,123,4,2,1")
+            self.assertEqual(len(submissions), 3)
+            self.assertEqual(submissions[0].split(",")[-1], "bvh_builder_blocked_per_frame")
+            self.assertEqual(submissions[1:], [
+                "2.0,500.0,400.5,380.0,10.5,5.0,1.0,33.0,4.0,2.0,123,4,2,1,",
+                "2.0,500.0,400.5,380.0,10.5,5.0,1.0,33.0,4.0,2.0,123,4,2,1,3",
+            ])
             for value in ("private", "192.0.2.10", "secret=value"):
                 self.assertNotIn(value, body + timings + "".join(submissions))
 

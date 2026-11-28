@@ -129,8 +129,10 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
    For private sharing, the filtered ZIP also contains per-window mean, median,
    p95, longest frame time and stall counts for each build. Separate submission
    samples record time spent on CPU preparation, buffer and texture copies,
-   GPU waits and copy-back, alongside draw and pipeline-drop counts. The private
-   event timeline connects shader binds, translations and pipeline results to
+   GPU waits and copy-back, alongside draw and unsubmitted-operation counts. A
+   separate column counts the subset blocked by the BVH builder; older builds
+   leave that column blank. The total is not a shader compilation failure count.
+   The private event timeline connects shader binds, translations and pipeline results to
    those samples through elapsed times and shader numbers shared across the pair.
    You can inspect the filtered ZIP in the printed temporary `share` folder.
 6. For **Send encrypted diagnostics to @requester**, install GitHub CLI and sign in to github.com
