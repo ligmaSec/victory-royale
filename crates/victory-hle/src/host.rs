@@ -44,7 +44,6 @@ impl Default for HostPolicy {
             "ole32.dll",
             "advapi32.dll",
             "iphlpapi.dll",
-            "rpcrt4.dll",
             // The title's crash handler writes minidumps with it (loaded by name).
             "dbghelp.dll",
             // Same APIs as the console's (XAudio2 ordinal 1 is XAudio2Create
@@ -79,7 +78,21 @@ impl HostPolicy {
         if !self.allows(dll) {
             return None;
         }
-        imp::resolve(dll, symbol)
+        let address = imp::resolve(dll, symbol)?;
+        // The title's copies of memory look where they write.
+        #[cfg(windows)]
+        if let ImportSymbol::Name { name, .. } = symbol {
+            let ours = victory_gpu::titlewrite::import(name, address);
+            if ours != address {
+                return Some(ours);
+            }
+        }
+        // With a timeline asked for, what threads wait with is wrapped.
+        #[cfg(all(windows, feature = "diagnostics"))]
+        if let ImportSymbol::Name { name, .. } = symbol {
+            return Some(victory_gpu::timeline::import(name, address));
+        }
+        Some(address)
     }
 }
 
@@ -237,17 +250,5 @@ mod imp {
 mod imp {
     pub(super) fn resolve(_dll: &str, _symbol: &victory_pe::ImportSymbol) -> Option<usize> {
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn host_policy_allows_rpcrt4() {
-        let policy = HostPolicy::default();
-        assert!(policy.allows("rpcrt4.dll"));
-        assert!(policy.allows("RPCRT4.DLL"));
     }
 }

@@ -138,19 +138,6 @@ impl Validator {
             .or_else(|| sdk_tool(Path::new(SDK_BIN), "dxil.dll"))
     }
 
-    #[cfg(test)]
-    pub(super) fn for_test() -> Option<Self> {
-        let path = Self::default_path();
-        match Self::load(path.as_deref()) {
-            Ok(validator) => Some(validator),
-            Err(e) if std::env::var_os("VICTORY_DXIL").is_some() => panic!("{e}"),
-            Err(e) => {
-                eprintln!("{e}; skipped");
-                None
-            }
-        }
-    }
-
     /// Loads `path`'s validator (or `dxil.dll` from the DLL search path).
     pub fn load(path: Option<&std::path::Path>) -> Result<Self, String> {
         let name: Vec<u16> = path

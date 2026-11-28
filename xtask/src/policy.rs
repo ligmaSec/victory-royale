@@ -1,5 +1,5 @@
-//! Rule #1, statically: the repository only ever contains small text files
-//! that we wrote. See docs/asset-policy.md.
+//! Rule #1, statically: the repository only contains small text files outside
+//! explicit exceptions. See docs/asset-policy.md.
 //!
 //! This is an allowlist, not a blocklist: a file passes only if its name is
 //! on the list, it is not too big, it is text, and it does not smuggle data
@@ -151,7 +151,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    // Only the listed testing tools may use Python, Swift or HTML.
+    // Allow the named tools and Wine source patch by path, not by extension.
     // All size, magic, NUL and encoded-data checks still apply.
     let allowed = matches!(
         path,
@@ -167,6 +167,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
             | "scripts/hardware-test/report-inbox.py"
             | "tests/hardware-test.py"
             | "tests/hardware-delivery.py"
+            | "scripts/wineserver-view-tree.patch"
     ) || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
@@ -288,6 +289,8 @@ mod tests {
             !check("data.bin", b"hello").is_empty(),
             "extension not allowed"
         );
+        assert!(!check("assets/other.patch", b"diff --git a/src b/src\n").is_empty());
+        assert!(!check("scripts/wineserver-view-tree.patch", b"MZ\x90\0").is_empty());
         assert!(
             !check("a.rs", &vec![b'a'; 600 * 1024]).is_empty(),
             "too big"

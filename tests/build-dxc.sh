@@ -4,7 +4,11 @@ set -euo pipefail
 cd "$(dirname "$0")/../crates/victory-gpu"
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
-rustc --edition=2024 build.rs -o "$work/build-script"
+rustc --edition=2024 -o "$work/build-script" - <<'RS'
+#[path = "build_helpers.rs"]
+mod build_helpers;
+fn main() { build_helpers::bundle(); }
+RS
 export CARGO_CFG_TARGET_OS=windows OUT_DIR="$work"
 
 env -u VICTORY_BUILD_DXC "$work/build-script" > "$work/unset.log"

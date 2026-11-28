@@ -5,18 +5,33 @@
 //! it is written: functions, then constants (all at module level), then the
 //! instructions of `main` in block order.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroUsize;
 
+pub mod census;
 pub mod opt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
+
+/// What the lowering made an instruction for, where it says so (counted by
+/// [`census`], nothing else reads it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tag {
+    /// The select that keeps a register's old value in lanes a guard masks.
+    Guard,
+    /// An index clamp the translation adds (the console has none).
+    Clamp,
+    /// The iteration counter and limit test the translation adds to a loop.
+    Counter,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum TypeDef {
     Void,
     Int(u32),
     Float,
+    Double,
     /// Pointee and address space.
     Ptr(Ty, u32),
     Struct(Option<String>, Vec<Ty>),
@@ -143,6 +158,8 @@ enum Op {
     /// `getelementptr` over the pointee type, from a pointer.
     Gep(Ty, V, Vec<V>),
     Load(V),
+    /// A group-shared load the wait loop must repeat. Not folded with an earlier load.
+    VolatileLoad(V),
     /// Pointer, value.
     Store(V, V),
     AtomicRmw(Rmw, V, V),
@@ -168,6 +185,7 @@ struct Block {
     phis: Vec<u32>,
     body: Vec<u32>,
     term: Option<Term>,
+    continuation: Option<NonZeroUsize>,
 }
 
 /// Function attributes of a `dx.op` declaration.
@@ -210,6 +228,8 @@ pub(crate) struct Module {
     blocks: Vec<Block>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
+    /// See [`Tag`]: by instruction.
+    tags: HashMap<u32, Tag>,
 }
 
 impl Module {
@@ -231,6 +251,9 @@ impl Module {
     }
     pub fn float(&mut self) -> Ty {
         self.ty(TypeDef::Float)
+    }
+    pub fn double(&mut self) -> Ty {
+        self.ty(TypeDef::Double)
     }
     pub fn ptr(&mut self, to: Ty) -> Ty {
         self.ty(TypeDef::Ptr(to, 0))
@@ -357,6 +380,16 @@ impl Module {
         g
     }
 
+    /// Notes what instruction `v` is for (see [`Tag`]); only when modules
+    /// are counted.
+    pub fn tag(&mut self, v: V, tag: Tag) {
+        if let V::Inst(i) = v
+            && census::enabled()
+        {
+            self.tags.insert(i, tag);
+        }
+    }
+
     pub fn new_block(&mut self) -> usize {
         self.blocks.push(Block::default());
         self.blocks.len() - 1
@@ -379,7 +412,36 @@ impl Module {
         }
     }
 
+    pub fn continuation(&self, mut block: usize) -> usize {
+        while let Some(next) = self.blocks[block].continuation {
+            block = next.get();
+        }
+        block
+    }
+
+    /// Inserts control flow before a block's outgoing edges. A late split
+    /// moves the original terminator and its phi edges to the continuation.
+    pub fn splice(&mut self, block: usize, branch: Term, tail: usize) {
+        let block = self.continuation(block);
+        debug_assert!(tail > block && self.blocks[tail].term.is_none());
+        let term = self.blocks[block].term.replace(branch);
+        self.blocks[block].continuation = NonZeroUsize::new(tail);
+        self.blocks[tail].term = term;
+        for &successor in successors(term).iter() {
+            for &id in &self.blocks[successor].phis {
+                if let Op::Phi(incoming) = &mut self.insts[id as usize].op {
+                    for (_, from) in incoming {
+                        if *from == block {
+                            *from = tail;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn push(&mut self, block: usize, ty: Ty, op: Op) -> V {
+        let block = self.continuation(block);
         let i = self.insts.len() as u32;
         self.insts.push(Inst { ty, op });
         // Terminators are kept apart, so a block can still grow at its end.
@@ -410,22 +472,6 @@ impl Module {
         };
         self.push(block, ty, Op::Extract(agg, index))
     }
-    pub(super) fn remap_input_loads(&mut self, ids: &HashMap<V, V>) {
-        if ids.is_empty() {
-            return;
-        }
-        for inst in &mut self.insts {
-            if let Op::Call(function, args) = &mut inst.op
-                && self.funcs[*function as usize]
-                    .name
-                    .starts_with("dx.op.loadInput.")
-                && let Some(&id) = ids.get(&args[1])
-            {
-                args[1] = id;
-            }
-        }
-    }
-
     pub fn call(&mut self, block: usize, f: V, args: Vec<V>) -> V {
         let V::Func(i) = f else {
             panic!("call of a non-function")
@@ -445,67 +491,6 @@ impl Module {
         self.blocks[block].phis.push(i);
         V::Inst(i)
     }
-
-    /// Whether the join's branch skips every use of `phi` when entered from `from`.
-    /// The skipped arm must be reachable only from the join, so a later loop
-    /// iteration can reach it only after selecting a new incoming phi value.
-    pub(super) fn unused_on_phi_edge(&self, phi: V, join: usize, from: usize) -> bool {
-        let block = &self.blocks[join];
-        let Some(Term::CondBr(V::Inst(test), yes, no)) = block.term else {
-            return false;
-        };
-        let Op::Cmp(op @ (pred::EQ | pred::NE), a, b) = self.insts[test as usize].op else {
-            return false;
-        };
-        if !block.body.contains(&test) || self.types[self.type_of(a).0 as usize] != TypeDef::Int(32)
-        {
-            return false;
-        }
-        let on_edge = |v| match v {
-            V::Inst(i) if block.phis.contains(&i) => {
-                let Op::Phi(inputs) = &self.insts[i as usize].op else {
-                    return None;
-                };
-                self.int_value(inputs.iter().find(|(_, p)| *p == from)?.0)
-            }
-            _ => self.int_value(v),
-        };
-        let (Some(a), Some(b)) = (on_edge(a), on_edge(b)) else {
-            return false;
-        };
-        if yes == no {
-            return false;
-        }
-        let skipped = if ((a as u32) == (b as u32)) == (op == pred::EQ) {
-            no
-        } else {
-            yes
-        };
-        if skipped == 0 || skipped == join {
-            return false;
-        }
-        for (i, other) in self.blocks.iter().enumerate() {
-            if i != join && successors(other.term).contains(&skipped) {
-                return false;
-            }
-            if i != skipped && matches!(other.term, Some(Term::CondBr(v, _, _)) if v == phi) {
-                return false;
-            }
-            // A phi reads its operands on the incoming edge, before its own block runs.
-            let reads_phi = |&n: &u32| {
-                let mut used = false;
-                for_each_operand(&self.insts[n as usize].op, |v| used |= v == phi);
-                used
-            };
-            if other.phis.iter().any(reads_phi)
-                || (i != skipped && other.body.iter().any(reads_phi))
-            {
-                return false;
-            }
-        }
-        true
-    }
-
     /// The address of element `index` of the array `ptr` points to.
     pub fn element(&mut self, block: usize, ptr: V, index: V) -> V {
         let TypeDef::Ptr(arr, space) = self.types[self.type_of(ptr).0 as usize] else {
@@ -524,6 +509,13 @@ impl Module {
         };
         self.push(block, ty, Op::Load(ptr))
     }
+    /// A load the optimiser and the driver must not lift out of a wait loop.
+    pub fn load_volatile(&mut self, block: usize, ptr: V) -> V {
+        let TypeDef::Ptr(ty, _) = self.types[self.type_of(ptr).0 as usize] else {
+            panic!("load from a non-pointer")
+        };
+        self.push(block, ty, Op::VolatileLoad(ptr))
+    }
     pub fn store(&mut self, block: usize, ptr: V, value: V) {
         let void = self.void();
         self.push(block, void, Op::Store(ptr, value));
@@ -540,11 +532,15 @@ impl Module {
         self.extract(block, r, 0)
     }
 
-    pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
+    pub fn set_phi(&mut self, phi: V, mut incoming: Vec<(V, usize)>) {
         let V::Inst(i) = phi else { panic!() };
+        for (_, from) in &mut incoming {
+            *from = self.continuation(*from);
+        }
         self.insts[i as usize].op = Op::Phi(incoming);
     }
     pub fn terminate(&mut self, block: usize, t: Term) {
+        let block = self.continuation(block);
         self.blocks[block].term = Some(t);
     }
 
@@ -565,42 +561,12 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
-    pub(crate) fn uses_whole_wave(&self) -> bool {
-        self.funcs.iter().any(|f| f.name.starts_with("dx.op.wave"))
-    }
-
-    pub(crate) fn has_dx_op(&self, name: &str, opcode: i64) -> bool {
-        self.dx_ops(name, opcode).next().is_some()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dx_op_count(&self, name: &str, opcode: i64) -> usize {
-        self.dx_ops(name, opcode).count()
-    }
-
-    fn dx_ops(&self, name: &str, opcode: i64) -> impl Iterator<Item = &Inst> {
-        self.insts.iter().filter(move |inst| match &inst.op {
-            Op::Call(fid, args) => {
-                self.funcs[*fid as usize].name == name
-                    && matches!(
-                        args.first(),
-                        Some(V::Const(cid)) if matches!(self.consts[*cid as usize].1, Const::Int(n) if n == opcode)
-                    )
-            }
-            _ => false,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_cmp(&self, predicate: u8) -> bool {
-        self.insts
-            .iter()
-            .any(|inst| matches!(inst.op, Op::Cmp(p, _, _) if p == predicate))
-    }
-
-    /// Start from instructions that must execute and from externally used
-    /// values. The worklist keeps their operands, including loop-carried phis.
-    fn live(&self, omit_unused_math: bool) -> Vec<bool> {
+    /// The module as bitcode.
+    /// Which instructions are written: every body instruction, the branch
+    /// conditions, and whatever they read, transitively (a phi nothing reads
+    /// is dropped). A worklist visits each instruction once, so a long chain
+    /// of merges costs one pass, not one pass per merge.
+    fn live(&self) -> Vec<bool> {
         let mut live = vec![false; self.insts.len()];
         let mut work: Vec<u32> = Vec::new();
         let mark = |live: &mut [bool], work: &mut Vec<u32>, v: V| {
@@ -611,27 +577,8 @@ impl Module {
                 work.push(i);
             }
         };
-        for md in &self.mds {
-            if let MdDef::Value(_, v) = md {
-                mark(&mut live, &mut work, *v);
-            }
-        }
         for b in &self.blocks {
             for &i in &b.body {
-                let op = &self.insts[i as usize].op;
-                if omit_unused_math
-                    && matches!(
-                        op,
-                        Op::Bin(..)
-                            | Op::Cast(..)
-                            | Op::Cmp(..)
-                            | Op::Select(..)
-                            | Op::Extract(..)
-                            | Op::Gep(..)
-                    )
-                {
-                    continue;
-                }
                 mark(&mut live, &mut work, V::Inst(i));
             }
             if let Some(Term::CondBr(c, ..)) = b.term {
@@ -646,7 +593,102 @@ impl Module {
         live
     }
 
-    pub fn write(&self, omit_unused_math: bool) -> Vec<u8> {
+    /// The blocks a block's terminator branches to.
+    #[cfg(test)]
+    fn successors(&self, b: usize) -> Vec<usize> {
+        match self.blocks[b].term {
+            Some(Term::Br(t)) => vec![t],
+            Some(Term::CondBr(_, t, f)) => vec![t, f],
+            _ => Vec::new(),
+        }
+    }
+
+    /// A loop header has one latch, and a latch branches back to only one
+    /// header. DXIL converters keep one incoming and one outgoing back
+    /// edge per block. Join the phi values of merged incoming edges; split
+    /// the choices of nested loops without changing either path's values.
+    pub fn single_latches(&mut self) {
+        let n = self.blocks.len();
+        if n == 0 {
+            return;
+        }
+        // Depth-first from the entry: an edge to a block still on the stack
+        // is a back edge (the control flow is reducible).
+        let mut state = vec![0u8; n];
+        let mut stack = vec![(0usize, 0usize)];
+        state[0] = 1;
+        let mut latches: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        let mut exits = vec![0u8; n];
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            let succ = successors(self.blocks[b].term);
+            if k < succ.len() {
+                top.1 += 1;
+                let t = succ[k];
+                match state[t] {
+                    0 => {
+                        state[t] = 1;
+                        stack.push((t, 0));
+                    }
+                    1 => {
+                        let from = latches.entry(t).or_default();
+                        if from.last() != Some(&b) {
+                            from.push(b);
+                            exits[b] += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                state[b] = 2;
+                stack.pop();
+            }
+        }
+        for (header, mut from) in latches {
+            from.sort_unstable();
+            from.dedup();
+            if from.len() == 1 && exits[from[0]] == 1 {
+                continue;
+            }
+            let latch = self.new_block();
+            for &b in &from {
+                let to = |t: usize| if t == header { latch } else { t };
+                self.blocks[b].term = match self.blocks[b].term {
+                    Some(Term::Br(t)) => Some(Term::Br(to(t))),
+                    Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(c, to(t), to(f))),
+                    other => other,
+                };
+            }
+            self.blocks[latch].term = Some(Term::Br(header));
+            for id in self.blocks[header].phis.clone() {
+                if let [source] = from[..] {
+                    if let Op::Phi(incoming) = &mut self.insts[id as usize].op {
+                        for (_, pred) in incoming {
+                            if *pred == source {
+                                *pred = latch;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let Op::Phi(incoming) = self.insts[id as usize].op.clone() else {
+                    continue;
+                };
+                let ty = self.insts[id as usize].ty;
+                let (back, mut rest): (Vec<_>, Vec<_>) =
+                    incoming.into_iter().partition(|(_, b)| from.contains(b));
+                if back.is_empty() {
+                    continue;
+                }
+                let joined = self.phi(latch, ty);
+                self.set_phi(joined, back);
+                rest.push((joined, latch));
+                self.insts[id as usize].op = Op::Phi(rest);
+            }
+        }
+    }
+
+    pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
         w.enter(MODULE_BLOCK, 3);
@@ -679,6 +721,7 @@ impl Module {
             match t {
                 TypeDef::Void => w.record(2, &[]),
                 TypeDef::Float => w.record(3, &[]),
+                TypeDef::Double => w.record(4, &[]),
                 TypeDef::Int(b) => w.record(7, &[u64::from(*b)]),
                 TypeDef::Ptr(p, space) => w.record(8, &[u64::from(p.0), u64::from(*space)]),
                 TypeDef::Array(n, e) => w.record(11, &[u64::from(*n), u64::from(e.0)]),
@@ -778,8 +821,8 @@ impl Module {
         }
         w.exit();
 
-        let live = self.live(omit_unused_math);
-        let is_live = |i: &&u32| live[**i as usize];
+        // Phis nothing reads are left out (one register per phi makes many).
+        let live = self.live();
 
         // Blocks are laid out in reverse postorder, so every block follows
         // its forward predecessors (drivers take a branch to an earlier
@@ -823,12 +866,23 @@ impl Module {
             let blk = &self.blocks[b];
             if let (Some(Term::Br(h)), true, [p]) = (
                 blk.term,
-                blk.phis.is_empty() && blk.body.is_empty(),
+                blk.phis.iter().all(|&i| !live[i as usize]) && blk.body.is_empty(),
                 &preds[b][..],
             ) && pos[h] < pos[b]
                 && !succs(*p).contains(&h)
             {
                 fold[b] = Some((*p, h));
+            }
+        }
+        // Do not undo the separation of nested loops. At most one of a
+        // predecessor's two branches can become a back edge after folding.
+        for &b in &post {
+            if let Some((p, _)) = fold[b]
+                && succs(p).iter().any(|&other| {
+                    other != b && pos[fold[other].map_or(other, |(_, h)| h)] <= pos[p]
+                })
+            {
+                fold[b] = None;
             }
         }
         let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();
@@ -845,7 +899,7 @@ impl Module {
         let mut ids = vec![u32::MAX; self.insts.len()];
         let mut next = base;
         for b in layout.iter().map(|&b| &self.blocks[b]) {
-            for &i in b.phis.iter().chain(&b.body).filter(is_live) {
+            for &i in b.phis.iter().filter(|&&i| live[i as usize]).chain(&b.body) {
                 if !self.is_void(self.insts[i as usize].ty) {
                     ids[i as usize] = next;
                     next += 1;
@@ -927,7 +981,7 @@ impl Module {
         // The operands of variable-length records, reused across them.
         let mut r: Vec<u64> = Vec::new();
         for b in layout.iter().map(|&b| &self.blocks[b]) {
-            for &i in b.phis.iter().chain(&b.body).filter(is_live) {
+            for &i in b.phis.iter().filter(|&&i| live[i as usize]).chain(&b.body) {
                 let inst = &self.insts[i as usize];
                 let rel = |v: V| {
                     let a = abs(v);
@@ -964,6 +1018,8 @@ impl Module {
                     }
                     // Alignment 4 (log2 + 1), not volatile.
                     Op::Load(p) => w.record(20, &[rel(*p), u64::from(inst.ty.0), 3, 0]),
+                    // The last field is the volatile bit: the wait must read again.
+                    Op::VolatileLoad(p) => w.record(20, &[rel(*p), u64::from(inst.ty.0), 3, 1]),
                     Op::Store(p, v) => w.record(44, &[rel(*p), rel(*v), 3, 0]),
                     // Sequentially consistent, across threads.
                     Op::AtomicRmw(op, p, v) => {
@@ -1009,7 +1065,7 @@ fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
             f(*a);
             f(*b);
         }
-        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => f(*v),
+        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) | Op::VolatileLoad(v) => f(*v),
         Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
             f(*a);
             f(*b);
@@ -1161,6 +1217,32 @@ mod tests {
         assert_eq!(signed(2), 4);
     }
 
+    #[test]
+    fn a_late_split_preserves_both_successors_and_phi_inputs() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let [entry, yes, no, meet, resume] = [(); 5].map(|()| m.new_block());
+        let (one, two) = (m.i32(1), m.i32(2));
+        let condition = m.cmp(entry, pred::IULT, one, two);
+        m.terminate(entry, Term::CondBr(condition, yes, no));
+        let before = m.phi(yes, i32t);
+        m.set_phi(before, vec![(one, entry)]);
+
+        m.terminate(meet, Term::Br(resume));
+        m.splice(entry, Term::Br(meet), resume);
+        let after = m.phi(no, i32t);
+        m.set_phi(after, vec![(two, entry)]);
+
+        assert_eq!(&*successors(m.blocks[entry].term), &[meet]);
+        assert!(matches!(m.blocks[resume].term, Some(Term::CondBr(c, y, n))
+            if (c, y, n) == (condition, yes, no)));
+        for (phi, value) in [(before, one), (after, two)] {
+            let V::Inst(id) = phi else { unreachable!() };
+            assert!(matches!(&m.insts[id as usize].op, Op::Phi(incoming)
+                if incoming == &[(value, resume)]));
+        }
+    }
+
     /// A structured shader's shape: `stages` if/else diamonds in a row, each
     /// merge with one phi per register (as the lowering makes them), then a
     /// loop, and a tail that reads only the first `read` registers.
@@ -1259,7 +1341,7 @@ mod tests {
     fn worklist_liveness_matches_passes() {
         for (regs, stages, read) in [(1, 0, 1), (1, 1, 1), (4, 3, 1), (8, 17, 3), (16, 40, 16)] {
             let m = synthetic(regs, stages, read);
-            let live = m.live(false);
+            let live = m.live();
             assert_eq!(live, live_by_passes(&m), "{regs} regs x {stages} stages");
         }
     }
@@ -1286,102 +1368,49 @@ mod tests {
             V::Inst(i) => i as usize,
             _ => unreachable!(),
         };
-        let live = m.live(false);
+        let live = m.live();
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
     }
 
     #[test]
-    fn compute_keeps_calls_and_memory_effects_with_their_operands() {
-        let mut m = Module::default();
-        let i32t = m.int(32);
-        let shared = m.global("shared", i32t, 3);
-        let fty = m.func_ty(i32t, vec![i32t]);
-        let f = m.function("test_call", fty, None, false);
-        let entry = m.new_block();
-        let x = m.load(entry, shared);
-        let two = m.i32(2);
-        let arg = m.bin(entry, Bin::Add, x, two);
-        let call = m.call(entry, f, vec![arg]);
-        let old = m.atomic(entry, Rmw::Add, shared, arg);
-        m.store(entry, shared, old);
-        let store = *m.blocks[entry].body.last().unwrap();
-        let unused = m.bin(entry, Bin::Mul, call, two);
-        let live = m.live(true);
-        let retained = |v| match v {
-            V::Inst(i) => live[i as usize],
-            _ => unreachable!(),
-        };
-        assert!([x, arg, call, old].into_iter().all(retained));
-        assert!(live[store as usize]);
-        assert!(!retained(unused));
-    }
-
-    #[test]
-    fn unused_arithmetic_can_release_a_loop_carried_phi() {
-        let m = synthetic(64, 64, 8);
-        let all = m.live(false);
-        let needed = m.live(true);
-        let removed_phis = m
-            .insts
-            .iter()
-            .enumerate()
-            .filter(|(i, inst)| all[*i] && !needed[*i] && matches!(inst.op, Op::Phi(_)))
-            .count();
-        assert!(removed_phis >= 56);
-        assert!(m.write(true).len() < m.write(false).len());
-    }
-
-    #[test]
-    fn missing_scalar_is_unread_only_on_the_edge_excluded_by_the_guard() {
-        for op in [pred::EQ, pred::NE] {
+    fn empty_latch_with_dead_phis_is_folded() {
+        // Two identical loops except one has an unread phi in its empty latch;
+        // both must fold the latch and emit identical bitcode.
+        let build = |with_dead_phi: bool| {
             let mut m = Module::default();
-            let [entry, mask, scalar, join, read, exit] = std::array::from_fn(|_| m.new_block());
-            let ty = m.int(32);
-            let ptr = m.global("input", ty, 3);
-            let input = m.load(entry, ptr);
-            let zero = m.i32(0);
-            let one = m.i32(1);
-            let unknown = m.undef(ty);
-            let choose = m.cmp(entry, pred::EQ, input, zero);
-            m.terminate(entry, Term::CondBr(choose, mask, scalar));
-            m.terminate(mask, Term::Br(join));
-            m.terminate(scalar, Term::Br(join));
-            let payload = m.phi(join, ty);
-            m.set_phi(payload, vec![(unknown, mask), (input, scalar)]);
-            let guard = m.phi(join, ty);
-            m.set_phi(guard, vec![(zero, mask), (one, scalar)]);
-            let test = m.cmp(join, op, one, guard);
-            let (yes, no) = if op == pred::EQ {
-                (read, exit)
-            } else {
-                (exit, read)
-            };
-            m.terminate(join, Term::CondBr(test, yes, no));
-            m.store(read, ptr, payload);
-            m.terminate(read, Term::Br(exit));
+            let i32t = m.int(32);
+            let void = m.void();
+            let fty = m.func_ty(void, vec![i32t]);
+            let f = m.function("sink", fty, Some(Attr::NoUnwind), false);
+            let main_ty = m.func_ty(void, vec![]);
+            m.function("main", main_ty, None, true);
+            let (entry, head, body, latch, exit) = (
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+            );
+            let (z, one, ten) = (m.i32(0), m.i32(1), m.i32(10));
+            m.terminate(entry, Term::Br(head));
+            let i = m.phi(head, i32t);
+            m.terminate(head, Term::Br(body));
+            let next = m.bin(body, Bin::Add, i, one);
+            let cond = m.cmp(body, pred::IULT, next, ten);
+            m.terminate(body, Term::CondBr(cond, latch, exit));
+            if with_dead_phi {
+                let dead = m.phi(latch, i32t);
+                m.set_phi(dead, vec![(next, body)]);
+            }
+            m.terminate(latch, Term::Br(head));
+            m.set_phi(i, vec![(z, entry), (next, latch)]);
+            let _ = m.call(exit, f, vec![next]);
             m.terminate(exit, Term::Ret);
-            assert!(m.unused_on_phi_edge(payload, join, mask));
-            assert!(!m.unused_on_phi_edge(payload, join, scalar));
-
-            // A second route to the read bypasses the guard.
-            m.terminate(exit, Term::Br(read));
-            assert!(!m.unused_on_phi_edge(payload, join, mask));
-            m.terminate(exit, Term::Ret);
-
-            // An unknown guard on this edge cannot protect the read.
-            m.set_phi(guard, vec![(unknown, mask), (one, scalar)]);
-            assert!(!m.unused_on_phi_edge(payload, join, mask));
-            m.set_phi(guard, vec![(zero, mask), (one, scalar)]);
-            // A read after reconvergence, including on a phi edge, is live.
-            let again = m.phi(exit, ty);
-            m.set_phi(again, vec![(one, read), (payload, join)]);
-            assert!(!m.unused_on_phi_edge(payload, join, mask));
-            m.set_phi(again, vec![(one, read), (one, join)]);
-            m.store(exit, ptr, payload);
-            assert!(!m.unused_on_phi_edge(payload, join, mask));
-        }
+            m.write()
+        };
+        assert_eq!(build(false), build(true));
     }
 
     #[test]
@@ -1400,7 +1429,7 @@ mod tests {
             ((64, 64, 64), 38_916, 0x9586_730c_f953_4a45),
             ((128, 256, 32), 295_952, 0x89e5_de2d_64f0_8785),
         ] {
-            let bytes = synthetic(regs, stages, read).write(false);
+            let bytes = synthetic(regs, stages, read).write();
             assert_eq!((bytes.len(), fnv(&bytes)), (len, hash), "{regs}x{stages}");
         }
     }
@@ -1410,11 +1439,11 @@ mod tests {
     fn bench_write() {
         for (regs, stages, read) in [(64, 64, 64), (128, 256, 32), (256, 512, 256)] {
             let m = synthetic(regs, stages, read);
-            let bytes = m.write(false);
+            let bytes = m.write();
             let runs = 5;
             let t = std::time::Instant::now();
             for _ in 0..runs {
-                std::hint::black_box(m.write(false));
+                std::hint::black_box(m.write());
             }
             let per = t.elapsed() / runs;
             println!(
@@ -1424,5 +1453,46 @@ mod tests {
                 fnv(&bytes)
             );
         }
+    }
+
+    /// A loop header with two back edges gets one, through a new block that
+    /// joins what each brings (vkd3d-proton keeps one per header).
+    #[test]
+    fn a_header_with_two_back_edges_gets_one() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let void = m.void();
+        let main_ty = m.func_ty(void, vec![]);
+        m.function("main", main_ty, None, true);
+        let [entry, head, body, mid, exit] = [(); 5].map(|()| m.new_block());
+        let (zero, one, two) = (m.i32(0), m.i32(1), m.i32(2));
+        m.terminate(entry, Term::Br(head));
+        let p = m.phi(head, i32t);
+        m.terminate(head, Term::Br(body));
+        let x = m.bin(body, Bin::Add, p, one);
+        let c = m.cmp(body, pred::IULT, x, two);
+        m.terminate(body, Term::CondBr(c, head, mid));
+        let y = m.bin(mid, Bin::Add, x, one);
+        let d = m.cmp(mid, pred::IULT, y, two);
+        m.terminate(mid, Term::CondBr(d, head, exit));
+        m.terminate(exit, Term::Ret);
+        m.set_phi(p, vec![(zero, entry), (x, body), (y, mid)]);
+        m.single_latches();
+        let latch = m.blocks.len() - 1;
+        assert_eq!(m.successors(body), [latch, mid]);
+        assert_eq!(m.successors(mid), [latch, exit]);
+        assert_eq!(m.successors(latch), [head]);
+        let phi = |m: &Module, v: V| match v {
+            V::Inst(id) => match &m.insts[id as usize].op {
+                Op::Phi(incoming) => incoming.clone(),
+                op => panic!("{op:?}"),
+            },
+            v => panic!("{v:?}"),
+        };
+        let incoming = phi(&m, p);
+        assert_eq!(incoming[0], (zero, entry));
+        assert_eq!(incoming[1].1, latch);
+        assert_eq!(phi(&m, incoming[1].0), [(x, body), (y, mid)]);
+        assert!(!m.write().is_empty());
     }
 }

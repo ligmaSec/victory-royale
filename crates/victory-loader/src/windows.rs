@@ -29,6 +29,7 @@ pub struct LoadedImage {
     module: HMODULE,
     path: PathBuf,
     info: ImageInfo,
+    original_hash: blake3::Hash,
 }
 
 // SAFETY: HMODULE is a process-wide handle (the base address); using it from
@@ -62,6 +63,7 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         .inspect_err(|error| IoOperation::CreateImageDirectory.failed(error, started))
         .with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(prepared.file_name());
+    victory_core::ensure_outside_repo(&path)?;
     write_if_changed(&path, &prepared.bytes)?;
 
     // SAFETY: the prepared image has no entry point or imports.
@@ -80,21 +82,12 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         module,
         path,
         info: prepared.info.clone(),
+        original_hash: prepared.original_hash,
     };
     // A DLL indexes its TLS properly; only an exe assumes index 0.
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
-    }
-    if std::env::var_os(crate::hooks::NO_WATCHDOG_ENV).is_some() {
-        // SAFETY: just mapped, and no title code has run.
-        let applied =
-            unsafe { crate::hooks::disarm_watchdog(loaded.base(), &prepared.original_hash) };
-        tracing::info!(
-            applied,
-            "title watchdog hooks ({})",
-            crate::hooks::NO_WATCHDOG_ENV
-        );
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
@@ -158,6 +151,11 @@ fn map_dll(
     seen: &mut HashSet<String>,
     loaded: &mut Vec<(String, LoadedImage)>,
 ) -> Result<()> {
+    // Import names and late library requests must name a package file,
+    // not a drive, stream, or path outside the package directory.
+    if name.is_empty() || name == "." || name == ".." || name.contains(['\\', '/', ':']) {
+        return Ok(());
+    }
     let name = name.to_ascii_lowercase();
     let path = dirs.0.join(&name);
     if !seen.insert(name.clone()) || !wanted(&name) || !path.is_file() {
@@ -165,6 +163,7 @@ fn map_dll(
     }
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
+    drop(original);
     let image = load(&prepared, dirs.1).with_context(|| format!("loading {}", path.display()))?;
     map_imports(&image.info, dirs, wanted, seen, loaded)?;
     loaded.push((name, image));
@@ -311,6 +310,40 @@ impl LoadedImage {
     /// Parsed from the original image (imports, entry point, TLS callbacks).
     pub fn info(&self) -> &ImageInfo {
         &self.info
+    }
+
+    /// Samples a word from the image without reading an inaccessible page.
+    #[cfg(feature = "diagnostics")]
+    pub fn read_diagnostic_word(&self, rva: usize) -> Option<u32> {
+        if rva.checked_add(4)? > self.info.size_of_image as usize {
+            return None;
+        }
+        let mut bytes = [0; 4];
+        crate::crash::read_memory(self.base().checked_add(rva)?, &mut bytes).ok()?;
+        Some(u32::from_le_bytes(bytes))
+    }
+
+    /// Applies explicit render settings only to the exact supported build.
+    ///
+    /// # Safety
+    /// Imports must already be bound, and no title code may run during this call.
+    pub unsafe fn apply_render_profile(
+        &self,
+        output: Option<(u32, u32)>,
+        scale: Option<f32>,
+        fps: Option<u32>,
+    ) -> Result<()> {
+        // SAFETY: this handle identifies the image whose original hash was recorded at load.
+        unsafe {
+            crate::render_profile::apply(
+                self.base(),
+                self.info.size_of_image as usize,
+                self.original_hash,
+                output,
+                scale,
+                fps,
+            )
+        }
     }
 
     /// Address of an export of the image, if it has one by that name.

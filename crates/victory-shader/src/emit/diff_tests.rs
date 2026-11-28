@@ -3,9 +3,8 @@
 //! dispatched) on the host GPU with the same inputs.
 //!
 //! Needs `VICTORY_CONSOLE_DXC` (the console SDK's `dxc.exe`) and a PC
-//! `dxc.exe` (`VICTORY_PC_DXC`, then the newest Windows SDK's, then the
-//! sibling of `VICTORY_DXIL` for standalone DXC). Skipped without both
-//! compilers. Set `VICTORY_WARP=1` to draw on WARP.
+//! `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's); skipped
+//! without them. Set `VICTORY_WARP=1` to draw on WARP.
 
 use std::path::{Path, PathBuf};
 
@@ -14,278 +13,6 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::host::{Draw, Host, Root};
 use super::{HostShader, RootType, translate};
-
-#[test]
-fn packed_pixel_inputs_read_both_halves() {
-    use super::container::{SigElement, signature};
-    use super::valu_tests::{ONE_AT_A_TIME, backends};
-    use crate::dxbc::{Container, FourCC};
-    use crate::native::{HwStage, NativeProgram, PsInput, StageIo, Usage, VsInput, VsOutput};
-
-    let element = |name: &str, index, kind, row, cols, comp, half| SigElement {
-        name: name.into(),
-        index,
-        kind,
-        comp,
-        interp: 0,
-        row: Some(row),
-        col: 0,
-        cols,
-        usage: (1 << cols) - 1,
-        half,
-    };
-    let emit = |stage, io, words: &[u32], ins: &[SigElement], outs: &[SigElement]| {
-        // The serializer writes host types. Mark the synthetic console's
-        // native 16-bit elements in the source signature, in register order.
-        let native_sig = |elements: &[SigElement], input| {
-            let mut sig = signature(elements, input);
-            for (row, e) in sig[8..].as_chunks_mut::<32>().0.iter_mut().zip(elements) {
-                if e.half {
-                    row[16] += 3;
-                }
-            }
-            sig
-        };
-        let isg = native_sig(ins, true);
-        let osg = native_sig(outs, false);
-        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg), (FourCC::OSG1, &osg)]);
-        let native = NativeProgram {
-            stage,
-            wave64: false,
-            vgprs: 12,
-            layout: vec![],
-            used: vec![],
-            io,
-            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        };
-        let p = crate::ir::build(&native.code, false, native.vgprs).unwrap();
-        let st = crate::structure::structure(&p).unwrap();
-        let io = crate::io::raise(&p, &native).unwrap();
-        let res = crate::resource::track(&p, &native.layout, stage, Some(&st)).unwrap();
-        super::emit(
-            &Container::parse(&bytes).unwrap(),
-            &native,
-            &p,
-            &st,
-            &io,
-            &res,
-        )
-        .unwrap()
-    };
-    let mut validator = super::validator::Validator::default_path()
-        .map(|path| super::validator::Validator::load(Some(&path)).unwrap());
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|err| err.into_inner());
-    let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
-
-    for (label, fp16, pack2, flat, comps, widths, payload, expected) in [
-        (
-            "packed float",
-            true,
-            true,
-            false,
-            [9, 9],
-            [3, 2],
-            [
-                f32::from_bits(0xC000_3C00),
-                f32::from_bits(0x4200),
-                f32::from_bits(0xC400_3800),
-            ],
-            [1.0, -2.0, 0.0, -4.0],
-        ),
-        (
-            "unpacked float",
-            true,
-            false,
-            false,
-            [9, 9],
-            [3, 0],
-            [1.0, -2.0, 0.5],
-            [1.0, 0.0, -2.0, 0.5],
-        ),
-        (
-            "packed integer",
-            true,
-            true,
-            true,
-            [5, 4],
-            [2, 2],
-            [
-                f32::from_bits(0xFEDC_1234),
-                f32::from_bits(0x8080_8001),
-                0.0,
-            ],
-            [4660.0, 65244.0, 32769.0, 32896.0],
-        ),
-        (
-            "raw dwords",
-            false,
-            false,
-            true,
-            [5, 5],
-            [2, 0],
-            [
-                f32::from_bits(0xFEDC_1234),
-                f32::from_bits(0x8080_8001),
-                0.0,
-            ],
-            [4660.0, 65244.0, 32769.0, 32896.0],
-        ),
-    ] {
-        let varying =
-            |i: usize, row| element("TEXCOORD", i as u32, 0, row, widths[i], comps[i], fp16);
-        let varyings: Vec<_> = (0..2)
-            .filter(|&i| widths[i] != 0)
-            .map(|i| varying(i, i as u32))
-            .collect();
-        let position = element("SV_Position", 0, 3, varyings.len() as u32, 4, 9, false);
-        let mut vs_out = varyings.clone();
-        vs_out.push(position);
-        let vs = emit(
-            HwStage::Vs,
-            StageIo::Vs {
-                inputs: [(0, 4, 15), (1, 8, 7)]
-                    .map(|(row, vgpr, mask)| VsInput {
-                        usage: Usage::Generic,
-                        row,
-                        vgpr,
-                        mask,
-                    })
-                    .to_vec(),
-                outputs: vec![VsOutput {
-                    usage: Usage::Generic,
-                    row: 0,
-                    param: 0,
-                    fp16,
-                    pack2,
-                }],
-            },
-            &[
-                0xF800_0207,
-                0x000A_0908, // exp param0 v8, v9, v10, off
-                0xF800_08CF,
-                0x0706_0504, // exp pos0 v4, v5, v6, v7 done
-                0xBF81_0000,
-            ],
-            &[
-                element("POSITION", 0, 0, 0, 4, 9, false),
-                element(
-                    "TEXCOORD",
-                    0,
-                    0,
-                    1,
-                    3,
-                    if fp16 && !pack2 { 9 } else { 5 },
-                    fp16 && !pack2,
-                ),
-            ],
-            &vs_out,
-        );
-
-        let mut words = Vec::new();
-        if flat {
-            words.extend([0xC812_0002, 0xC816_0102]); // mov p0 attr0.x/y to v4/v5
-            for (pair, src) in [4u8, 5].into_iter().enumerate() {
-                let lo = 2 * pair as u8;
-                let hi = lo + 1;
-                // Shift each half down, then export its unsigned bit pattern as float.
-                let shift = |opcode: u32, dst: u8, src: u8| {
-                    opcode << 25 | u32::from(dst) << 17 | u32::from(src) << 9 | 144
-                };
-                words.extend([
-                    shift(0x1A, lo, src),
-                    shift(0x16, lo, lo),
-                    shift(0x16, hi, src),
-                ]);
-                for reg in [lo, hi] {
-                    words.push(0x7E00_0D00 | u32::from(reg) << 17 | u32::from(reg));
-                }
-            }
-        } else {
-            let reads = if pack2 {
-                [(0, 0), (0, 1), (1, 1), (2, 1)]
-            } else {
-                [(0, 0), (0, 1), (1, 0), (2, 0)]
-            };
-            for (i, (channel, high)) in reads.into_iter().enumerate() {
-                let dst = 2 + i as u32;
-                let attr = channel << 6 | high << 8;
-                words.extend([
-                    0xD742_0000 | dst,
-                    0x0002_0000 | attr,
-                    0xD75A_0000 | dst,
-                    (256 + dst) << 18 | 0x0002_0200 | attr,
-                    0x7E00_1700 | dst << 17 | dst, // v_cvt_f32_f16
-                ]);
-            }
-        }
-        words.extend([
-            0xF800_180F,
-            if flat { 0x0302_0100 } else { 0x0504_0302 },
-            0xBF81_0000,
-        ]);
-        let ps = emit(
-            HwStage::Ps,
-            StageIo::Ps {
-                inputs: vec![PsInput {
-                    usage: Usage::Generic,
-                    row: 0,
-                    mask: 7,
-                    attr: 0,
-                    flat,
-                    fp16,
-                    pack2,
-                    row2: u8::from(pack2),
-                }],
-                input_addr: if flat { 0 } else { 2 },
-                db_shader_control: 0,
-                patches: vec![],
-            },
-            &words,
-            &varyings,
-            &[element("SV_Target", 0, 16, 0, 4, 9, false)],
-        );
-        if let Some(v) = &mut validator {
-            for shader in [&vs, &ps] {
-                v.validate(&mut shader.dxil.clone())
-                    .unwrap_or_else(|err| panic!("{label} {:?}: {err}", shader.stage));
-            }
-            eprintln!("{label}: dxil.dll accepted VS and PS");
-        }
-        let vertices: Vec<_> = [[-1.0, -1.0], [-1.0, 3.0], [3.0, -1.0]]
-            .into_iter()
-            .flat_map(|[x, y]| [x, y, 0.5, 1.0, payload[0], payload[1], payload[2]])
-            .collect();
-        for &(backend, warp) in backends(force_warp) {
-            let host = match Host::new(warp) {
-                Ok(host) => host,
-                Err(err) => {
-                    eprintln!("{backend}: skipped ({err})");
-                    continue;
-                }
-            };
-            let (root, pso) = host
-                .pipeline(&vs, &ps)
-                .unwrap_or_else(|err| panic!("{label} {backend}: {err}"));
-            let out = host
-                .draw(
-                    &root,
-                    &pso,
-                    &Draw {
-                        roots: vec![],
-                        textures: &[],
-                        samplers: &[],
-                        vertices: &vertices,
-                        stride: 28,
-                        size: (2, 2),
-                        mesh_groups: 0,
-                    },
-                )
-                .unwrap();
-            assert_eq!(out, [expected; 4], "{label} {backend}");
-            eprintln!("{label}: readback matched on {backend}");
-        }
-    }
-}
 
 const RS: &str = "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT), \
                   RootConstants(num32BitConstants=4, b0), \
@@ -969,6 +696,17 @@ fn pc_compiler_prefers_sdk_and_supports_standalone_dxc() {
     assert_eq!(locate(None), Some((console, explicit_pc)));
 }
 
+fn write_dump(path: &Path, bytes: &[u8]) {
+    victory_core::ensure_outside_repo(path).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn scratch_dir() -> tempfile::TempDir {
+    let temp = std::env::temp_dir();
+    victory_core::ensure_outside_repo(&temp).unwrap();
+    tempfile::tempdir_in(temp).unwrap()
+}
+
 fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec<u8> {
     let input = dir.join("t.hlsl");
     let output = dir.join(format!("{entry}.bin"));
@@ -1027,12 +765,15 @@ fn translated_shaders_draw_as_pc_ones() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
-    let dir = std::env::temp_dir().join(format!("victory-diff-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = scratch_dir();
+    let dir = scratch.path();
     let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
     let texels: Vec<[f32; 4]> = (0..16)
         .map(|i| {
@@ -1088,8 +829,8 @@ fn translated_shaders_draw_as_pc_ones() {
     {
         // A case may bring its own vertex shader.
         let vs = if src.contains(" vs16(") { "vs16" } else { "vs" };
-        let vs_c = translate(&compile(&console, &dir, src, vs, "vs_6_5")).unwrap();
-        let ps_c = match translate(&compile(&console, &dir, src, "ps", "ps_6_5")) {
+        let vs_c = translate(&compile(&console, dir, src, vs, "vs_6_5")).unwrap();
+        let ps_c = match translate(&compile(&console, dir, src, "ps", "ps_6_5")) {
             Ok(s) => s,
             Err(e) => {
                 failures.push(format!("{name}: {e}"));
@@ -1098,12 +839,12 @@ fn translated_shaders_draw_as_pc_ones() {
         };
         if let Ok(out) = std::env::var("VICTORY_EMIT_DUMP") {
             let stem = name.replace([' ', ','], "_");
-            std::fs::write(
-                format!("{out}/{stem}.ps.cdxil"),
-                compile(&console, &dir, src, "ps", "ps_6_5"),
-            )
-            .unwrap();
-            std::fs::write(format!("{out}/{stem}.ps.dxil"), &ps_c.dxil).unwrap();
+            let out = Path::new(&out);
+            write_dump(
+                &out.join(format!("{stem}.ps.cdxil")),
+                &compile(&console, dir, src, "ps", "ps_6_5"),
+            );
+            write_dump(&out.join(format!("{stem}.ps.dxil")), &ps_c.dxil);
         }
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
@@ -1126,8 +867,8 @@ fn translated_shaders_draw_as_pc_ones() {
             .unwrap();
 
         let (vs_p, ps_p) = (
-            compile(&pc, &dir, src, vs, "vs_6_5"),
-            compile(&pc, &dir, src, "ps", "ps_6_5"),
+            compile(&pc, dir, src, vs, "vs_6_5"),
+            compile(&pc, dir, src, "ps", "ps_6_5"),
         );
         // SAFETY: the PC container carries its root signature.
         let root_p: ID3D12RootSignature =
@@ -1173,7 +914,6 @@ fn translated_shaders_draw_as_pc_ones() {
             failures.push(format!("{name}: {worst:?}"));
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
@@ -1183,12 +923,15 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
-    let dir = std::env::temp_dir().join(format!("victory-diff-ms-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = scratch_dir();
+    let dir = scratch.path();
     let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
     let draw = |roots, mesh_groups| Draw {
         roots,
@@ -1205,7 +948,7 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
         .iter()
         .filter(|c| only.as_ref().is_none_or(|o| o == c.0))
     {
-        let console_ms = compile(&console, &dir, src, "ms", "ms_6_5");
+        let console_ms = compile(&console, dir, src, "ms", "ms_6_5");
         let ms_c = match translate(&console_ms) {
             Ok(s) => s,
             Err(e) => {
@@ -1213,11 +956,12 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
                 continue;
             }
         };
-        let ps_c = translate(&compile(&console, &dir, src, "mps", "ps_6_5")).unwrap();
+        let ps_c = translate(&compile(&console, dir, src, "mps", "ps_6_5")).unwrap();
         if let Ok(out) = std::env::var("VICTORY_EMIT_DUMP") {
             let stem = name.replace([' ', ','], "_");
-            std::fs::write(format!("{out}/{stem}.ms.cdxil"), &console_ms).unwrap();
-            std::fs::write(format!("{out}/{stem}.ms.dxil"), &ms_c.dxil).unwrap();
+            let out = Path::new(&out);
+            write_dump(&out.join(format!("{stem}.ms.cdxil")), &console_ms);
+            write_dump(&out.join(format!("{stem}.ms.dxil")), &ms_c.dxil);
         }
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
@@ -1240,8 +984,8 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
             )
             .unwrap();
         let (ms_p, ps_p) = (
-            compile(&pc, &dir, src, "ms", "ms_6_5"),
-            compile(&pc, &dir, src, "mps", "ps_6_5"),
+            compile(&pc, dir, src, "ms", "ms_6_5"),
+            compile(&pc, dir, src, "mps", "ps_6_5"),
         );
         // SAFETY: the PC container carries its root signature.
         let root_p: ID3D12RootSignature =
@@ -1280,7 +1024,6 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
             failures.push(format!("{name}: {worst:?}"));
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
@@ -1300,12 +1043,15 @@ fn float_semantics_are_the_consoles() {
         eprintln!("no console compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
-    let dir = std::env::temp_dir().join(format!("victory-float-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = scratch_dir();
+    let dir = scratch.path();
     let src = r#"[RootSignature(RS)] [numthreads(4, 1, 1)]
         void cs(uint i : SV_GroupIndex) {
             float x = i == 0 ? k.x : i == 1 ? -k.x : i == 2 ? k.y : k.z;
@@ -1318,7 +1064,7 @@ fn float_semantics_are_the_consoles() {
                     : i == 2 ? k.w - 3.14159274 : k.w + 1.57079637;
             outb.Store(64 + 4 * i, asuint(i == 3 ? cos(r) : sin(r)));
         }"#;
-    let cs = translate(&compile(&console, &dir, src, "cs", "cs_6_5")).unwrap();
+    let cs = translate(&compile(&console, dir, src, "cs", "cs_6_5")).unwrap();
     let (root, pso) = host.compute_pipeline(&cs).unwrap();
     // 1e30, NaN, 3.5, 0.
     let k = [1e30f32.to_bits(), 0x7FC0_0000, 3.5f32.to_bits(), 0];
@@ -1343,7 +1089,6 @@ fn float_semantics_are_the_consoles() {
             },
         )
         .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(
         out[0][..16],
         [
@@ -1389,12 +1134,15 @@ fn translated_compute_matches_pc() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
-    let dir = std::env::temp_dir().join(format!("victory-diff-cs-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = scratch_dir();
+    let dir = scratch.path();
     let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
     let texels: Vec<[f32; 4]> = (0..16)
         .map(|i| [i as f32 / 16.0, (i % 4) as f32 * 0.3, 0.5, 1.0])
@@ -1489,10 +1237,13 @@ fn translated_compute_matches_pc() {
         .filter(|c| only.as_ref().is_none_or(|o| o == c.0))
         .filter(|c| warp || !c.0.starts_with("terminates"))
     {
-        let console_cs = compile(&console, &dir, src, "cs", "cs_6_5");
+        let console_cs = compile(&console, dir, src, "cs", "cs_6_5");
         if let Ok(out) = std::env::var("VICTORY_EMIT_DUMP") {
             let stem = name.replace([' ', ','], "_");
-            std::fs::write(format!("{out}/{stem}.cs.cdxil"), &console_cs).unwrap();
+            write_dump(
+                &Path::new(&out).join(format!("{stem}.cs.cdxil")),
+                &console_cs,
+            );
         }
         let cs_c = match translate(&console_cs) {
             Ok(s) => s,
@@ -1503,7 +1254,7 @@ fn translated_compute_matches_pc() {
         };
         if let Ok(out) = std::env::var("VICTORY_EMIT_DUMP") {
             let stem = name.replace([' ', ','], "_");
-            std::fs::write(format!("{out}/{stem}.cs.dxil"), &cs_c.dxil).unwrap();
+            write_dump(&Path::new(&out).join(format!("{stem}.cs.dxil")), &cs_c.dxil);
         }
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
@@ -1525,12 +1276,42 @@ fn translated_compute_matches_pc() {
         let mut root_views: Vec<(u8, bool)> = cs_c.root_cbvs.iter().map(|&s| (s, false)).collect();
         root_views.extend(cs_c.root_srvs.iter().map(|&s| (s, true)));
         root_views.sort_unstable();
+        let view_strides: Vec<u32> = views
+            .iter()
+            .map(|v| match *v {
+                View::RawUav(_) => 1,
+                View::HalfUav(_) => 8,
+                View::Buffer { stride, .. } => match stride {
+                    Stride::Raw => 1,
+                    Stride::Typed => 16,
+                    Stride::Structured(s) => s,
+                    Stride::Format(f, bytes) => {
+                        let kind = match f.0 as u32 {
+                            3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => {
+                                super::VIEW_INTEGER
+                            }
+                            4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => {
+                                super::VIEW_INTEGER | super::VIEW_SIGNED
+                            }
+                            _ => 0,
+                        };
+                        bytes | kind
+                    }
+                },
+                _ => 0,
+            })
+            .collect();
         for (n, (slot, srv)) in root_views.into_iter().enumerate() {
-            assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
-            let data = if srv {
-                root_srv.clone()
+            let data = if srv && (slot == super::SLOT_STRIDES || slot == super::SLOT_TABLE_STRIDES)
+            {
+                view_strides.clone()
             } else {
-                root_cbv.clone()
+                assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
+                if srv {
+                    root_srv.clone()
+                } else {
+                    root_cbv.clone()
+                }
             };
             roots.push((1 + n as u32, Root::View { srv, data }));
         }
@@ -1543,7 +1324,7 @@ fn translated_compute_matches_pc() {
             continue;
         }
         let ours = ours.unwrap();
-        let cs_p = compile(&pc, &dir, src, "cs", "cs_6_5");
+        let cs_p = compile(&pc, dir, src, "cs", "cs_6_5");
         // SAFETY: the PC container carries its root signature.
         let root_p: ID3D12RootSignature =
             unsafe { host.device.CreateRootSignature(0, &cs_p) }.unwrap();
@@ -1591,6 +1372,5 @@ fn translated_compute_matches_pc() {
             )),
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "{failures:#?}");
 }

@@ -1,37 +1,61 @@
-use std::env;
-use std::path::PathBuf;
-use std::process::Command;
+//! Fingerprints the shader translator, so that cached translations
+//! (`src/shader_cache.rs`) last until the translator itself changes and not
+//! only until the next build of anything.
+
+use std::path::{Path, PathBuf};
+
+mod build_helpers;
+
+fn files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
 
 fn main() {
-    println!("cargo:rustc-check-cfg=cfg(victory_bundled_hlsl)");
-    println!("cargo:rerun-if-env-changed=VICTORY_BUILD_DXC");
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        return;
+    build_helpers::bundle();
+    let here = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default());
+    let crates = here.join("..");
+    let root = crates.join("..");
+    // The translator, what it is built from, and the form entries are kept in.
+    let mut all = vec![
+        crates.join("victory-shader/Cargo.toml"),
+        here.join("src/shader_cache.rs"),
+        root.join("Cargo.lock"),
+        root.join("rust-toolchain.toml"),
+    ];
+    let source = crates.join("victory-shader/src");
+    println!("cargo:rerun-if-changed={}", source.display());
+    files(&source, &mut all);
+    all.sort();
+    let mut hash = blake3::Hasher::new();
+    for path in &all {
+        println!("cargo:rerun-if-changed={}", path.display());
+        // Names and line endings as they are in every checkout.
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let mut bytes = std::fs::read(path).unwrap_or_else(|e| {
+            panic!(
+                "reading {} for shader cache fingerprint: {e}",
+                path.display()
+            )
+        });
+        bytes.retain(|&b| b != b'\r');
+        hash.update(name.as_bytes());
+        hash.update(&(bytes.len() as u64).to_le_bytes());
+        hash.update(&bytes);
     }
-    let Some(compiler) = env::var_os("VICTORY_BUILD_DXC").map(PathBuf::from) else {
-        return;
-    };
-    if compiler.as_os_str().is_empty() {
-        println!("cargo:warning=VICTORY_BUILD_DXC is empty. Skipping GPU helper shader embedding.");
-        return;
-    }
-    println!("cargo:rerun-if-changed={}", compiler.display());
-    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    for name in [
-        "argument_clamp",
-        "rect_rewrite",
-        "rect_expand",
-        "table_probe",
-    ] {
-        let source = format!("shaders/{name}.hlsl");
-        println!("cargo:rerun-if-changed={source}");
-        let status = Command::new(&compiler)
-            .args(["-T", "cs_6_0", "-E", "main", "-O3", "-Fo"])
-            .arg(out.join(format!("{name}.dxil")))
-            .arg(&source)
-            .status()
-            .unwrap_or_else(|e| panic!("could not start {} for {source}: {e}", compiler.display()));
-        assert!(status.success(), "DXC failed for {source} ({status})");
-    }
-    println!("cargo:rustc-cfg=victory_bundled_hlsl");
+    println!("cargo:rerun-if-changed=build.rs");
+    println!(
+        "cargo:rustc-env=VICTORY_TRANSLATOR={}",
+        hash.finalize().to_hex()
+    );
 }

@@ -28,9 +28,10 @@ merged Git tree matches the one the job tested. Direct code pushes and merges
 without matching test evidence rerun it. The regression gate verifies the
 expected jobs for each path. A docs-only merge does not publish a binary.
 
-The distribution job builds the x86-64 Windows release on Linux and checks the
-embedded DXIL for `argument_clamp`, `rect_expand` and `rect_rewrite`. It unpacks the
-archive, exercises the offline launcher checks and pinned runtime selection with
+The distribution job builds the x86-64 Windows release on Linux and checks
+that it embeds the GPU helper shaders used by presentation, readback and
+indirect execution. It unpacks the archive, exercises the offline launcher
+checks and pinned runtime selection with
 a fake UMU, and runs the packaged executable under Wine against
 [synthetic PE fixtures](../tests/runtime/README.md). The suite checks import
 binding, TLS, threads, memory, DLL loading, and expected title return codes.
@@ -44,9 +45,13 @@ days. The latter contains the revision GitHub tested with the base branch.
 For a requested comparison, use the [interactive hardware test](#run-a-hardware-test)
 to get both matched builds. For a single run, Windows testers can launch the extracted
 `victory.exe` with the [usual Windows launch command](../README.md#getting-started).
+See the [Wine and Proton measurements](proton-launcher.md#wine-and-proton-performance)
+for historical runner benchmarks and startup issues. They do not replace the
+acceptance checks for the revision under test.
 
 Download the artifact from the CI run and unzip the Actions download. On Linux,
-run these commands in the extracted directory.
+run these commands in the extracted directory. Leave `PROTONPATH` unset for
+[automatic Proton setup](proton-launcher.md#patched-wineserver).
 
 ```sh
 sha256sum --check SHA256SUMS
@@ -76,8 +81,10 @@ You'll need Python 3.9 or newer and your own title executable outside the VIctor
 > credentials and output from the game. Review the filtered report before sharing.
 > Keeping all results local is always an option.
 
-On Linux, install Bash and UMU (`umu-run`). The Proton launcher may download its pinned
-runtime on first use.
+On Linux, install Bash and UMU (`umu-run`). New packages set up the indexed
+runner and the pinned vkd3d-proton libraries on first use. For A/B against an
+older package without automatic setup, export `PROTONPATH` pointing to the
+same [indexed Proton runner](proton-launcher.md#patched-wineserver) for both.
 
 | Start here | Linux/Proton | Windows (PowerShell) |
 | --- | --- | --- |
@@ -128,8 +135,10 @@ and build revisions. An extracted kit includes both builds and needs no GitHub l
    For private sharing, the filtered ZIP also contains per-window mean, median,
    p95, longest frame time and stall counts for each build. Separate submission
    samples record time spent on CPU preparation, buffer and texture copies,
-   GPU waits and copy-back, alongside draw and pipeline-drop counts. The private
-   event timeline connects shader binds, translations and pipeline results to
+   GPU waits and copy-back, alongside draw and unsubmitted-operation counts. A
+   separate column counts the subset blocked by the BVH builder; older builds
+   leave that column blank. The total is not a shader compilation failure count.
+   The private event timeline connects shader binds, translations and pipeline results to
    those samples through elapsed times and shader numbers shared across the pair.
    You can inspect the filtered ZIP in the printed temporary `share` folder.
 6. For **Send encrypted diagnostics to @requester**, install GitHub CLI and sign in to github.com
@@ -156,6 +165,138 @@ creation attempts can count more than once. The initial export uses a fixed set 
 fields. Unknown messages, command lines, hostnames, wall-clock timestamps, screenshots and
 the request's free text are excluded. If the summary misses something, describe
 it in words. See the [asset policy](asset-policy.md).
+
+### Compare extracted builds locally
+
+Use `--local` to run already extracted builds without selecting a hardware
+request, opening the report editor, or uploading results. Use verified packages
+with `victory.exe`, `REVISION` and, on Linux, `victory-proton.sh` in each `--build`
+directory. Run from the checkout with Python 3.9 or later. On Linux the packaged
+launcher needs Bash and UMU as above. Use the same runner for comparisons.
+Keep the title, report destination and
+system temporary directory outside the checkout; put the results and temporary
+files outside the title, build and source-save directories as well.
+If `--output-dir` is omitted, the runner uses the system temporary directory.
+
+Start by checking a clean first launch. On Linux:
+
+```sh
+python3 scripts/hardware-test/run-test.py --local \
+  --build candidate "/path/to/candidate/victory" \
+  --title "/path/to/game/title.exe" --clean-data \
+  --output-dir "/path/to/private/results"
+```
+
+On Windows (PowerShell):
+
+```powershell
+py scripts/hardware-test/run-test.py --local --build candidate 'D:\Builds\candidate\victory' `
+  --title 'D:\Games\Title\title.exe' --clean-data --output-dir 'D:\Private\VIctory results'
+```
+
+For a copied-save comparison, explicitly select `--save-dir` instead of
+`--clean-data`. Repeat `--build NAME DIR` in the order you want the builds run.
+The following scripted example assumes both extracted builds were compiled
+with the `diagnostics` feature; omit `--keys` for normal release builds.
+
+```sh
+python3 scripts/hardware-test/run-test.py --local \
+  --build main "/path/to/main/victory" --build candidate "/path/to/candidate/victory" \
+  --title "/path/to/game/title.exe" --save-dir "/path/to/7952987A" \
+  --warm --console series-x --keys "10:Enter,15:X" \
+  --output-dir "/path/to/private/results"
+```
+
+The same flags work with `py` and Windows paths. Each build's cold run starts
+with empty VIctory caches and, on Linux, separate translation and driver cache
+directories. `--warm` immediately repeats the run with the same cache directories;
+it does not reset system-wide caches. Each cold or warm case starts with its own
+fresh user data (empty or copied from the same save snapshot), and its own
+temporary working directory and Proton prefix. `--console` defaults to `series-x`
+and also accepts `series-s`. Windows runs the packaged EXE directly. On Linux the
+runner uses the packaged `--run` command with the pinned vkd3d-proton runtime.
+If the verified pin is not cached, the launcher may download it; use
+`--runtime proton` to use Proton's bundled vkd3d-proton instead. Follow the same
+runtime choice for all runs you intend to compare.
+
+`--keys` passes an optional `VICTORY_KEYS` schedule unchanged to each build.
+It requires a diagnostics-enabled build. The point syntax above holds each key
+for 0.2 seconds at the specified time after input starts, not after process
+launch. The integrated diagnostics build also accepts a held range, such as
+`10-10.5:Enter`. Use point syntax for older builds. With no `--keys`, the
+runner does not inherit an ambient `VICTORY_KEYS`.
+Close each game normally when your scenario is finished; the runner does not
+enforce a timeout. Verify gameplay and that a new save resumes manually, using
+a separate persistent test profile for the create-and-resume check: local
+comparison profiles are discarded and are not suitable for testing persistence
+across runs.
+
+The printed `victory-local-*` results folder contains labeled `cold` and
+optional `warm` case directories. Each has `case.json` (build name, package
+revision, SHA-256 of `victory.exe`, console, key schedule, starting data and
+cache class and graphics runtime), raw `console.log`, any Proton Steam logs,
+`console-exit.txt`, and timing/diagnostic summaries and CSVs. Timings can include menus;
+neither a boot log nor a zero exit proves gameplay or a successful save. The
+runner finishes normal exits serially and returns the first nonzero status, if
+any. It does not archive saves or upload the results. Keep this folder private:
+its unfiltered logs can contain sensitive information.
+
+## Player acceptance
+
+Use the exact tested package revisions and verify `SHA256SUMS` before launch.
+Report the OS, driver, GPU selected in the log, Proton and vkd3d-proton
+versions where applicable, console profile, actual swap-chain resolution,
+and cache state. On hybrid systems select the intended adapter with
+`VICTORY_ADAPTER` (a case-insensitive name fragment) and check the log.
+Apply the same settings and input sequence to all builds being compared.
+
+| Physical adapter under test | First comparison | Minimum target |
+| --- | --- | --- |
+| High-end discrete AMD or NVIDIA | 3840×2160 output, Series X | 30 FPS average, p95 ≤ 50 ms |
+| AMD or NVIDIA at lower resolution; feature-capable Intel Arc | 1920×1080 output, Series S | 30 FPS average, p95 ≤ 50 ms |
+| Integrated GPU that meets the same feature requirements | 1920×1080 output, Series S | 30 FPS average, p95 ≤ 50 ms; exploratory |
+
+These are test targets, not verified hardware tiers. Repeat on native Windows
+and Linux/Proton with the same GPU where possible. Set the test display to the
+requested resolution and record the actual swap-chain size from the log: a
+smaller window or Series S alone does not guarantee 1080p output. If the
+system cannot present at the specified size or initialize the required D3D12
+capabilities, record that result separately. WARP runs qualify only as
+functional checks, never as performance results. If DXGI substitutes a
+hardware adapter for WARP, record WARP as unavailable.
+
+1. Run the [clean-data comparison](#compare-extracted-builds-locally) on the
+   candidate. Complete setup, change a setting that is easy to check later,
+   and start a new game. Watch the intro without skipping it. Mark the time
+   from starting or resuming the game until camera or movement input changes
+   a rendered world frame. If input never changes the scene, report no first
+   control, not the time of the first present.
+2. From the [copied save](#run-a-hardware-test), turn the camera, walk across a
+   doorway, return, and reach the next available checkpoint. Look for scene
+   geometry, materials, lighting, characters, and effects. Repeat the same
+   indoor–outdoor route for at least ten minutes or until blocked. Record the
+   last point actually played, visual faults, resets or crashes, and process
+   memory and GPU memory at the same locations after repeated transitions.
+3. Repeat one checkpoint in a separate persistent test profile using the
+   [packaged Windows command](#ci-and-build-downloads) or the
+   [packaged Proton launcher](proton-launcher.md#launch). Set
+   `VICTORY_DATA_DIR` and `VICTORY_CACHE_DIR` to writable paths outside the
+   checkout (Windows paths, including under Proton); use a separate
+   `WINEPREFIX` on Linux. Keep the same test profile when relaunching. Save
+   using the game's available save or checkpoint, quit normally, reopen the
+   game, and verify that both progress and the chosen setting persist. Files
+   on disk alone do not establish a successful resume.
+4. Report the load time separately from a fixed segment after first control.
+   For both cold and warm runs, include average FPS, p95 and worst frame time,
+   and counts over 100 ms and one second. Include the sample length. Any crash,
+   device removal, persistent corruption, or one-second stall fails the
+   sustained-play check even if average FPS meets the target.
+
+Return a written summary with revisions, setting values, timing aggregates,
+and the observed blocker to the issue or PR. Keep game files, saves, captures,
+raw logs, and local paths out of public replies. Use the
+[private report workflow](#receive-private-hardware-reports) only for reviewed,
+filtered diagnostics requested by a maintainer.
 
 ## Receive private hardware reports
 
@@ -276,6 +417,15 @@ comparing a GPU test failure with the software adapter. WARP
 is not a real GPU, so behaviour that depends on the hardware (wave size,
 driver quirks) is only settled by a run on that hardware.
 
+For 32-lane compute shaders with a `32×1×1` thread group, the translator
+can retry a refused numeric lane-mask join using only subgroup operations.
+Use `VICTORY_WAVE_WIDE=0` to disable the retry for comparisons. Widening
+that can require barriers across host waves remains opt-in.
+
+The shader readback fixtures check that numeric mask joins retain the console
+wave width and that halfword LDS accesses spanning two dwords preserve the
+surrounding bytes.
+
 Run one crate or one test on its own:
 
 ```powershell
@@ -319,14 +469,60 @@ with a working sound device.
 
 ## Comparing frame pacing
 
-Keep the build settings, driver, window size and launch sequence the same. Compare
-the menu and first scene after loading separately. Release logs include a
+Compare one save and route at a time. Pin the Proton build or Wine client and
+server, the DXGI and vkd3d-proton libraries, and the graphics driver on both
+sides. If any change, label that as a separate runtime comparison. Record
+both the actual swap-chain size and the internal render scale, plus the
+initial shader and pipeline cache state. Measure loading and interaction
+separately.
+
+Release logs include a
 `present intervals` line for every five seconds of completed frame intervals
 (or 4,096 intervals at high rates). Each line gives the sample count, mean,
 median, nearest-rank p95, longest interval and counts over 100 ms and one second.
 These are wall-clock times between successful host presents. Startup before
 the first present and gaps while DXGI reports an occluded window are excluded.
 A stall appears in the log when presentation resumes.
+
+Concurrent recording threads share the same wall-clock pipeline wait
+budget for a title frame. One thread waiting for a pipeline no longer
+forces another to drop its draw while time remains. Keep general and
+screen-pass limits the same in matched cache comparisons.
+
+When the title is remapping memory, a repeat texture refresh can reuse its
+last stable staged pixels and retry rather than block the submitting thread.
+First fills and exact refreshes still wait for a stable mapping. For a
+matched blocking-path diagnostic, set `VICTORY_TEXTURE_NO_WAIT=0`.
+
+Small transient descriptor tables share a chunk within one host command
+list, so its completion frees a contiguous range. Closing it returns only
+the unused tail. When a wait splits a title command list, each host part
+owns its slots and releases them after its own GPU work completes, not
+when a later part completes. Near capacity, only the needed slots are
+allocated.
+The allocator fills the smallest fitting range on the preferred side.
+Tables of at least 256 slots prefer the upper eighth; small speculative
+chunks cannot split that region. Exact allocations can fall back to the
+other side or span the boundary, without reducing heap capacity. A failed
+retry logs the requested run, total free slots and largest physical run.
+Equal table records in one host part share a live snapshot even if copied
+to another guest address in the same heap. Different records or a new
+part get a different snapshot; earlier work keeps its own descriptors.
+A final allocation failure also reports slots held by the requesting part.
+
+For donor parity diagnostics, `VICTORY_SHADER_ROLES` can point to a private
+text file outside the checkout. Each nonempty line maps a full BLAKE3 shader
+container ID to one role, with whitespace between them and an optional `#`
+comment. Valid roles are `ambient-resolve`, `ambient-radiance`, `ambient-air`,
+`probe-activation`, `ray-resolve`, `hair`, `skin-init`, `scene-input`, `bake`, and
+`defrag`. Use the same locally verified role assignments in a comparison.
+Without a registry, no per-module role override is applied. Do not commit or
+upload the registry. Its purpose is to compare renderer variants, not to
+replace a clean run of the package without local overrides.
+
+The Proton package embeds the host-owned indirect-light helpers. Those
+helpers do not need a separately installed shader compiler when testing a
+locally configured ambient workaround.
 
 ## Tests that skip or are ignored
 

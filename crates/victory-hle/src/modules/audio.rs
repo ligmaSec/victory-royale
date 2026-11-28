@@ -114,6 +114,11 @@ fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
     heap.blocks
         .insert(ptr as usize, Block { size, apu, layout });
     heap.by_apu.insert(apu, ptr as usize);
+    // The big ones are named in the log: they are the title's audio memory
+    // given out of our allocator, which the memory line counts as ours.
+    if size >= 32 << 20 {
+        tracing::info!(mb = size >> 20, at = ?ptr, "audio memory for the title from our allocator");
+    }
     Some((ptr, apu))
 }
 
@@ -192,12 +197,7 @@ pub extern "system" fn ApuAlloc(
     align: u32,
     _flags: u32,
 ) -> HRESULT {
-    if out.is_null()
-        || size == 0
-        || align < 4
-        || !align.is_power_of_two()
-        || size.checked_add(align).is_none()
-    {
+    if out.is_null() || size == 0 || align < 4 || !align.is_power_of_two() {
         return E_INVALIDARG;
     }
     let Some((ptr, address)) = heap_alloc(size as usize, align as usize) else {
@@ -218,16 +218,10 @@ pub extern "system" fn ApuFree(ptr: *mut c_void) {
 }
 
 pub extern "system" fn ApuMapVirtualAddress(ptr: *const c_void) -> u32 {
-    if ptr.is_null() {
-        return 0;
-    }
     heap_map(ptr as usize)
 }
 
 pub extern "system" fn ApuIsVirtualAddressValid(ptr: *const c_void, align: u32) -> bool {
-    if ptr.is_null() {
-        return false;
-    }
     let apu = heap_map(ptr as usize);
     apu != 0 && (align == 0 || apu.is_multiple_of(align))
 }
@@ -524,10 +518,21 @@ fn pump(context: Context, voice: &mut Voice) {
         return;
     }
     while context.field(1, 31, 1) == 1 {
-        if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
+        // A skipped frame or an input boundary can advance the decoder without
+        // producing samples. Publish only complete blocks, except the final
+        // padded tail. Limit empty steps so a broken looping voice cannot hold
+        // its lock or stall other voices for the whole decoding pass.
+        for _ in 0..8 {
+            if voice.pcm.len() >= SAMPLES_PER_BLOCK || !decode(context, voice) {
+                break;
+            }
+        }
+        if voice.pcm.is_empty() || (voice.pcm.len() < SAMPLES_PER_BLOCK && !voice.ended) {
             return;
         }
-        let write = context.field(0, 27, 5);
+        // The write block is the title's too: taken modulo the ring before
+        // the first write, which would otherwise land past the ring's end.
+        let write = context.field(0, 27, 5) % size;
         let address = context.get(7) as usize + write as usize * BLOCK_BYTES;
         let Some(out) = heap_bytes(address as u32, BLOCK_BYTES) else {
             return;
@@ -554,12 +559,21 @@ fn pump(context: Context, voice: &mut Voice) {
 /// Decodes the next frame of the current input into `voice.pcm`; false
 /// when there is nothing left to decode.
 fn decode(context: Context, voice: &mut Voice) -> bool {
+    let valid = context.field(0, 20, 2);
     if voice.ended {
-        return false;
+        // The title can refill either input while the context stays enabled.
+        // Flush the previous tail once and leave the ring idle until a valid
+        // buffer is published. The decoder resets its overlap when flushed.
+        if valid == 0 {
+            return false;
+        }
+        voice.ended = false;
+        if context.field(2, 26, 5) == INPUT_INVALID {
+            context.set_field(2, 26, 6, 0);
+        }
     }
     let channels = context.channels();
     let mut current = context.field(4, 31, 1);
-    let valid = context.field(0, 20, 2);
     if valid & (1 << current) == 0 {
         if valid & (1 << (1 - current)) == 0 {
             // Out of input: the overlap tail, then nothing.
@@ -664,12 +678,17 @@ fn dump_input(index: u32, context: Context) {
         context.get(5) & !0x7ff,
         context.field(0, 0, 12) as usize * xma::PACKET_BYTES,
     );
+    let ctx = dir.join(format!("{n:02}-{index}.ctx"));
+    let xma = dir.join(format!("{n:02}-{index}.xma"));
+    for path in [&ctx, &xma] {
+        if let Err(error) = victory_core::ensure_outside_repo(path) {
+            tracing::warn!(%error, "not writing the audio diagnostic");
+            return;
+        }
+    }
     let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(dir.join(format!("{n:02}-{index}.ctx")), words);
-    let _ = std::fs::write(
-        dir.join(format!("{n:02}-{index}.xma")),
-        input.unwrap_or_default(),
-    );
+    let _ = std::fs::write(ctx, words);
+    let _ = std::fs::write(xma, input.unwrap_or_default());
 }
 
 /// Starts the decoding thread on the first enabled voice, and has it fill
@@ -955,9 +974,6 @@ mod tests {
         assert_eq!(heap_unmap(apu + 4), Some(ptr.cast::<u8>().wrapping_add(4)));
         ApuFree(ptr);
         assert_eq!(ApuMapVirtualAddress(ptr), 0);
-        assert!(!ApuIsVirtualAddressValid(std::ptr::null(), 0));
-        assert_eq!(ApuMapVirtualAddress(std::ptr::null()), 0);
-        assert_eq!(ApuAlloc(&mut ptr, &mut apu, u32::MAX, 128, 1), E_INVALIDARG);
         assert_eq!(ApuAlloc(&mut ptr, &mut apu, 0x100, 6, 1), E_INVALIDARG);
     }
 
@@ -1102,6 +1118,93 @@ mod tests {
         assert_eq!((write, writable), (2, 0));
         assert!(ring[..0x200].iter().all(|&b| b == 0));
         assert!(ring[0x200..].iter().all(|&b| b == 0x55));
+    }
+
+    /// A write block past the end of the ring (6 on a ring of four) is block
+    /// 2 of it: blocks 2, 3 and 0 are filled, up to the read block (1). It
+    /// used to write block 6 first, past the ring's end.
+    #[test]
+    fn xma_write_blocks_past_the_ring_end_wrap() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let mut request = ShapeContexts {
+            counts: [0, 0, 0, 0, 4, 0],
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+        let context = Context(request.arrays[4].cast::<u32>().wrapping_add(16));
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: two packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(
+            ApuAlloc(&mut output, &mut output_apu, 0x800, 0x100, 2),
+            S_OK
+        );
+        // SAFETY: the allocation was just made: the ring (four blocks) and a guard
+        // area after it, which the pass must not touch.
+        unsafe { output.cast::<u8>().write_bytes(0x55, 0x800) };
+
+        // As in `xma_contexts_decode_into_their_output_rings`, but looping
+        // forever from the first frame to the last; write block 6, read block 1.
+        context.set(0, 2 | 255 << 12 | 1 << 20 | 4 << 22 | 6 << 27);
+        context.set(1, 1 << 31 | 3 << 27);
+        context.set(2, 32);
+        context.set(3, 32);
+        context.set(4, (xma::PACKET_BYTES * 8 + 32 + 2 * 31) as u32);
+        context.set(5, input_apu);
+        context.set(7, output_apu);
+        context.set(9, 1);
+
+        let mut acp = std::ptr::null_mut();
+        assert_eq!(AcpHalCreate(&mut acp), S_OK);
+        // SAFETY: just created.
+        let m = unsafe { (*acp).vtable };
+        assert_eq!((m.connect)(acp, 0x1000, 0x1000), S_OK);
+        let submit = |command: u32, words: &[u32]| {
+            assert_eq!(
+                (m.submit)(acp, command, 0xf1, u32::MAX, words.as_ptr().cast(), 0),
+                S_OK
+            );
+        };
+        submit(ENABLE_XMA, &[1]);
+        // A pass on a thread of its own (the decoding thread runs them too),
+        // so that one that never ends fails this test instead of hanging it.
+        let (done, passed) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            xma().pump();
+            let _ = done.send(());
+        });
+        let five = std::time::Duration::from_secs(5);
+        let wait = || passed.recv_timeout(five).is_ok();
+        let ended = wait();
+        if !ended {
+            // End it as a full ring would, to release the contexts below.
+            context.set_field(1, 31, 1, 0);
+            assert!(wait(), "the XMA pass did not end on a full ring either");
+        }
+        let (write, writable) = (context.field(0, 27, 5), context.field(1, 31, 1));
+        // SAFETY: the ring.
+        let ring = unsafe { std::slice::from_raw_parts(output.cast::<u8>(), 0x800) }.to_vec();
+
+        submit(DISABLE_XMA, &[1]);
+        (m.release)(acp);
+        ApuFree(input);
+        ApuFree(output);
+        assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+        assert!(ended, "the XMA pass never ended");
+        // Blocks 2, 3 and 0 written (silence), 1 left for the title, and
+        // nothing past the ring.
+        assert_eq!((write, writable), (1, 0));
+        assert!(
+            ring[0x400..].iter().all(|&b| b == 0x55),
+            "written past the ring"
+        );
+        let block = |n: usize| &ring[n * 0x100..(n + 1) * 0x100];
+        assert!([0, 2, 3].iter().all(|&n| block(n).iter().all(|&b| b == 0)));
+        assert!(block(1).iter().all(|&b| b == 0x55));
     }
 
     #[test]

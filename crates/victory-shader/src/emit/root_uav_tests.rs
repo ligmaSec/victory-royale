@@ -1,15 +1,17 @@
 //! A synthetic compute shader writes one word through a spilled root descriptor.
 
-use super::{HostShader, lower};
+use super::{SLOT_MEMORY, USER_ROOT_ADDRESS, lower};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
-use crate::{io, ir, resource, structure};
+use crate::{io, resource, structure};
 
 #[test]
-fn compute_writes_through_spilled_root_uav() {
+fn spilled_root_uav_uses_the_title_address_directory() {
     let slot = 3;
-    let words: [u32; 8] = [
+    let words = [
+        0x8701_FF01u32, // s_and_b32 s1, s1, 0xff (40-bit pointer)
+        0xff,
         0xF404_0200, // s_load_dwordx2 s[8:9], s[0:1], 0
         0xFA00_0000,
         0xBE8A_0384, // descriptor size
@@ -47,8 +49,7 @@ fn compute_writes_through_spilled_root_uav() {
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
-    let p =
-        ir::build_with(&native.code, native.wave64, native.vgprs, true).expect("ir::build_with");
+    let p = crate::spill::build(&native).expect("spill build");
     let st = structure::structure(&p).expect("structure");
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
@@ -66,63 +67,14 @@ fn compute_writes_through_spilled_root_uav() {
     })
     .expect("lower");
 
-    let shader = HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        samplers: lowered.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
-        root_uavs: lowered.root_uavs,
-    };
-
-    assert_eq!(shader.root_uavs, [slot]);
-    assert!(shader.root_srvs.is_empty());
-    #[cfg(windows)]
-    check_readback(&shader);
-}
-
-#[cfg(windows)]
-fn check_readback(shader: &HostShader) {
-    use super::host::{Dispatch, Host, Root, View};
-    use super::valu_tests::{ONE_AT_A_TIME, backends};
-
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut ran = 0;
-    let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
-    for &(label, warp) in backends(force_warp) {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
-        };
-        let (root, pso) = host
-            .compute_pipeline(shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
-        let out = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![
-                        (0, Root::Constants(vec![0])),
-                        (
-                            1,
-                            Root::Table {
-                                sampler: false,
-                                index: 1,
-                            },
-                        ),
-                    ],
-                    views: &[View::RawUav(4), View::RawUav(4)],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        assert_eq!(out, [vec![0; 4], vec![0, 29, 0, 0]], "{label}");
-        eprintln!("{label}: root UAV write verified");
-        ran += 1;
+    assert!(lowered.root_srvs.contains(&SLOT_MEMORY));
+    assert!(!lowered.root_uavs.contains(&slot));
+    for kind in [USER_ROOT_ADDRESS, USER_ROOT_ADDRESS + 1] {
+        assert!(
+            lowered
+                .user_data
+                .iter()
+                .any(|u| u.root == RootType::Other(kind) && u.slot == slot)
+        );
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }

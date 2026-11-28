@@ -55,6 +55,18 @@ pub fn image_named(file: &str) -> Option<usize> {
         .map(|(b, _)| *b)
 }
 
+static TITLE_ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// The arguments the title's `main` gets (those after `--`). Set once, before
+/// the title starts; later calls are ignored.
+pub fn set_title_args(args: Vec<String>) {
+    let _ = TITLE_ARGS.set(args);
+}
+
+pub fn title_args() -> &'static [String] {
+    TITLE_ARGS.get().map_or(&[], Vec::as_slice)
+}
+
 /// Maps a title DLL the title loads itself (`LoadLibrary`) and returns its
 /// base; `Ok(None)` if `file` is not one of the title's DLLs.
 pub type TitleDllLoader = Box<dyn Fn(&str) -> Result<Option<usize>, String> + Send + Sync>;
@@ -95,7 +107,6 @@ impl Title {
                 .find(|(p, _)| p == path)
                 .map(|(_, text)| text.as_str())
         };
-        // GDK manifests commonly write the id as `0x639AA8DD`.
         let id = get("Game/TitleId").and_then(|v| {
             let v = v
                 .strip_prefix("0x")
@@ -120,10 +131,34 @@ impl Title {
     }
 }
 
-/// Each element of an XML text as its path from the root (`Game/TitleId`)
-/// and its trimmed text up to the first child, the predefined entities
-/// decoded (a self-closing element has an empty body); comments, CDATA
-/// sections, declarations and attributes are skipped.
+/// The trimmed text of one element: comments inside it are skipped, not
+/// treated as the end of its value. A manifest generator can write
+/// `<TitleId><!-- generated -->639AA8DD</TitleId>`, which must still give
+/// the title's id rather than an empty field.
+fn field_text(rest: &str) -> String {
+    let mut out = String::new();
+    let mut rest = rest;
+    loop {
+        let Some(open) = rest.find('<') else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..open]);
+        if rest[open..].starts_with("<!--") {
+            let Some(end) = rest[open..].find("-->") else {
+                break;
+            };
+            rest = &rest[open + end + 3..];
+        } else {
+            // A child element, a closing tag or anything else ends the text.
+            break;
+        }
+    }
+    out.trim().to_owned()
+}
+
+/// Each element's path, with its trimmed text and predefined entities
+/// decoded. Self-closing elements have no text.
 fn elements(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut path: Vec<&str> = Vec::new();
@@ -157,9 +192,9 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .unwrap_or("");
         path.push(name);
         let body = if closed {
-            ""
+            String::new()
         } else {
-            rest[..rest.find('<').unwrap_or(rest.len())].trim()
+            field_text(rest)
         };
         let body = [
             ("&lt;", "<"),
@@ -169,7 +204,7 @@ fn elements(text: &str) -> Vec<(String, String)> {
             ("&amp;", "&"),
         ]
         .iter()
-        .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
+        .fold(body, |b, (entity, c)| b.replace(entity, c));
         out.push((path.join("/"), body));
         if closed {
             path.pop();
@@ -195,15 +230,6 @@ fn tag_end(text: &str) -> Option<usize> {
 
 static TITLE: Mutex<Option<Title>> = Mutex::new(None);
 
-/// Serialises tests that read or change the process title (`set_title` /
-/// `title` / package id). Hold this for the whole title-dependent sequence;
-/// `set_title` itself does not take it (the mutex is not reentrant).
-#[cfg(test)]
-pub fn title_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 pub fn set_title(title: Title) {
     *TITLE.lock().unwrap_or_else(|e| e.into_inner()) = Some(title);
 }
@@ -228,12 +254,22 @@ pub fn use_console_timers() {
     use windows_sys::Win32::Media::timeBeginPeriod;
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
-        ProcessPowerThrottling, SetProcessInformation,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetProcessInformation,
+    };
+    // Also: the system does not run this process at reduced speed (its
+    // "efficiency mode": lower clock, the slow cores of a hybrid processor)
+    // when its window is not the one in front, as while its owner works in
+    // another window or streams. The console has eight cores alike and no
+    // such mode. `VICTORY_EFFICIENCY_MODE=1` leaves the system its choice.
+    let execution = if std::env::var_os("VICTORY_EFFICIENCY_MODE").is_some_and(|v| v == "1") {
+        0
+    } else {
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED
     };
     let keep = PROCESS_POWER_THROTTLING_STATE {
         Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION | execution,
         StateMask: 0,
     };
     // SAFETY: plain process settings; `keep` outlives the call.
@@ -246,6 +282,30 @@ pub fn use_console_timers() {
         );
         timeBeginPeriod(1);
     }
+    ahead_of_other_programs();
+}
+
+/// The title's streaming thread runs below normal priority (on the console
+/// nobody else wants its core) and does all of the title's loading: a
+/// program that keeps the processors busy at normal priority (a build, a
+/// virus scan) starved it, loading took 40 to 60 s instead of 28 to 33, and
+/// the opening ran without the models that were to be there (runs cpu-1,
+/// play-1125-0203). The process runs above normal, as long as it runs.
+/// `VICTORY_PROCESS_PRIORITY=normal`: as it was started.
+#[cfg(windows)]
+fn ahead_of_other_programs() {
+    use windows_sys::Win32::System::Threading::{
+        ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass,
+    };
+    if std::env::var_os("VICTORY_PROCESS_PRIORITY").is_some_and(|v| v == "normal" || v == "0") {
+        return;
+    }
+    // SAFETY: a plain process setting.
+    let set = unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) } != 0;
+    tracing::info!(
+        set,
+        "the process runs above normal priority (VICTORY_PROCESS_PRIORITY=normal: not)"
+    );
 }
 
 #[cfg(test)]
@@ -298,7 +358,6 @@ mod tests {
     #[test]
     fn storage_quota_saturates_when_megabytes_exceed_u64_bytes() {
         let max_mb = u64::MAX / (1024 * 1024);
-
         let at_limit = format!(
             "<Game><PersistentLocalStorage><SizeMB>{max_mb}</SizeMB></PersistentLocalStorage></Game>"
         );
@@ -306,11 +365,23 @@ mod tests {
             Title::from_manifest(&at_limit).storage_bytes,
             max_mb * 1024 * 1024
         );
-
         let above_limit = format!(
             "<Game><PersistentLocalStorage><SizeMB>{}</SizeMB></PersistentLocalStorage></Game>",
             max_mb + 1
         );
         assert_eq!(Title::from_manifest(&above_limit).storage_bytes, u64::MAX);
+    }
+
+    #[test]
+    fn inline_comments_do_not_truncate_a_field() {
+        let text = "<Game>\
+            <TitleId><!-- generated -->639AA8DD</TitleId>\
+            <StoreId>9&amp;<!-- keep -->C</StoreId>\
+            <PersistentLocalStorage><SizeMB><!-- n -->1024</SizeMB></PersistentLocalStorage>\
+            </Game>";
+        let t = Title::from_manifest(text);
+        assert_eq!(t.id, 0x639A_A8DD);
+        assert_eq!(t.store_id, "9&C");
+        assert_eq!(t.storage_bytes, 1024 << 20);
     }
 }

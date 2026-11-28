@@ -80,6 +80,11 @@ our override where one exists.
 (`victory-hle::modules::xgameruntime` lists the areas); online areas answer
 as an offline console. Game saves are files under the configured data directory
 (`[paths].data_dir` in `victory.toml`, or `VICTORY_DATA_DIR`).
+`XGameSave` retains Royale's data layout and on-disk format, keyed by title,
+user and service configuration. There is no new migration for existing
+Royale saves. An update commits by renaming a complete container generation.
+An unreadable newest manifest is an error; the provider does not overwrite
+it or remove earlier committed generations.
 
 Title storage is a drive on the console, and titles build paths on that.
 `victory-hle::modules::files` binds every path-taking title import

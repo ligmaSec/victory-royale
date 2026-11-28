@@ -21,14 +21,16 @@
 //!    point on a thread with the stack size the image asks for; from then
 //!    on, pass every thread start and end on to the attached images.
 
+#[cfg(any(windows, test))]
+mod console_insn_decode;
 #[cfg(windows)]
 mod crash;
-#[cfg(windows)]
-mod hooks;
 pub mod prepare;
 // Only the Windows loader publishes images; the tests run everywhere.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod publish;
+#[cfg(windows)]
+mod render_profile;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
@@ -45,7 +47,8 @@ mod windows;
 pub use crash::save_on_crash;
 #[cfg(windows)]
 pub use crash::{
-    locate, log_crash, log_crashes_to, note_title_output, report_crashes, report_unhandled,
+    ConsoleWriteScope, locate, log_crash, log_crashes_to, note_title_output, report_crashes,
+    report_crashes_with_console_writes, report_unhandled,
 };
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};

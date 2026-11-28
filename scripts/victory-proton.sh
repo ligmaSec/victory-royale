@@ -5,19 +5,42 @@ set -euo pipefail
 usage() {
     cat <<'HELP'
 Usage: victory-proton.sh --build | --test
-       victory-proton.sh [--run | --report] [--runtime proton|pinned | --vkd3d-dir DIR] TITLE.exe [options]
+       victory-proton.sh [--run | --report] [--profile tuned-4k]
+                         [--runtime proton|pinned | --vkd3d-dir DIR] TITLE.exe [options]
 
   --test           Run the offline launcher checks (no game, build, or GPU needed).
   --build          Build the Windows release from a source checkout with LLVM-MinGW.
   --run            Execute the title.
   --report         Execute once and save the launcher and Proton logs in one archive.
+  --profile tuned-4k  Opt into the experimental native 4K Series X renderer preset.
   --runtime pinned Use the pinned vkd3d-proton build (default for --run and --report).
   --runtime proton Use the vkd3d-proton libraries supplied by Proton.
   --vkd3d-dir DIR  Use the x64 d3d12.dll and d3d12core.dll from DIR for this run.
 
 With no mode, the launcher forwards the title and options to victory run.
 Use TITLE.exe alone to check imports, or TITLE.exe --execute to launch.
+Play automatically sets up pinned GE-Proton with Royale's indexed wineserver.
+Set PROTONPATH only to use a custom indexed Proton build.
+Set VICTORY_ALLOW_STOCK_WINESERVER=1 only for stock diagnostics.
 HELP
+}
+
+apply_tuned_4k() {
+    # These are renderer defaults for the preset, not overrides of caller settings.
+    local setting name
+    for setting in \
+        VICTORY_OUTPUT=3840x2160 VICTORY_RENDER_SCALE=1.0 VICTORY_FRAME_INTERVAL_MS=16.667 \
+        VICTORY_CARD_WINDOWS_MB=4096 VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_CARD_AWAKE=1 \
+        VICTORY_THIN=1 VICTORY_JOIN_PARTS=0 VICTORY_JOIN_COPIES=1 VICTORY_PORT_JOURNAL=1 \
+        VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_READBACK_POOL=1 VICTORY_READBACK_POOL_MB=32 \
+        VICTORY_CARD_REHASH_RUNS=1 VICTORY_CARD_STEPS=2 VICTORY_CARD_STEP_GATHER=1 \
+        VICTORY_MAP_THREADS=1 VICTORY_LEVELS_ON_DEMAND=1 VICTORY_TEXTURE_NO_WAIT=1 \
+        VICTORY_UPLOAD_AHEAD=1 VICTORY_SHOW_AFTER=1 \
+        VICTORY_INDIRECT_WINDOW=1 VICTORY_INDIRECT_WIDE=1 VICTORY_INDIRECT_BATCH=2 \
+        VICTORY_PIPELINE_WAIT_MS=0 VICTORY_HAIR=1 VICTORY_AMBIENT=constant:0.35; do
+        name=${setting%%=*}
+        if [[ ! -v $name ]]; then export "$name=${setting#*=}"; fi
+    done
 }
 
 pinned_asset=vkd3d-proton-ec20719-x64.tar.gz
@@ -47,6 +70,9 @@ stage_pinned_runtime() {
 }
 
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck source=scripts/proton-runner.sh
+source "$script_dir/proton-runner.sh"
+
 if [[ ${1:-} == --test ]]; then
     if (( $# != 1 )); then usage >&2; exit 2; fi
     suite="$script_dir/tests/proton-launcher.sh"
@@ -73,6 +99,7 @@ if [[ ${1:-} == --build ]]; then
 fi
 
 mode=
+profile=
 runtime=
 vkd3d_dir=
 while (( $# )); do
@@ -82,6 +109,14 @@ while (( $# )); do
             if [[ -n $mode ]]; then usage >&2; exit 2; fi
             mode=$1
             shift
+            ;;
+        --profile)
+            if [[ -n $profile || ${2:-} != tuned-4k ]]; then
+                echo 'Choose --profile tuned-4k once, or omit --profile for standard settings.' >&2
+                exit 2
+            fi
+            profile=$2
+            shift 2
             ;;
         --runtime|--vkd3d-dir)
             if [[ -n $runtime || -z ${2:-} ]]; then usage >&2; exit 2; fi
@@ -132,24 +167,56 @@ fi
 binary=$(realpath -- "$binary")
 title=$(realpath -- "$1")
 shift
+execute_title=0
+for arg in "$@"; do
+    [[ $arg != -- ]] || break
+    if [[ $arg == --execute ]]; then execute_title=1; break; fi
+done
 if [[ -n $mode ]]; then
     runtime=${runtime:-pinned}
-    # Accept an existing --execute, including invocations migrated from the old syntax.
-    execute=(--execute)
-    for arg in "$@"; do
-        [[ $arg != -- ]] || break
-        if [[ $arg == --execute ]]; then execute=(); break; fi
-    done
-    set -- "${execute[@]}" "$@"
+    if (( ! execute_title )); then set -- --execute "$@"; fi
+    execute_title=1
+fi
+if [[ -n $profile ]]; then
+    if (( ! execute_title )); then
+        echo 'Use --profile with --run, --report, or TITLE.exe --execute.' >&2
+        exit 2
+    fi
+    apply_tuned_4k
+fi
+
+data_home=${XDG_DATA_HOME:-$HOME/.local/share}
+cache_home=${XDG_CACHE_HOME:-$HOME/.cache}
+[[ $data_home == /* ]] || data_home=$HOME/.local/share
+[[ $cache_home == /* ]] || cache_home=$HOME/.cache
+patched_server=
+if (( execute_title )); then
+    if [[ -z ${PROTONPATH:-} && ${VICTORY_ALLOW_STOCK_WINESERVER:-0} != 1 ]]; then
+        PROTONPATH=$(proton_managed_path "$cache_home/victory/proton" "$script_dir")
+        export PROTONPATH
+    fi
+    # Inspect the selected server itself, not the Proton version label. The
+    # fallback diagnostic survives stripping, including in backported builds.
+    proton=${PROTONPATH:-}
+    if [[ -n $proton ]] && proton=$(realpath -e -- "$proton" 2>/dev/null) &&
+        [[ -f $proton/proton && -x $proton/proton ]] &&
+        proton_has_view_index "$proton/files/bin/wineserver"; then
+        export PROTONPATH=$proton
+        unset WINESERVER
+        patched_server=$proton/files/bin/wineserver
+        echo 'Using Proton with the indexed wineserver.' >&2
+    elif [[ ${VICTORY_ALLOW_STOCK_WINESERVER:-0} == 1 ]]; then
+        echo 'Warning: the indexed wineserver was not verified; stock diagnostics only.' >&2
+    else
+        echo 'The requested PROTONPATH does not have the indexed wineserver.' >&2
+        echo 'Unset PROTONPATH to install the managed runner, or set VICTORY_ALLOW_STOCK_WINESERVER=1 for diagnostics.' >&2
+        exit 1
+    fi
 fi
 
 # Hand Proton Windows paths on its standard Z: drive. A Windows executable
 # path also lets UMU-Proton attach this CLI to the calling terminal.
 export GAMEID=${GAMEID:-umu-victory}
-data_home=${XDG_DATA_HOME:-$HOME/.local/share}
-cache_home=${XDG_CACHE_HOME:-$HOME/.cache}
-[[ $data_home == /* ]] || data_home=$HOME/.local/share
-[[ $cache_home == /* ]] || cache_home=$HOME/.cache
 export WINEPREFIX=${WINEPREFIX:-$data_home/victory/proton}
 # Both translation layers otherwise write derived data to the working directory.
 export VKD3D_SHADER_CACHE_PATH=${VKD3D_SHADER_CACHE_PATH:-$cache_home/victory/vkd3d}
@@ -282,7 +349,14 @@ export WINEDEBUG=${WINEDEBUG:--all,+timestamp,+pid,+tid,+seh}
     cd -- "${binary%/*}"
     sha256sum -- "${binary##*/}"
     printf 'runtime=%s\n' "${runtime:-proton}"
+    if [[ -n $profile ]]; then printf 'renderer_profile=%s\n' "$profile"; fi
     if [[ $runtime == pinned ]]; then printf 'runtime_asset=%s\n' "$pinned_asset"; fi
+    if [[ -n $patched_server ]]; then
+        server_digest=$(sha256sum < "$patched_server")
+        printf 'wineserver_sha256=%s\n' "${server_digest%% *}"
+    else
+        printf 'wineserver=unverified\n'
+    fi
     if [[ -f REVISION ]]; then
         printf 'package_revision=%s\n' "$(<REVISION)"
     elif [[ -d $script_dir/../.git || -f $script_dir/../.git ]]; then

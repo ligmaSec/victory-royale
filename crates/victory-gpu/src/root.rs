@@ -215,7 +215,7 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::object::{E_NOINTERFACE, E_POINTER, S_FALSE, S_OK, slot};

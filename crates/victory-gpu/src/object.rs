@@ -14,7 +14,6 @@ pub(crate) const E_NOTIMPL: HRESULT = 0x8000_4001_u32 as i32;
 pub(crate) const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
 pub(crate) const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 pub(crate) const E_INVALIDARG: HRESULT = 0x8007_0057_u32 as i32;
-pub(crate) const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 pub(crate) const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 /// What D3D and DXGI return for a missing item (adapter, output, private
 /// data).
@@ -62,54 +61,6 @@ impl Object {
 
 pub(crate) type This = *const Object;
 
-/// A reference to one of our objects held by work that runs later (on a
-/// queue held back by a wait), given back on drop.
-pub(crate) struct Held(This);
-
-// SAFETY: our objects are made for use from many threads (counts atomic,
-// state locked).
-unsafe impl Send for Held {}
-
-impl Held {
-    pub(crate) fn new(this: This) -> Held {
-        add_ref(this);
-        Held(this)
-    }
-
-    /// Retains `this` only if its reference count is still non-zero; returns
-    /// `None` if another thread has already started dropping the object.
-    ///
-    /// # Safety
-    /// The caller must guarantee that `this`'s allocation cannot be freed while
-    /// this call runs (for example, by holding a lock that `Drop` must acquire
-    /// before deallocating `this`).
-    pub(crate) unsafe fn try_new(this: This) -> Option<Held> {
-        if this.is_null() {
-            return None;
-        }
-        // SAFETY: caller guarantees `this` is still allocated while this runs.
-        let refs = &unsafe { &*this }.refs;
-        refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            (n > 0).then_some(n + 1)
-        })
-        .ok()?;
-        Some(Held(this))
-    }
-
-    pub(crate) fn get(&self) -> This {
-        self.0
-    }
-}
-
-impl Drop for Held {
-    fn drop(&mut self) {
-        // SAFETY: one of our objects; slot 2 of its table is `Release`.
-        let release: extern "system" fn(This) -> u32 =
-            unsafe { std::mem::transmute(*(*self.0).functions.add(2)) };
-        release(self.0);
-    }
-}
-
 #[repr(transparent)]
 pub(crate) struct Table<const N: usize>(pub [*const (); N]);
 // SAFETY: function addresses only.
@@ -118,6 +69,16 @@ unsafe impl<const N: usize> Sync for Table<N> {}
 pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Increments the reference count only if the object still has live references.
+pub(crate) fn add_ref_alive(this: This) -> bool {
+    // SAFETY: `this` is one of our objects, not freed yet.
+    let refs = &unsafe { &*this }.refs;
+    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        (n > 0).then(|| n + 1)
+    })
+    .is_ok()
 }
 
 pub(crate) extern "system" fn release(this: This) -> u32 {

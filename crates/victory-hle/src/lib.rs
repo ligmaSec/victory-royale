@@ -11,11 +11,14 @@
 //! Resolution order for every import: an implementation in [`modules`],
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
 
-// Off Windows only the portable parts are built (for their tests); the
-// helpers that only Windows modules call go unused.
+// On other hosts the portable tests do not call the Windows import helpers.
 #![cfg_attr(not(windows), allow(dead_code, unused_variables, unused_mut))]
 
 mod host;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use victory_gpu::frame_phase;
+pub use victory_gpu::frames_begun;
+
 pub mod modules;
 mod registry;
 pub mod runtime;
@@ -24,6 +27,15 @@ pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
 pub use victory_gpu::console;
 
+#[cfg(windows)]
+pub use victory_gpu::set_frame_interval_override;
+
+/// Runs an emulated console write with GPU-tracked pages open until it finishes.
+#[cfg(windows)]
+pub fn with_console_write(at: usize, len: usize, write: &mut dyn FnMut()) {
+    let _guard = victory_gpu::kernel_writing(at, len);
+    write();
+}
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;
 
@@ -123,5 +135,31 @@ mod tests {
             ),
             Some(Provenance::Hle)
         );
+    }
+
+    // #510: the RPC runtime's GUID calls are ours, so the DLL itself stays
+    // outside the host policy (its own `ws2_32` imports would be a network
+    // path `modules::net` never sees).
+    #[test]
+    fn the_rpc_runtime_is_implemented_here() {
+        let r = HleResolver::new(HostPolicy::none());
+        for call in [
+            "UuidCreate",
+            "UuidCreateSequential",
+            "UuidFromStringA",
+            "UuidFromStringW",
+            "UuidToStringA",
+            "UuidToStringW",
+            "RpcStringFreeA",
+            "RpcStringFreeW",
+        ] {
+            assert_eq!(
+                r.classify("rpcrt4.dll", &name(call)),
+                Some(Provenance::Hle),
+                "{call}"
+            );
+        }
+        // A call we do not implement is not passed to the host either.
+        assert_eq!(r.classify("rpcrt4.dll", &name("RpcServerRegisterIf")), None);
     }
 }

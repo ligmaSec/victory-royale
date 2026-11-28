@@ -7,9 +7,10 @@ You can help without writing a patch. Browse [PRs looking for testers](https://g
 show whether a failure follows a particular build, GPU driver, or setting.
 
 - **Testing a pull request?** Use the [interactive hardware test](docs/testing.md#run-a-hardware-test) on Windows or Linux/Proton. Supply your own standard `7952987A` save, pick the PR and follow its scenario once per build. Choose **Describe what you saw** to record observations for main and candidate. Paste a screenshot for either build there. The public comment includes reviewed notes and timings. Screenshots travel in the encrypted ZIP if you choose private delivery. Logs may contain usernames, local paths, or other sensitive information. Use the results screen to preview the summary, redact text or exclude files before sharing. The runner previews a summary you can post to the PR and can send detailed diagnostics encrypted to the verified requester named on screen using GitHub CLI authenticated with gist access. Keep the raw logs local.
-- **Reporting a single Linux run?** Install UMU (`umu-run`) and extract a tested
-  [Proton build](docs/testing.md#ci-and-build-downloads). From its `victory`
-  directory, run `./victory-proton.sh --report "/path/to/title.exe"`.
+- **Reporting a single Linux run?** Install UMU (`umu-run`) and extract a
+  tested [Proton package](docs/testing.md#ci-and-build-downloads). From its
+  `victory` directory, run `./victory-proton.sh --report "/path/to/title.exe"`.
+  It sets up the matching indexed runner on first use.
   If you built from a checkout, use the same arguments with
   `./scripts/victory-proton.sh`.
 - **Reporting a single Windows run?** Follow the [Windows build and launch instructions](README.md#getting-started).

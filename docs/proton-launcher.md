@@ -31,10 +31,39 @@ An existing x64 MSVC build also works with the launcher. With `cargo-xwin`,
 LLVM, and the MSVC Rust target installed, build one using
 `cargo xwin build --locked --release -p victory --target x86_64-pc-windows-msvc`.
 
+## Package the Linux distribution
+
+From the checkout in Bash, install the cross-build tools and Linux DXC above
+and the [server build prerequisites](#patched-wineserver) below. The packager
+requires Python 3, the full Git revision, and a new output directory outside
+the checkout. It checks that the executable embeds the production GPU helpers
+and ships the indexed wineserver with its complete prepared Wine source.
+The distribution does not bundle GE-Proton itself.
+
+```sh
+(
+    set -e
+    revision=$(git rev-parse HEAD)
+    work=$(mktemp -d)
+    export CARGO_TARGET_DIR="$work/target"
+    VICTORY_BUILD_COMMIT="$revision" ./scripts/victory-proton.sh --build
+    bash scripts/build-proton-wineserver.sh --with-source "$work/server" "$work/downloads"
+    bash scripts/package-proton.sh "$CARGO_TARGET_DIR/x86_64-pc-windows-gnullvm/release" \
+        "$revision" "$work/distribution" "$work/server"
+    mkdir "$work/unpacked"
+    cd "$work/distribution"
+    sha256sum --check --strict SHA256SUMS
+    tar -xf victory-proton-x86_64.tar.gz -C "$work/unpacked"
+    test "$(cat "$work/unpacked/victory/REVISION")" = "$revision"
+    printf 'Distribution and extracted files: %s\n' "$work"
+)
+```
+
 ## Launch
 
-Install UMU so that `umu-run` is on `PATH`. Keep your game files outside
-the checkout. Pass the Linux path to the title executable to the launcher.
+Install UMU so that `umu-run` is on `PATH`. Keep your game files outside the
+checkout and pass the Linux path to the title executable. Leave `PROTONPATH`
+unset for [automatic Proton setup](#patched-wineserver).
 [UMU installation](https://github.com/Open-Wine-Components/umu-launcher#installation)
 
 ```sh
@@ -56,15 +85,17 @@ specific build, set `VICTORY_EXE` to its Linux path. By default the launcher
 looks beside itself for `victory.exe`, then under `${CARGO_TARGET_DIR:-target}`
 for the gnullvm and MSVC release builds, in that order.
 
-On first use, UMU may need to download its runtime and a Proton build. The default
+On first use, UMU may need to download its Steam Linux Runtime. The default
 prefix is `${XDG_DATA_HOME:-$HOME/.local/share}/victory/proton`, and the
-default `GAMEID` is `umu-victory`. Set `WINEPREFIX`, `GAMEID` or `PROTONPATH`
-to override them. Use Windows paths in `victory.toml`.
+default `GAMEID` is `umu-victory`. Set `WINEPREFIX` or `GAMEID` to override
+them. Use Windows paths in `victory.toml`.
 
-The launcher searches `$XDG_DATA_HOME/Steam`, `$HOME/.steam/steam` and
+For import checks and explicit stock diagnostics, if `PROTONPATH` is unset
+the launcher searches `$XDG_DATA_HOME/Steam`, `$HOME/.steam/steam` and
 `$HOME/.local/share/Steam` for Proton Experimental. It uses the first install
 with an executable `steamapps/common/Proton - Experimental/proton`. An explicit
-`PROTONPATH` takes precedence. For an explicit path, the launcher recognizes
+`PROTONPATH` takes precedence. With no Experimental install, UMU selects the
+diagnostic runner. For an explicit path, the launcher recognizes
 Experimental when its `version` file contains `experimental-` and the path
 uses a `steamapps/common` layout. It gives UMU Unix paths and sets `STEAM_COMPAT_LIBRARY_PATHS` to the
 Steam library. Each VIctory package directory gets its own install symlink under
@@ -85,6 +116,129 @@ override these defaults. `VKD3D_SHADER_CACHE_PATH=0` disables the VKD3D cache
 without creating a directory. Empty or relative XDG base directories fall back
 to the standard directories under `$HOME`.
 
+## Tuned 4K profile
+
+```sh
+./victory-proton.sh --run --profile tuned-4k "/path/to/title.exe"
+```
+
+Use `./scripts/victory-proton.sh` from a source checkout. The preset is
+opt-in for Series X on the reference RTX 5090, GE-Proton11-14 and pinned
+vkd3d-proton. It requests native 3840×2160, 16.667 ms frame pacing, and a
+4 GiB GPU window-copy budget. It also enables deferred submissions and
+copies, batched indirect work, and texture upload ahead. It uses a zero
+pipeline wait budget: cold runs can drop draws while pipelines compile.
+Individual `VICTORY_*` environment settings take precedence.
+
+This ships the renderer flags, not the private shader-role map used by the
+comparison. With the map, package `09323541fcc7` measured 19.04 FPS and 60 ms
+p95 over a short native-4K walk; glass and shadows were still wrong. Removing
+only the map disabled the ambient-light workaround and brought back dark
+silhouettes and blown highlights during camera movement. The preset alone is
+not a lighting fix or a game performance guarantee. Normal `--run` is unchanged.
+
+## Patched wineserver
+
+The first normal play (`--run`, `--report` or `TITLE.exe --execute`) downloads
+and checksums the official x86-64 **GE-Proton11-14** archive (about 571 MB).
+Royale installs it with the matching indexed `wineserver` under
+`${XDG_CACHE_HOME:-$HOME/.cache}/victory/proton/`. Subsequent launches reuse
+that private runner. The launcher does not patch a Steam install, change
+system Wine, or alter the save layout. UMU also downloads Steam Linux Runtime
+on first use if needed.
+
+The Linux package ships a prebuilt server: **players do not need a compiler
+or have to apply a patch**. When running from a source checkout, the first
+play builds just the matching server in the cache. Install a native C/C++
+toolchain with static libc, `make`, Autoconf, Flex, Bison, Perl, Python 3,
+`pkg-config`, and GNU Patch/binutils before running from source
+(Arch: `base-devel` and `python`; Debian/Ubuntu: `build-essential autoconf
+flex bison perl python3 pkg-config patch binutils`). No full Proton build is
+needed. See the [runner benchmarks](#wine-and-proton-performance) for what the
+index improves and what still needs measuring.
+
+### Custom Proton builds
+
+Set `PROTONPATH` only to use a custom indexed Proton runner. The included
+`wineserver-view-tree.patch` can be built against that release's **exact
+prepared Wine source**; build only `server/wineserver` and install it as
+`files/bin/wineserver` in a private copy of that same Proton release. The
+client and server protocols must match. The source patch may need rebasing.
+Do not apply it twice: upstream [Wine 11.23](https://github.com/wine-mirror/wine/commit/3217449b1f719c8f7a73a6de768df536495ddcbf)
+already has a separate mapped-view index. That does not imply that an older
+Proton release includes it.
+
+The launcher checks `PROTONPATH/files/bin/wineserver` for the patch's
+duplicate-view diagnostic. This identifies the build, not the protocol or
+the process already serving a prefix. Stop prior sessions for the prefix
+before switching runners: Wine can attach to an existing server. Use a
+separate `WINEPREFIX` for stock comparisons, and rebuild the patched server
+whenever you change the Proton version.
+
+Import checks do not require the patch. For a stock playback diagnostic, set
+`VICTORY_ALLOW_STOCK_WINESERVER=1` and select a stock `PROTONPATH` (or leave it
+unset for the diagnostic auto-selection). There is no automatic fallback
+from a normal play launch to stock.
+
+## Wine and Proton performance
+
+These are short, controlled walks on one RTX 5090 at native 3840×2160,
+Series X, with the tuned renderer profile and pinned `ec20719` graphics DLLs.
+The Windows package was `REVISION` `77c9125f92f621a97aa87f5c5e4360e47b244e4e`.
+Loading frames are excluded. Neither the tuned profile nor its local
+shader-role map is a package default.
+
+### Direct Wine, matched Royale build
+
+The executable, DLLs, starting scene, renderer options, and cache seed were
+held fixed. Both runs used a direct loader/server pair, not UMU.
+
+| Wine runner | Walk FPS | p95 frame time | Worst frame |
+| --- | ---: | ---: | ---: |
+| Wine 11.22 with indexed views | 21.24 | 60 ms | 80 ms |
+| GE-Proton11-14 Wine pair | 11.21 | 220 ms | 430 ms |
+
+The GE run had higher median worker times for write-watch/guard queries
+(52.05 vs 4.7 ms/frame) and remap waits (16.65 vs 0.2 ms/frame). These worker
+totals are not additive elapsed times. [Comparison details in #92](https://github.com/ligmaSec/victory-royale/issues/92#issuecomment-7239498585).
+The whole Wine build changed, so this does not isolate the server patch.
+
+### Packaged launcher through UMU
+
+A separate run matrix used the same package, tuned 4K profile, starting scene,
+cache seed, and graphics DLLs through UMU and Steam Linux Runtime 4. Each
+runner used its release server, without a view-tree replacement. Successful
+walks were roughly eight seconds.
+
+| Proton runner | Walk FPS | p95 frame time | Worst frame | Result |
+| --- | ---: | ---: | ---: | --- |
+| GE-Proton11-14 | 10.71 | 250 ms | 280 ms | World and movement verified |
+| Proton-CachyOS `cachyos-11.0-20261015-slr` | 11.40 | 200 ms | 300 ms | World and movement verified |
+| Proton-Wineland `wineland-11.0-20261127` | 10.82 | 230 ms | 330 ms | World and movement verified |
+| UMU-Proton 11.0-2e | — | — | — | Reached the Player prompt; load failed before control |
+
+UMU-Proton's single load failure was not diagnosed. These runs do not establish
+save compatibility, sustained play, or 30 FPS. Track the performance gap in
+[#92](https://github.com/ligmaSec/victory-royale/issues/92) and other Proton
+builds in [#99](https://github.com/ligmaSec/victory-royale/issues/99) and
+[#100](https://github.com/ligmaSec/victory-royale/issues/100).
+
+### Patch evidence and startup failures
+
+- The [7900 XT fork's server-only GE-Proton11-14 comparison](https://github.com/kroeeee-eeee/VIctory-Linux-Proton-Wine-7900XT-XTX/tree/a14cfcbfce092444488112262fb222c16fe87ea9/linux/wineserver)
+  reported about **8.3 → 17.7 FPS**. The [NVIDIA fork v0.1.2](https://github.com/dfmbrollins/victory-linux-nvidia/blob/v0.1.2/README.md#where-it-stands)
+  reported **about 24 FPS at 1080p** on an RTX 5070 with patched Wine-staging
+  11.22; that was not a server-only A/B. These are other forks' results, not
+  Royale's.
+- An upgrade to Wine 11.23 broke pairing with the server built for 11.22.
+  A client/server protocol mismatch fails before the title runs; changing
+  vkd3d-proton DLLs will not fix it. Use a matched client and server in a
+  private runner rather than downgrading system Wine.
+- A server-only comparison of package `09323541fcc7` had no matched gameplay
+  result: the stock-server control stopped at “Couldn't Load” before movement.
+  The shipped indexed server passed a fresh-prefix smoke; other Proton
+  releases may need a rebase and their own game-free launch check.
+
 ## Capture a workstation run
 
 For a requested PR comparison, follow the [interactive hardware test](testing.md#run-a-hardware-test). It runs both builds and bundles their logs. To capture a single launch, use the command below.
@@ -96,6 +250,8 @@ For a requested PR comparison, follow the [interactive hardware test](testing.md
 The launcher records UMU output, enables Proton exception logging and Victory
 pipeline tracing, and writes the launcher exit status and executable SHA-256.
 The package revision or launcher checkout revision is included when available.
+`build.txt` also records the selected renderer preset, if any, and the patched
+server's SHA-256 (or marks the server unverified for a stock diagnostic).
 Each invocation prints its own archive path under
 `${XDG_DATA_HOME:-$HOME/.local/share}/victory/reports`. A failed launch also
 produces an archive once UMU has started. Logs can include personal paths and
@@ -134,15 +290,17 @@ can still use the same shaders. Unset the variable to restore the passes.
 
 ## Testing without game files
 
-`./scripts/victory-proton.sh --test` (or `./victory-proton.sh --test` in the package) checks argument quoting, cache paths, XDG
-fallbacks and exit status with a fake UMU. It requires neither Wine nor a GPU,
-and runs in Linux CI.
+`./scripts/victory-proton.sh --test` (or `./victory-proton.sh --test` in the
+package) tests argument quoting, path handling, rejected runner downloads,
+offline reuse and exit status with fake UMU. It needs no Wine or GPU.
 
 `./tests/proton-smoke.sh` compiles its synthetic title with the LLVM-MinGW
 toolchain and gnullvm Rust target above, even when `VICTORY_EXE` points to
-an MSVC build. The test checks the launcher's exit status, the reported Proton version, and the
-return value from the title. It uses a separate `victory/proton-smoke` prefix under
-the XDG data directory. Set `VICTORY_SMOKE_PREFIX` to choose another test prefix.
+an MSVC build. Leave `PROTONPATH` unset to exercise the managed runner, or opt
+into a custom runner as above. The test checks the launcher's exit status,
+the reported Proton version and the title's return value. It uses a separate
+`victory/proton-smoke` prefix under the XDG data directory. Set
+`VICTORY_SMOKE_PREFIX` to choose another test prefix.
 
 To reproduce the loader integration tests after the smoke test, build the
 DLL fixture on Linux and set `VICTORY_HLE_PROBE` to the Windows path of the

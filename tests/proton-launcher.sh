@@ -3,6 +3,7 @@
 set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 launcher=$(realpath -- "${1:-$root/scripts/victory-proton.sh}")
+runner_helper="${launcher%/*}/proton-runner.sh"
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 mkdir -p "$work/bin" "$work/build with spaces" "$work/game with spaces"
@@ -12,11 +13,19 @@ cat > "$work/bin/umu-run" <<'EOF'
 set -euo pipefail
 printf '%s\n' "$@" > "$LAUNCH_RECORD"
 printf '%s\n' "$WINEPREFIX" "$VKD3D_SHADER_CACHE_PATH" "$DXVK_STATE_CACHE_PATH" > "$ENV_RECORD"
+if [[ -n ${PROFILE_RECORD:-} ]]; then
+    printf '%s\n' "${VICTORY_OUTPUT-unset}" "${VICTORY_RENDER_SCALE-unset}" \
+        "${VICTORY_CARD_WINDOWS_MB-unset}" "${VICTORY_RELAY-unset}" "${VICTORY_AMBIENT-unset}" \
+        "${VICTORY_SHADER_ROLES-unset}" "${VICTORY_PRESENT_LOG-unset}" > "$PROFILE_RECORD"
+fi
 if [[ -n ${STEAM_RECORD:-} ]]; then
     printf '%s\n' "${STEAM_COMPAT_INSTALL_PATH:-}" "${STEAM_COMPAT_LIBRARY_PATHS:-}" > "$STEAM_RECORD"
 fi
 if [[ -n ${PROTON_RECORD:-} ]]; then
     printf '%s\n' "${PROTONPATH:-}" > "$PROTON_RECORD"
+fi
+if [[ ${EXPECT_MATCHED_SERVER:-} == 1 ]]; then
+    test -z "${WINESERVER+x}"
 fi
 # Hold the first UMU invocation open while the other package launches.
 if [[ -n ${SECOND_BUILD:-} ]]; then
@@ -64,8 +73,48 @@ export XDG_DATA_HOME="$work/data" XDG_CACHE_HOME="$work/cache"
 export VICTORY_EXE="$work/build with spaces/victory.exe"
 export LAUNCH_RECORD="$work/args" ENV_RECORD="$work/env"
 unset WINEPREFIX VKD3D_SHADER_CACHE_PATH DXVK_STATE_CACHE_PATH PROTON_LOG EXPECTED_RUNTIME
+unset PROTONPATH WINESERVER VICTORY_ALLOW_STOCK_WINESERVER
+unset VICTORY_OUTPUT VICTORY_RENDER_SCALE VICTORY_CARD_WINDOWS_MB VICTORY_RELAY
+unset VICTORY_AMBIENT VICTORY_SHADER_ROLES VICTORY_PRESENT_LOG PROFILE_RECORD
 
-bash "$launcher" "$work/game with spaces/title.exe" --execute --console series-s -- "argument with spaces"
+# Reject an explicitly selected stock Proton before execution or runtime staging.
+patched="$work/patched proton"
+stock="$work/stock proton"
+for proton in "$patched" "$stock"; do
+    mkdir -p -- "$proton/files/bin"
+    touch "$proton/proton" "$proton/files/bin/wineserver"
+    chmod +x "$proton/proton" "$proton/files/bin/wineserver"
+done
+printf '\0wineserver view tree: two views at base\0' > "$patched/files/bin/wineserver"
+game="$work/game with spaces/title.exe"
+if PROTONPATH="$stock" bash "$launcher" "$game" --execute 2> "$work/runner-error"; then exit 1; fi
+grep -Fq 'Unset PROTONPATH to install' "$work/runner-error"
+if PROTONPATH="$patched" bash "$launcher" --profile tuned-4k "$game" 2> "$work/profile-error"; then exit 1; fi
+grep -Fq 'Use --profile with --run' "$work/profile-error"
+if PROTONPATH="$patched" bash "$launcher" --run --profile unknown "$game" 2> "$work/profile-error"; then exit 1; fi
+grep -Fq 'Choose --profile tuned-4k' "$work/profile-error"
+test ! -e "$LAUNCH_RECORD"
+test ! -e "$XDG_CACHE_HOME"
+
+# Import checks, even with a literal --execute title argument, can use stock.
+PROTONPATH="$stock" bash "$launcher" "$game" -- --execute
+tail -n +4 "$LAUNCH_RECORD" | diff -u <(printf '%s\n' -- --execute) -
+
+# Stock execution is explicit and leaves the selected runner unchanged.
+PROTONPATH="$stock" VICTORY_ALLOW_STOCK_WINESERVER=1 PROTON_RECORD="$work/runner" PROFILE_RECORD="$work/profile" \
+    bash "$launcher" --run --runtime proton "$game"
+test "$(<"$work/runner")" = "$stock"
+tail -n +4 "$LAUNCH_RECORD" | diff -u <(echo --execute) -
+printf '%s\n' unset unset unset unset unset unset unset | diff -u - "$work/profile"
+
+# The preset takes effect for play without introducing private metadata or tracing.
+PROTONPATH="$patched" PROFILE_RECORD="$work/profile" \
+    bash "$launcher" --run --runtime proton --profile tuned-4k "$game"
+printf '%s\n' 3840x2160 1.0 4096 2 constant:0.35 unset unset | diff -u - "$work/profile"
+
+PROTONPATH="$patched" PROTON_RECORD="$work/runner" WINESERVER="$work/bin/wineserver" \
+    EXPECT_MATCHED_SERVER=1 bash "$launcher" "$game" --execute --console series-s -- "argument with spaces"
+test "$(<"$work/runner")" = "$patched"
 binary=${VICTORY_EXE//\//\\}
 title="$work/game with spaces/title.exe"
 title=${title//\//\\}
@@ -110,12 +159,14 @@ printf 'new core' > "$EXPECTED_RUNTIME/d3d12core.dll"
 printf 'original' > "${VICTORY_EXE%/*}/d3d12.dll"
 touch "${VICTORY_EXE%/*}/dxcompiler.dll"
 status=0
-UMU_EXIT=3 bash "$launcher" --report --vkd3d-dir "$EXPECTED_RUNTIME" "$work/game with spaces/title.exe" \
-    --console series-s -- "--execute" > "$work/report-output" || status=$?
+PROTONPATH="$patched" UMU_EXIT=3 PROFILE_RECORD="$work/profile" VICTORY_AMBIENT=off \
+    bash "$launcher" --report --profile tuned-4k --vkd3d-dir "$EXPECTED_RUNTIME" "$game" \
+    --console series-x -- "--execute" > "$work/report-output" || status=$?
 test "$status" -eq 3
 tail -n +4 "$LAUNCH_RECORD" > "$work/options"
-printf '%s\n' --execute --console series-s -- --execute | diff -u - "$work/options"
+printf '%s\n' --execute --console series-x -- --execute | diff -u - "$work/options"
 test ! -e "$(<"$STAGE_RECORD")"
+printf '%s\n' 3840x2160 1.0 4096 2 off unset unset | diff -u - "$work/profile"
 test "$(<"${VICTORY_EXE%/*}/d3d12.dll")" = original
 reports="$HOME/.local/share/victory/reports"
 archives=("$reports"/*.tar.gz)
@@ -127,8 +178,11 @@ tar -xOf "${archives[0]}" ./launcher-exit.txt | grep -qx 3
 tar -xOf "${archives[0]}" ./steam-victory.log | grep -qx 'Proton output'
 tar -xOf "${archives[0]}" ./launcher.log | diff -u <(printf 'Victory output\nUMU output\n') -
 tar -xOf "${archives[0]}" ./build.txt | grep -Fq victory.exe
+tar -xOf "${archives[0]}" ./build.txt | grep -Fxq 'renderer_profile=tuned-4k'
+server_digest=$(sha256sum < "$patched/files/bin/wineserver")
+tar -xOf "${archives[0]}" ./build.txt | grep -Fxq "wineserver_sha256=${server_digest%% *}"
 if tar -tf "${archives[0]}" | grep -Eq '\.(exe|dll)$'; then exit 1; fi
-if bash "$launcher" --run --vkd3d-dir "$work/nonexistent" "$work/game with spaces/title.exe" 2>/dev/null; then
+if PROTONPATH="$patched" bash "$launcher" --run --vkd3d-dir "$work/nonexistent" "$game" 2>/dev/null; then
     exit 1
 fi
 unset EXPECTED_RUNTIME
@@ -139,17 +193,19 @@ if bash "$launcher" --runtime unknown "$work/game with spaces/title.exe" 2>/dev/
 mkdir -p "$work/source"
 touch "$work/source/.victory-root"
 ln -s "$work/source" "$work/data-link"
-if XDG_DATA_HOME="$work/data-link" bash "$launcher" --report --runtime proton "$work/game with spaces/title.exe" 2>/dev/null; then
+if PROTONPATH="$patched" XDG_DATA_HOME="$work/data-link" \
+    bash "$launcher" --report --runtime proton "$game" 2>/dev/null; then
     exit 1
 fi
 test ! -d "$work/source/victory/reports"
-bash "$launcher" --run --runtime proton "$work/game with spaces/title.exe" --execute
+PROTONPATH="$patched" bash "$launcher" --run --runtime proton "$game" --execute
 head -n 1 "$LAUNCH_RECORD" | diff -u <(printf '%s\n' "Z:$binary") -
 tail -n +4 "$LAUNCH_RECORD" | diff -u <(echo --execute) -
 
 # An extracted distribution finds the executable beside its launcher.
 mkdir -p "$work/extracted bundle"
-cp "$launcher" "$work/extracted bundle/victory-proton.sh"
+cp -- "$launcher" "$work/extracted bundle/victory-proton.sh"
+cp -- "$runner_helper" "$work/extracted bundle/"
 touch "$work/extracted bundle/victory.exe"
 unset VICTORY_EXE
 export CARGO_TARGET_DIR="$work/no-build-tree"
@@ -158,6 +214,52 @@ read -r launched < "$LAUNCH_RECORD"
 expected="$work/extracted bundle/victory.exe"
 test "$launched" = "Z:${expected//\//\\}"
 if bash "$work/extracted bundle/victory-proton.sh" --build 2>/dev/null; then exit 1; fi
+
+# A first run installs a checksummed runner and uses the packaged server.
+# Give the real launcher and helper a tiny release fixture instead of a
+# production download. The downloader is unavailable on the second run.
+bundle="$work/extracted bundle"
+cp -p -- "$patched/files/bin/wineserver" "$bundle/wineserver"
+release=GE-Proton11-14-x86_64
+tree="$work/release/$release"
+mkdir -p -- "$tree/files/bin"
+printf 'proton fixture\n' > "$tree/proton"
+printf 'stock server\n' > "$tree/files/bin/wineserver"
+chmod +x -- "$tree/proton" "$tree/files/bin/wineserver"
+tar -czf "$work/runner.tar.gz" -C "$work/release" -- "$release"
+digest=$(sha256sum < "$work/runner.tar.gz")
+printf '\nproton_runner_sha256=%q\n' "${digest%% *}" >> "$bundle/proton-runner.sh"
+cat > "$work/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+while (( $# )); do
+    if [[ $1 == --output ]]; then
+        cp -- "${RUNNER_DOWNLOAD:?Unexpected network fetch}" "$2"
+        exit
+    fi
+    shift
+done
+exit 1
+EOF
+chmod +x "$work/bin/curl"
+export XDG_CACHE_HOME="$work/managed cache"
+: > "$LAUNCH_RECORD"
+if RUNNER_DOWNLOAD="$tree/proton" bash "$bundle/victory-proton.sh" --run --runtime proton "$game" \
+    2> "$work/bad-runner"; then exit 1; fi
+grep -Fq 'SHA-256 verification failed:' "$work/bad-runner"
+test ! -s "$LAUNCH_RECORD"
+RUNNER_DOWNLOAD="$work/runner.tar.gz" PROTON_RECORD="$work/installed-runner" \
+    bash "$bundle/victory-proton.sh" --run --runtime proton "$game"
+installed=$(<"$work/installed-runner")
+[[ $installed == "$XDG_CACHE_HOME/victory/proton/"* ]]
+cmp -- "$tree/proton" "$installed/proton"
+cmp -- "$bundle/wineserver" "$installed/files/bin/wineserver"
+test "$(<"$tree/files/bin/wineserver")" = 'stock server'
+rm -- "$XDG_CACHE_HOME/victory/proton/downloads/$release.tar.gz"
+PROTON_RECORD="$work/installed-runner" bash "$bundle/victory-proton.sh" --run --runtime proton "$game"
+test "$(<"$work/installed-runner")" = "$installed"
+rm -- "$work/bin/curl"
+unset XDG_CACHE_HOME
 
 # Steam's Proton Experimental gets Unix paths and a compat install symlink.
 export VICTORY_EXE="$work/build with spaces/victory.exe"
@@ -171,7 +273,7 @@ mkdir -p "$XDG_DATA_HOME/Steam/steamapps/common/Proton - Experimental" "$experim
 touch "$experimental/proton"
 chmod +x "$experimental/proton"
 printf '1794497090 experimental-11.0-20261112-x86_64\n' > "$experimental/version"
-bash "$launcher" "$work/game with spaces/title.exe" --execute
+VICTORY_ALLOW_STOCK_WINESERVER=1 bash "$launcher" "$game" --execute
 mapfile -t launched_args < "$LAUNCH_RECORD"
 test "${launched_args[0]}" = "$VICTORY_EXE"
 test "${launched_args[1]}" = run
@@ -187,7 +289,7 @@ test "$(readlink -- "${steam_env[0]}")" = "$work/build with spaces"
 mkdir -p "$work/other build"
 touch "$work/other build/victory.exe"
 TEST_LAUNCHER="$launcher" SECOND_BUILD="$work/other build" CHECK_PACKAGE_PATH=1 \
-    bash "$launcher" --run --runtime proton "$work/game with spaces/title.exe" --console series-x
+    VICTORY_ALLOW_STOCK_WINESERVER=1 bash "$launcher" --run --runtime proton "$game" --console series-x
 
 # Repair a stale or dangling link at this package's own path.
 ln -sfn -- "$work/other build" "$default_install"

@@ -1,7 +1,6 @@
-//! CPU model of the per-list indirect work budget that
-//! `shaders/argument_clamp.hlsl` enforces on the GPU, kept free of platform
-//! code so its arithmetic is tested everywhere. The shader reserves
-//! `min(cost, remaining)` with a saturating compare-and-exchange; a record is
+//! CPU model of the saturating per-list indirect work budget, independent
+//! of the graphics API. In the stop-after-rejection mode, a record reserves
+//! `min(cost, remaining)`; the record is
 //! rejected (runs empty) when the budget was already spent or the cost does
 //! not fit in what remains. The counter never exceeds [`BUDGET`], so rejected
 //! records cannot wrap the 32-bit word and reopen the budget.
@@ -134,16 +133,5 @@ mod tests {
             }
             assert!(u64::from(b.used) >= work);
         }
-    }
-
-    #[test]
-    fn shader_matches_the_model() {
-        let source = include_str!("../shaders/argument_clamp.hlsl");
-        assert!(source.contains("BUDGET = 1u << 27"));
-        assert!(source.contains("InterlockedCompareExchange"));
-        assert!(
-            !source.contains("InterlockedAdd(0, cost"),
-            "the budget word must only be updated by saturating compare-and-exchange"
-        );
     }
 }
