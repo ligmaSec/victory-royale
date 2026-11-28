@@ -6284,3 +6284,130 @@ void main() { output.Store(0, a); output.Store(4, b); }
         state.tables_done();
     }
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod world_capture_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+    struct Target(This);
+    impl Drop for Target {
+        fn drop(&mut self) {
+            crate::object::release(self.0);
+        }
+    }
+
+    fn render_target() -> Target {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let iid = ID3D12Resource::IID;
+        let mut target = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_committed(
+                std::ptr::null(),
+                (&raw const heap).cast(),
+                0,
+                (&raw const desc).cast(),
+                D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32,
+                std::ptr::null(),
+                (&raw const iid).cast(),
+                &mut target,
+            ),
+            crate::object::S_OK
+        );
+        Target(target)
+    }
+
+    #[test]
+    fn world_capture_dumps_targets_on_followups_and_listed_frames() {
+        // Capture switches and the frame counter belong to the process.
+        const CHILD: &str = "VICTORY_TEST_WORLD_TARGETS";
+        if std::env::var_os(CHILD).is_none() {
+            let folder = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "draw::world_capture_tests::world_capture_dumps_targets_on_followups_and_listed_frames",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("VICTORY_CAPTURE", folder.path())
+                .env("VICTORY_DUMP_TARGETS", "1")
+                .env("VICTORY_CAPTURE_WORLD", "1")
+                .env("VICTORY_CAPTURE_FRAMES", "8,10")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(
+                result.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{stderr}"
+            );
+            eprint!("{stderr}");
+            return;
+        }
+        let Some(host) = crate::host::host() else {
+            assert!(
+                !crate::switch::on("VICTORY_D3D12_WARP"),
+                "the requested WARP device must initialize for the readback test"
+            );
+            return;
+        };
+        let target = render_target();
+        let resource = crate::resource::host_resource(target.0).unwrap();
+        let mut slot = [0u64; 16];
+        let handle = slot.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(std::ptr::null(), target.0, std::ptr::null(), handle);
+        let rtv = host.rtv(Some(resource), None);
+        let mut state = State::default();
+        let red = |frame: u64| (frame * 16) as u8;
+        for frame in 1..=11 {
+            let list = host.new_list().unwrap();
+            state.set_targets(&list, &[handle], 0);
+            state.set_targets(&list, &[handle], 0);
+            let color = [f32::from(red(frame)) / 255.0, 0.0, 1.0, 1.0];
+            // SAFETY: an open list and a live RTV in render-target state.
+            unsafe { list.list.ClearRenderTargetView(rtv, &color, None) };
+            list.close();
+            host.execute(&[&list]);
+            if frame == 3 {
+                DRAWN.fetch_add(500, Ordering::Relaxed);
+            }
+            assert_eq!(crate::queue::present_test_frame(), crate::object::S_OK);
+        }
+        let folder = crate::capture::folder().unwrap();
+        let dumps = std::fs::read_dir(folder)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "png"))
+            .count();
+        assert_eq!(dumps, 4);
+        for frame in [5, 8, 9, 10] {
+            let expected = [red(frame), 0, 255, 255].repeat(16);
+            crate::capture::save(frame, 4, 4, 16, false, &expected);
+            let dumped = folder.join(format!("frame-{frame}-00-{:?}-4x4-f28.png", target.0));
+            let reference = folder.join(format!("frame-{frame}.png"));
+            assert_eq!(
+                std::fs::read(dumped).unwrap(),
+                std::fs::read(reference).unwrap()
+            );
+        }
+        eprintln!("verified GPU readback for all four scheduled world-capture frames");
+    }
+}

@@ -1123,6 +1123,12 @@ extern "system" fn present(
     S_OK
 }
 
+/// Run the same frame boundary as an empty title present.
+#[cfg(all(windows, test, feature = "diagnostics"))]
+pub(crate) fn present_test_frame() -> HRESULT {
+    present(std::ptr::null(), 0, std::ptr::null(), std::ptr::null())
+}
+
 /// Diagnostics: the title's present is over.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn frame_ends() {
