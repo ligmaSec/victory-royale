@@ -13,6 +13,11 @@ cat > "$work/bin/umu-run" <<'EOF'
 set -euo pipefail
 printf '%s\n' "$@" > "$LAUNCH_RECORD"
 printf '%s\n' "$WINEPREFIX" "$VKD3D_SHADER_CACHE_PATH" "$DXVK_STATE_CACHE_PATH" > "$ENV_RECORD"
+if [[ -n ${PROFILE_RECORD:-} ]]; then
+    printf '%s\n' "${VICTORY_OUTPUT-unset}" "${VICTORY_RENDER_SCALE-unset}" \
+        "${VICTORY_CARD_WINDOWS_MB-unset}" "${VICTORY_RELAY-unset}" "${VICTORY_AMBIENT-unset}" \
+        "${VICTORY_SHADER_ROLES-unset}" "${VICTORY_PRESENT_LOG-unset}" > "$PROFILE_RECORD"
+fi
 if [[ -n ${STEAM_RECORD:-} ]]; then
     printf '%s\n' "${STEAM_COMPAT_INSTALL_PATH:-}" "${STEAM_COMPAT_LIBRARY_PATHS:-}" > "$STEAM_RECORD"
 fi
@@ -69,6 +74,8 @@ export VICTORY_EXE="$work/build with spaces/victory.exe"
 export LAUNCH_RECORD="$work/args" ENV_RECORD="$work/env"
 unset WINEPREFIX VKD3D_SHADER_CACHE_PATH DXVK_STATE_CACHE_PATH PROTON_LOG EXPECTED_RUNTIME
 unset PROTONPATH WINESERVER VICTORY_ALLOW_STOCK_WINESERVER
+unset VICTORY_OUTPUT VICTORY_RENDER_SCALE VICTORY_CARD_WINDOWS_MB VICTORY_RELAY
+unset VICTORY_AMBIENT VICTORY_SHADER_ROLES VICTORY_PRESENT_LOG PROFILE_RECORD
 
 # Reject an explicitly selected stock Proton before execution or runtime staging.
 patched="$work/patched proton"
@@ -82,6 +89,10 @@ printf '\0wineserver view tree: two views at base\0' > "$patched/files/bin/wines
 game="$work/game with spaces/title.exe"
 if PROTONPATH="$stock" bash "$launcher" "$game" --execute 2> "$work/runner-error"; then exit 1; fi
 grep -Fq 'Unset PROTONPATH to install' "$work/runner-error"
+if PROTONPATH="$patched" bash "$launcher" --profile tuned-4k "$game" 2> "$work/profile-error"; then exit 1; fi
+grep -Fq 'Use --profile with --run' "$work/profile-error"
+if PROTONPATH="$patched" bash "$launcher" --run --profile unknown "$game" 2> "$work/profile-error"; then exit 1; fi
+grep -Fq 'Choose --profile tuned-4k' "$work/profile-error"
 test ! -e "$LAUNCH_RECORD"
 test ! -e "$XDG_CACHE_HOME"
 
@@ -90,10 +101,16 @@ PROTONPATH="$stock" bash "$launcher" "$game" -- --execute
 tail -n +4 "$LAUNCH_RECORD" | diff -u <(printf '%s\n' -- --execute) -
 
 # Stock execution is explicit and leaves the selected runner unchanged.
-PROTONPATH="$stock" VICTORY_ALLOW_STOCK_WINESERVER=1 PROTON_RECORD="$work/runner" \
+PROTONPATH="$stock" VICTORY_ALLOW_STOCK_WINESERVER=1 PROTON_RECORD="$work/runner" PROFILE_RECORD="$work/profile" \
     bash "$launcher" --run --runtime proton "$game"
 test "$(<"$work/runner")" = "$stock"
 tail -n +4 "$LAUNCH_RECORD" | diff -u <(echo --execute) -
+printf '%s\n' unset unset unset unset unset unset unset | diff -u - "$work/profile"
+
+# The preset takes effect for play without introducing private metadata or tracing.
+PROTONPATH="$patched" PROFILE_RECORD="$work/profile" \
+    bash "$launcher" --run --runtime proton --profile tuned-4k "$game"
+printf '%s\n' 3840x2160 1.0 4096 2 constant:0.35 unset unset | diff -u - "$work/profile"
 
 PROTONPATH="$patched" PROTON_RECORD="$work/runner" WINESERVER="$work/bin/wineserver" \
     EXPECT_MATCHED_SERVER=1 bash "$launcher" "$game" --execute --console series-s -- "argument with spaces"
@@ -142,12 +159,14 @@ printf 'new core' > "$EXPECTED_RUNTIME/d3d12core.dll"
 printf 'original' > "${VICTORY_EXE%/*}/d3d12.dll"
 touch "${VICTORY_EXE%/*}/dxcompiler.dll"
 status=0
-PROTONPATH="$patched" UMU_EXIT=3 bash "$launcher" --report --vkd3d-dir "$EXPECTED_RUNTIME" "$game" \
-    --console series-s -- "--execute" > "$work/report-output" || status=$?
+PROTONPATH="$patched" UMU_EXIT=3 PROFILE_RECORD="$work/profile" VICTORY_AMBIENT=off \
+    bash "$launcher" --report --profile tuned-4k --vkd3d-dir "$EXPECTED_RUNTIME" "$game" \
+    --console series-x -- "--execute" > "$work/report-output" || status=$?
 test "$status" -eq 3
 tail -n +4 "$LAUNCH_RECORD" > "$work/options"
-printf '%s\n' --execute --console series-s -- --execute | diff -u - "$work/options"
+printf '%s\n' --execute --console series-x -- --execute | diff -u - "$work/options"
 test ! -e "$(<"$STAGE_RECORD")"
+printf '%s\n' 3840x2160 1.0 4096 2 off unset unset | diff -u - "$work/profile"
 test "$(<"${VICTORY_EXE%/*}/d3d12.dll")" = original
 reports="$HOME/.local/share/victory/reports"
 archives=("$reports"/*.tar.gz)
@@ -159,6 +178,7 @@ tar -xOf "${archives[0]}" ./launcher-exit.txt | grep -qx 3
 tar -xOf "${archives[0]}" ./steam-victory.log | grep -qx 'Proton output'
 tar -xOf "${archives[0]}" ./launcher.log | diff -u <(printf 'Victory output\nUMU output\n') -
 tar -xOf "${archives[0]}" ./build.txt | grep -Fq victory.exe
+tar -xOf "${archives[0]}" ./build.txt | grep -Fxq 'renderer_profile=tuned-4k'
 server_digest=$(sha256sum < "$patched/files/bin/wineserver")
 tar -xOf "${archives[0]}" ./build.txt | grep -Fxq "wineserver_sha256=${server_digest%% *}"
 if tar -tf "${archives[0]}" | grep -Eq '\.(exe|dll)$'; then exit 1; fi

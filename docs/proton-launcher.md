@@ -116,6 +116,27 @@ override these defaults. `VKD3D_SHADER_CACHE_PATH=0` disables the VKD3D cache
 without creating a directory. Empty or relative XDG base directories fall back
 to the standard directories under `$HOME`.
 
+## Tuned 4K profile
+
+```sh
+./victory-proton.sh --run --profile tuned-4k "/path/to/title.exe"
+```
+
+Use `./scripts/victory-proton.sh` from a source checkout. The preset is
+opt-in for Series X on the reference RTX 5090, GE-Proton11-14 and pinned
+vkd3d-proton. It requests native 3840×2160, 16.667 ms frame pacing, and a
+4 GiB GPU window-copy budget. It also enables deferred submissions and
+copies, batched indirect work, and texture upload ahead. It uses a zero
+pipeline wait budget: cold runs can drop draws while pipelines compile.
+Individual `VICTORY_*` environment settings take precedence.
+
+This ships the renderer flags, not the private shader-role map used by the
+comparison. With the map, package `09323541fcc7` measured 19.04 FPS and 60 ms
+p95 over a short native-4K walk; glass and shadows were still wrong. Removing
+only the map disabled the ambient-light workaround and brought back dark
+silhouettes and blown highlights during camera movement. The preset alone is
+not a lighting fix or a game performance guarantee. Normal `--run` is unchanged.
+
 ## Patched wineserver
 
 The first normal play (`--run`, `--report` or `TITLE.exe --execute`) downloads
@@ -213,9 +234,10 @@ builds in [#99](https://github.com/ligmaSec/victory-royale/issues/99) and
   A client/server protocol mismatch fails before the title runs; changing
   vkd3d-proton DLLs will not fix it. Use a matched client and server in a
   private runner rather than downgrading system Wine.
-- Royale has not measured a server-only A/B under Proton. The shipped source
-  patch applies to the pinned GE-Proton11-14 Wine source in a dry run. Other
-  releases may need a rebase and a fresh-prefix, game-free launch check.
+- A server-only comparison of package `09323541fcc7` had no matched gameplay
+  result: the stock-server control stopped at “Couldn't Load” before movement.
+  The shipped indexed server passed a fresh-prefix smoke; other Proton
+  releases may need a rebase and their own game-free launch check.
 
 ## Capture a workstation run
 
@@ -228,8 +250,8 @@ For a requested PR comparison, follow the [interactive hardware test](testing.md
 The launcher records UMU output, enables Proton exception logging and Victory
 pipeline tracing, and writes the launcher exit status and executable SHA-256.
 The package revision or launcher checkout revision is included when available.
-`build.txt` also records the selected patched server's SHA-256, or marks it
-unverified for a stock diagnostic.
+`build.txt` also records the selected renderer preset, if any, and the patched
+server's SHA-256 (or marks the server unverified for a stock diagnostic).
 Each invocation prints its own archive path under
 `${XDG_DATA_HOME:-$HOME/.local/share}/victory/reports`. A failed launch also
 produces an archive once UMU has started. Logs can include personal paths and

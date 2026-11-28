@@ -42,6 +42,8 @@ No manual patch or Wine build is needed with the package.
 `--report` launches once and prints the path to a compressed diagnostic archive
 when the process exits. Both modes download pinned vkd3d-proton on first use
 and verify the cache on each launch. Add `--runtime proton` to use Proton's own libraries.
+For a native 4K Series X experiment, add [`--profile tuned-4k`](docs/proton-launcher.md#tuned-4k-profile).
+This opt-in preset does not fix the default lighting.
 Contributors running from source use
 `./scripts/victory-proton.sh --build` after installing the cross-toolchain,
 then the same commands with `./scripts/victory-proton.sh`.
