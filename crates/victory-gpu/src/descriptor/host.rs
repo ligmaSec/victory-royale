@@ -126,40 +126,86 @@ impl Made {
     }
 }
 
-/// Free intervals in dynamic-slot coordinates. The same interval is indexed
-/// by start for coalescing and by length for best-fit allocation.
+/// Free intervals stay whole by address. Their length indexes prefer the
+/// upper eighth for wide tables, so speculative small chunks do not split
+/// the last long runs. The placement boundary is not a physical limit.
 #[derive(Default)]
 struct DynamicRanges {
     by_start: BTreeMap<u32, u32>,
-    by_len: BTreeSet<(u32, u32)>,
+    by_len: [BTreeSet<(u32, u32)>; 2],
+    wide_from: u32,
 }
 
 impl DynamicRanges {
     fn new(capacity: u32) -> Self {
-        let mut ranges = Self::default();
+        let mut ranges = Self {
+            wide_from: capacity - capacity / 8,
+            ..Self::default()
+        };
         if capacity != 0 {
             ranges.insert(0, capacity);
         }
         ranges
     }
 
+    fn pieces(&self, first: u32, n: u32) -> [(u32, u32); 2] {
+        let end = first + n;
+        let split = self.wide_from.clamp(first, end);
+        [(first, split - first), (split, end - split)]
+    }
+
     fn insert(&mut self, first: u32, n: u32) {
         self.by_start.insert(first, n);
-        self.by_len.insert((n, first));
+        for (region, (at, len)) in self.pieces(first, n).into_iter().enumerate() {
+            if len != 0 {
+                self.by_len[region].insert((len, at));
+            }
+        }
     }
 
     fn remove(&mut self, first: u32, n: u32) {
         self.by_start.remove(&first);
-        self.by_len.remove(&(n, first));
+        for (region, (at, len)) in self.pieces(first, n).into_iter().enumerate() {
+            if len != 0 {
+                self.by_len[region].remove(&(len, at));
+            }
+        }
     }
 
-    fn take(&mut self, n: u32) -> Option<u32> {
-        let &(len, first) = self.by_len.range((n, 0)..).next()?;
+    fn take(&mut self, n: u32, reserve: bool) -> Option<u32> {
+        const WIDE_TABLE: u32 = 256;
+        let primary = usize::from(n >= WIDE_TABLE);
+        let fit = |region: usize| {
+            self.by_len[region]
+                .range((n, 0)..)
+                .next()
+                .map(|&(_, first)| first)
+        };
+        let start = match fit(primary) {
+            Some(first) => first,
+            None if reserve => return None,
+            None => fit(1 - primary).or_else(|| {
+                self.crossing()
+                    .filter(|&(_, len)| len >= n)
+                    .map(|(first, _)| first)
+            })?,
+        };
+        // A preferred piece may start inside the full free interval.
+        let (&first, &len) = self.by_start.range(..=start).next_back()?;
         self.remove(first, len);
-        if len > n {
-            self.insert(first + n, len - n);
+        if start > first {
+            self.insert(first, start - first);
         }
-        Some(first)
+        if start + n < first + len {
+            self.insert(start + n, first + len - start - n);
+        }
+        Some(start)
+    }
+
+    /// At most one physical interval can cross the placement boundary.
+    fn crossing(&self) -> Option<(u32, u32)> {
+        let (&first, &len) = self.by_start.range(..self.wide_from).next_back()?;
+        (first + len > self.wide_from).then_some((first, len))
     }
 
     fn give(&mut self, first: u32, n: u32) -> bool {
@@ -197,7 +243,10 @@ impl DynamicRanges {
     }
 
     fn largest(&self) -> u32 {
-        self.by_len.last().map_or(0, |&(n, _)| n)
+        self.by_len
+            .iter()
+            .filter_map(|index| index.last().map(|&(n, _)| n))
+            .fold(self.crossing().map_or(0, |(_, n)| n), u32::max)
     }
 
     #[cfg(feature = "diagnostics")]
@@ -2028,9 +2077,7 @@ impl HostHeap {
         if reserve && free.saturating_sub(n) < self.dynamic / 8 {
             return None;
         }
-        // Fill smaller holes before splitting a run that a later, larger
-        // table needs. A failed fit never has to walk the descriptor heap.
-        let Some(first) = ranges.take(n) else {
+        let Some(first) = ranges.take(n, reserve) else {
             if matches!(request, DynamicRequest::AfterSettle) {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
@@ -6718,6 +6765,44 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn dynamic_small_recordings_leave_space_for_a_wide_table() {
+        let mut ranges = DynamicRanges::new(4096);
+        for first in (0..3584).step_by(64) {
+            assert_eq!(ranges.take(64, false), Some(first));
+        }
+        // Short holes are all a one-view recording needs. Speculatively
+        // holding four 64-slot chunks in the wide region would leave a
+        // largest run of 256 before any of those recordings closed.
+        for first in (0..3584).step_by(64) {
+            assert!(ranges.give(first, 5));
+        }
+        for _ in 0..4 {
+            assert_eq!(ranges.take(64, true), None);
+            assert!(ranges.take(1, false).is_some());
+        }
+        assert!(ranges.take(258, false).is_some());
+    }
+
+    #[test]
+    fn dynamic_exact_requests_can_cross_the_placement_boundary() {
+        let mut ranges = DynamicRanges::new(2048);
+        assert_eq!(ranges.take(1920, false), Some(0));
+        let small = ranges.take(64, false).expect("exact request can borrow");
+        assert_eq!(small, 1920);
+        assert!(ranges.give(0, 1920));
+        assert_eq!(ranges.largest(), 1920);
+        assert_eq!(ranges.take(1920, false), Some(0));
+        assert_eq!(
+            ranges.take(65, false),
+            None,
+            "must not overlap the live slot"
+        );
+        assert!(ranges.give(small, 64));
+        assert!(ranges.give(0, 1920));
+        assert_eq!(ranges.take(2048, false), Some(0));
     }
 
     #[test]
