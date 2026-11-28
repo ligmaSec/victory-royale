@@ -5999,11 +5999,16 @@ mod tests {
         square[6] = 512;
         let mut buffer = texture;
         buffer[0] = 1;
+        let mut other_format = twice;
+        other_format[8] = 83;
         assert_eq!(kin(&old, &view(texture, 98, 4, 0x1000_0000)), Kin::Same);
         assert_eq!(kin(&old, &view(texture, 98, 4, 0x2000_0000)), Kin::Moved);
         assert_eq!(kin(&old, &view(twice, 98, 4, 0x2000_0000)), Kin::Sized);
         assert_eq!(kin(&old, &view(square, 98, 4, 0x2000_0000)), Kin::Other);
-        assert_eq!(kin(&old, &view(twice, 83, 4, 0x2000_0000)), Kin::Other);
+        assert_eq!(
+            kin(&old, &view(other_format, 83, 4, 0x2000_0000)),
+            Kin::None
+        );
         assert_eq!(kin(&old, &view(texture, 98, 9, 0x2000_0000)), Kin::None);
         assert_eq!(kin(&old, &view(buffer, 98, 1, 0x2000_0000)), Kin::None);
         for (kin, kept) in [

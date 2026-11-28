@@ -4970,10 +4970,18 @@ float4 corner(uint i : SV_VertexID) : SV_Position {
     float z = float(number) * asfloat(0x37800080);
     return float4(float(i & 1) * 4.0 - 1.0, float(i >> 1) * 4.0 - 1.0, z, 1.0);
 }
-float4 lit() : SV_Target { return 1.0; }
+float4 shade_target() : SV_Target { return 1.0; }
 "#;
         let vs = crate::host::compile(SOURCE, c"corner", c"vs_5_1").unwrap();
-        let ps = crate::host::compile(SOURCE, c"lit", c"ps_5_1").unwrap();
+        // The graphics pipeline takes its root signature from the vertex shader.
+        let ps = crate::hlsl::compile_stage(
+            "depth-twin test",
+            SOURCE,
+            c"shade_target",
+            c"ps_5_1",
+            false,
+        )
+        .unwrap();
         let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
