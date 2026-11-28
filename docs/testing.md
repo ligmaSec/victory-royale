@@ -471,6 +471,11 @@ These are wall-clock times between successful host presents. Startup before
 the first present and gaps while DXGI reports an occluded window are excluded.
 A stall appears in the log when presentation resumes.
 
+Concurrent recording threads share the same wall-clock pipeline wait
+budget for a title frame. One thread waiting for a pipeline no longer
+forces another to drop its draw while time remains. Keep general and
+screen-pass limits the same in matched cache comparisons.
+
 For donor parity diagnostics, `VICTORY_SHADER_ROLES` can point to a private
 text file outside the checkout. Each nonempty line maps a full BLAKE3 shader
 container ID to one role, with whitespace between them and an optional `#`

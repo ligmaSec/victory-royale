@@ -314,17 +314,66 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
-/// Whether the frame's budget is one for all threads together: a thread
-/// that waits takes what is left of it and gives back what it did not
-/// use. Counted only when a wait had ended, the budget was one per thread:
-/// each of the title's five recording threads began its first wait of a
-/// frame with nothing counted yet and waited the whole half second, 2.5 s
-/// of waiting in every frame in which pipelines were being made (runs
-/// 34-49: "2504 ms waiting for pipelines" in each such frame).
+/// Use one wall-clock budget across the frame's recording threads. Overlapping
+/// waits share a deadline; charging them separately once they return allows
+/// every thread to spend a full budget in the same frame.
 /// On by default; `VICTORY_PIPELINE_WAIT_SHARED=0` counts as before.
 fn shared_budget() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
+}
+
+struct FrameWait {
+    frame: u64,
+    spent: Duration,
+    /// The start and participant count of the current overlapping wait.
+    active: Option<(Instant, usize)>,
+}
+
+impl FrameWait {
+    const fn new() -> Self {
+        Self {
+            frame: 0,
+            spent: Duration::ZERO,
+            active: None,
+        }
+    }
+
+    fn begin(&mut self, frame: u64, budget: Duration, shared: bool, now: Instant) -> Duration {
+        if frame < self.frame {
+            return Duration::ZERO;
+        }
+        if frame != self.frame {
+            *self = Self {
+                frame,
+                ..Self::new()
+            };
+        }
+        let running = self.active.map_or(Duration::ZERO, |(start, _)| {
+            now.saturating_duration_since(start)
+        });
+        let left = budget.saturating_sub(self.spent.saturating_add(running));
+        if shared && !left.is_zero() {
+            self.active.get_or_insert((now, 0)).1 += 1;
+        }
+        left
+    }
+
+    fn end(&mut self, frame: u64, shared: bool, waited: Duration, now: Instant) {
+        if self.frame != frame {
+            return;
+        }
+        if !shared {
+            self.spent = self.spent.saturating_add(waited);
+        } else if let Some((started, count)) = &mut self.active {
+            *count -= 1;
+            if *count == 0 {
+                let elapsed = now.saturating_duration_since(*started);
+                self.spent = self.spent.saturating_add(elapsed);
+                self.active = None;
+            }
+        }
+    }
 }
 
 /// Waits for `p` while frame `frame` has budget left.
@@ -338,27 +387,17 @@ fn wait(p: &Pending, frame: u64) {
     if budget.is_zero() {
         return;
     }
-    // The frame the budget belongs to, and what was waited of it (or is
-    // taken by a thread waiting now); of the passes over the screen too.
-    static SPENT: [Mutex<(u64, Duration)>; 2] =
-        [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    static SPENT: [Mutex<FrameWait>; 2] = [const { Mutex::new(FrameWait::new()) }; 2];
     let spent_of = &SPENT[usize::from(screen)];
     let shared = shared_budget();
-    let left = {
+    let (started, left) = {
         let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
-        if spent.0 != frame {
-            *spent = (frame, Duration::ZERO);
-        }
-        let left = budget.saturating_sub(spent.1);
-        if shared {
-            spent.1 += left;
-        }
-        left
+        let started = Instant::now();
+        (started, spent.begin(frame, budget, shared, started))
     };
     if left.is_zero() {
         return;
     }
-    let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
@@ -373,6 +412,10 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    {
+        let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
+        spent.end(frame, shared, waited, Instant::now());
+    }
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
@@ -380,17 +423,6 @@ fn wait(p: &Pending, frame: u64) {
             shaders = ?p.shaders,
             "a pass over the screen was waited for (VICTORY_SCREEN_WAIT_MS=0: dropped past half a second a frame)"
         );
-    }
-    {
-        let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
-        // A frame that began meanwhile has its own budget.
-        if spent.0 == frame {
-            if shared {
-                spent.1 = spent.1.saturating_sub(left - waited);
-            } else {
-                spent.1 += waited;
-            }
-        }
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
@@ -642,6 +674,28 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlapping_pipeline_waits_share_a_deadline_without_dropping_later_requests() {
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        let at = |offset| start + ms(offset);
+        let mut frame = FrameWait::new();
+        let budget = ms(100);
+        assert_eq!(frame.begin(7, budget, true, at(0)), ms(100));
+        assert_eq!(frame.begin(7, budget, true, at(20)), ms(80));
+        frame.end(7, true, ms(20), at(20));
+        assert_eq!(frame.begin(7, budget, true, at(70)), ms(30));
+        frame.end(7, true, ms(55), at(75));
+        frame.end(7, true, ms(10), at(80));
+        assert_eq!(frame.begin(7, budget, true, at(100)), ms(20));
+        assert_eq!(frame.begin(7, budget, true, at(121)), Duration::ZERO);
+
+        assert_eq!(frame.begin(8, budget, true, at(121)), ms(100));
+        frame.end(7, true, ms(20), at(124));
+        assert_eq!(frame.begin(7, budget, true, at(124)), Duration::ZERO);
+        assert_eq!(frame.begin(8, budget, true, at(124)), ms(97));
+    }
 
     #[test]
     fn initialization_producers_are_started_early_without_classifying_recurring_skinning() {
