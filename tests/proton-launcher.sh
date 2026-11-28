@@ -3,6 +3,7 @@
 set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 launcher=$(realpath -- "${1:-$root/scripts/victory-proton.sh}")
+runner_helper="${launcher%/*}/proton-runner.sh"
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 mkdir -p "$work/bin" "$work/build with spaces" "$work/game with spaces"
@@ -69,7 +70,7 @@ export LAUNCH_RECORD="$work/args" ENV_RECORD="$work/env"
 unset WINEPREFIX VKD3D_SHADER_CACHE_PATH DXVK_STATE_CACHE_PATH PROTON_LOG EXPECTED_RUNTIME
 unset PROTONPATH WINESERVER VICTORY_ALLOW_STOCK_WINESERVER
 
-# Reject missing and stock Proton before execution or runtime staging.
+# Reject an explicitly selected stock Proton before execution or runtime staging.
 patched="$work/patched proton"
 stock="$work/stock proton"
 for proton in "$patched" "$stock"; do
@@ -79,9 +80,8 @@ for proton in "$patched" "$stock"; do
 done
 printf '\0wineserver view tree: two views at base\0' > "$patched/files/bin/wineserver"
 game="$work/game with spaces/title.exe"
-if bash "$launcher" --run "$game" 2> "$work/runner-error"; then exit 1; fi
-grep -Fq PROTONPATH "$work/runner-error"
 if PROTONPATH="$stock" bash "$launcher" "$game" --execute 2> "$work/runner-error"; then exit 1; fi
+grep -Fq 'Unset PROTONPATH to install' "$work/runner-error"
 test ! -e "$LAUNCH_RECORD"
 test ! -e "$XDG_CACHE_HOME"
 
@@ -184,7 +184,8 @@ tail -n +4 "$LAUNCH_RECORD" | diff -u <(echo --execute) -
 
 # An extracted distribution finds the executable beside its launcher.
 mkdir -p "$work/extracted bundle"
-cp "$launcher" "$work/extracted bundle/victory-proton.sh"
+cp -- "$launcher" "$work/extracted bundle/victory-proton.sh"
+cp -- "$runner_helper" "$work/extracted bundle/"
 touch "$work/extracted bundle/victory.exe"
 unset VICTORY_EXE
 export CARGO_TARGET_DIR="$work/no-build-tree"
@@ -193,6 +194,52 @@ read -r launched < "$LAUNCH_RECORD"
 expected="$work/extracted bundle/victory.exe"
 test "$launched" = "Z:${expected//\//\\}"
 if bash "$work/extracted bundle/victory-proton.sh" --build 2>/dev/null; then exit 1; fi
+
+# A first run installs a checksummed runner and uses the packaged server.
+# Give the real launcher and helper a tiny release fixture instead of a
+# production download. The downloader is unavailable on the second run.
+bundle="$work/extracted bundle"
+cp -p -- "$patched/files/bin/wineserver" "$bundle/wineserver"
+release=GE-Proton11-14-x86_64
+tree="$work/release/$release"
+mkdir -p -- "$tree/files/bin"
+printf 'proton fixture\n' > "$tree/proton"
+printf 'stock server\n' > "$tree/files/bin/wineserver"
+chmod +x -- "$tree/proton" "$tree/files/bin/wineserver"
+tar -czf "$work/runner.tar.gz" -C "$work/release" -- "$release"
+digest=$(sha256sum < "$work/runner.tar.gz")
+printf '\nproton_runner_sha256=%q\n' "${digest%% *}" >> "$bundle/proton-runner.sh"
+cat > "$work/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+while (( $# )); do
+    if [[ $1 == --output ]]; then
+        cp -- "${RUNNER_DOWNLOAD:?Unexpected network fetch}" "$2"
+        exit
+    fi
+    shift
+done
+exit 1
+EOF
+chmod +x "$work/bin/curl"
+export XDG_CACHE_HOME="$work/managed cache"
+: > "$LAUNCH_RECORD"
+if RUNNER_DOWNLOAD="$tree/proton" bash "$bundle/victory-proton.sh" --run --runtime proton "$game" \
+    2> "$work/bad-runner"; then exit 1; fi
+grep -Fq 'SHA-256 verification failed:' "$work/bad-runner"
+test ! -s "$LAUNCH_RECORD"
+RUNNER_DOWNLOAD="$work/runner.tar.gz" PROTON_RECORD="$work/installed-runner" \
+    bash "$bundle/victory-proton.sh" --run --runtime proton "$game"
+installed=$(<"$work/installed-runner")
+[[ $installed == "$XDG_CACHE_HOME/victory/proton/"* ]]
+cmp -- "$tree/proton" "$installed/proton"
+cmp -- "$bundle/wineserver" "$installed/files/bin/wineserver"
+test "$(<"$tree/files/bin/wineserver")" = 'stock server'
+rm -- "$XDG_CACHE_HOME/victory/proton/downloads/$release.tar.gz"
+PROTON_RECORD="$work/installed-runner" bash "$bundle/victory-proton.sh" --run --runtime proton "$game"
+test "$(<"$work/installed-runner")" = "$installed"
+rm -- "$work/bin/curl"
+unset XDG_CACHE_HOME
 
 # Steam's Proton Experimental gets Unix paths and a compat install symlink.
 export VICTORY_EXE="$work/build with spaces/victory.exe"

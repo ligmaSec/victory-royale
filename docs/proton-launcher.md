@@ -33,14 +33,12 @@ LLVM, and the MSVC Rust target installed, build one using
 
 ## Package the Linux distribution
 
-From the checkout in Bash, with the cross-build tools and Linux DXC above,
-build and check the same distribution CI publishes. The packager requires
-Python 3, the full Git revision, and a new output directory outside the
-checkout whose parent already exists. It checks that every production GPU
-helper compiled by DXC is embedded in the executable. It ships only the
-executable, launcher, example configuration, license, launcher regression
-test, revision, and the wineserver source patch and setup guide. No Proton or
-wineserver binary is bundled.
+From the checkout in Bash, install the cross-build tools and Linux DXC above
+and the [server build prerequisites](#patched-wineserver) below. The packager
+requires Python 3, the full Git revision, and a new output directory outside
+the checkout. It checks that the executable embeds the production GPU helpers
+and ships the indexed wineserver with its complete prepared Wine source.
+The distribution does not bundle GE-Proton itself.
 
 ```sh
 (
@@ -49,8 +47,9 @@ wineserver binary is bundled.
     work=$(mktemp -d)
     export CARGO_TARGET_DIR="$work/target"
     VICTORY_BUILD_COMMIT="$revision" ./scripts/victory-proton.sh --build
+    bash scripts/build-proton-wineserver.sh --with-source "$work/server" "$work/downloads"
     bash scripts/package-proton.sh "$CARGO_TARGET_DIR/x86_64-pc-windows-gnullvm/release" \
-        "$revision" "$work/distribution"
+        "$revision" "$work/distribution" "$work/server"
     mkdir "$work/unpacked"
     cd "$work/distribution"
     sha256sum --check --strict SHA256SUMS
@@ -62,9 +61,9 @@ wineserver binary is bundled.
 
 ## Launch
 
-Install UMU so that `umu-run` is on `PATH`, and set up a
-[patched wineserver](#patched-wineserver) for gameplay. Keep your game files
-outside the checkout and pass the Linux path to the title executable.
+Install UMU so that `umu-run` is on `PATH`. Keep your game files outside the
+checkout and pass the Linux path to the title executable. Leave `PROTONPATH`
+unset for [automatic Proton setup](#patched-wineserver).
 [UMU installation](https://github.com/Open-Wine-Components/umu-launcher#installation)
 
 ```sh
@@ -119,47 +118,34 @@ to the standard directories under `$HOME`.
 
 ## Patched wineserver
 
-Normal play (`--run`, `--report` and `TITLE.exe --execute`) requires a
-Proton build with an indexed `wineserver`. The title streams tens of thousands
-of memory views; the patch indexes addresses instead of scanning the view list
-on each map and unmap. See the [runner benchmarks](#wine-and-proton-performance)
-for the measured effect and its limits.
+The first normal play (`--run`, `--report` or `TITLE.exe --execute`) downloads
+and checksums the official x86-64 **GE-Proton11-14** archive (about 571 MB).
+Royale installs it with the matching indexed `wineserver` under
+`${XDG_CACHE_HOME:-$HOME/.cache}/victory/proton/`. Subsequent launches reuse
+that private runner. The launcher does not patch a Steam install, change
+system Wine, or alter the save layout. UMU also downloads Steam Linux Runtime
+on first use if needed.
 
-Build the server from the **exact prepared Wine sources of your Proton
-build** in its Steam Linux Runtime SDK (or a compatible build environment).
-The client and server must use the same protocol. For GE-Proton11-14,
-use the [tagged GE source](https://github.com/GloriousEggroll/proton-ge-custom/tree/GE-Proton11-14)
-with its submodules initialized. Run `bash patches/protonprep-valve-staging.sh`
-from the root of that disposable source checkout before applying the patch.
-That preparation script resets its submodules. Do not patch system Wine or
-replace a Steam-managed runner.
+The Linux package ships a prebuilt server: **players do not need a compiler
+or have to apply a patch**. When running from a source checkout, the first
+play builds just the matching server in the cache. Install a native C/C++
+toolchain with static libc, `make`, Autoconf, Flex, Bison, Perl, Python 3,
+`pkg-config`, and GNU Patch/binutils before running from source
+(Arch: `base-devel` and `python`; Debian/Ubuntu: `build-essential autoconf
+flex bison perl python3 pkg-config patch binutils`). No full Proton build is
+needed. See the [runner benchmarks](#wine-and-proton-performance) for what the
+index improves and what still needs measuring.
 
-The archive includes `wineserver-view-tree.patch` beside its launcher
-(`scripts/wineserver-view-tree.patch` in a checkout). With the patch path set
-for your layout, build only the server and replace it in a **new private copy**
-of the matching extracted Proton release:
+### Custom Proton builds
 
-```sh
-patch_file=$(realpath -e wineserver-view-tree.patch)
-wine_source=/absolute/path/to/prepared/ge-proton/wine
-stock=$(realpath -e /absolute/path/to/GE-Proton11-14)
-patched="$stock-view-tree"
-(
-    set -e
-    test ! -e "$patched"
-    test ! -L "$patched"
-    patch --directory="$wine_source" -p1 --fuzz=0 < "$patch_file"
-    build=$(mktemp -d)
-    cd "$build"
-    "$wine_source/configure" --enable-win64 --without-mingw --without-x
-    make -j"$(nproc)" server/wineserver
-    cp -aT --reflink=auto -- "$stock" "$patched"
-    install -m 755 -T -- server/wineserver "$patched/files/bin/wineserver.view-tree"
-    mv -fT -- "$patched/files/bin/wineserver.view-tree" "$patched/files/bin/wineserver"
-)
-# After the build and copy succeed:
-export PROTONPATH="$patched"
-```
+Set `PROTONPATH` only to use a custom indexed Proton runner. The included
+`wineserver-view-tree.patch` can be built against that release's **exact
+prepared Wine source**; build only `server/wineserver` and install it as
+`files/bin/wineserver` in a private copy of that same Proton release. The
+client and server protocols must match. The source patch may need rebasing.
+Do not apply it twice: upstream [Wine 11.23](https://github.com/wine-mirror/wine/commit/3217449b1f719c8f7a73a6de768df536495ddcbf)
+already has a separate mapped-view index. That does not imply that an older
+Proton release includes it.
 
 The launcher checks `PROTONPATH/files/bin/wineserver` for the patch's
 duplicate-view diagnostic. This identifies the build, not the protocol or
@@ -282,17 +268,17 @@ can still use the same shaders. Unset the variable to restore the passes.
 
 ## Testing without game files
 
-`./scripts/victory-proton.sh --test` (or `./victory-proton.sh --test` in the package) checks argument quoting, cache paths, XDG
-fallbacks and exit status with a fake UMU. It requires neither Wine nor a GPU,
-and runs in Linux CI.
+`./scripts/victory-proton.sh --test` (or `./victory-proton.sh --test` in the
+package) tests argument quoting, path handling, rejected runner downloads,
+offline reuse and exit status with fake UMU. It needs no Wine or GPU.
 
 `./tests/proton-smoke.sh` compiles its synthetic title with the LLVM-MinGW
 toolchain and gnullvm Rust target above, even when `VICTORY_EXE` points to
-an MSVC build. Set `PROTONPATH` to the patched build to exercise the normal
-launch path, or opt into a stock diagnostic as above. The test checks the
-launcher's exit status, the reported Proton version, and the title's return
-value. It uses a separate `victory/proton-smoke` prefix under the XDG data
-directory. Set `VICTORY_SMOKE_PREFIX` to choose another test prefix.
+an MSVC build. Leave `PROTONPATH` unset to exercise the managed runner, or opt
+into a custom runner as above. The test checks the launcher's exit status,
+the reported Proton version and the title's return value. It uses a separate
+`victory/proton-smoke` prefix under the XDG data directory. Set
+`VICTORY_SMOKE_PREFIX` to choose another test prefix.
 
 To reproduce the loader integration tests after the smoke test, build the
 DLL fixture on Linux and set `VICTORY_HLE_PROBE` to the Windows path of the

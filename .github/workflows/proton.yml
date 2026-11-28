@@ -27,11 +27,13 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends wine wine64 xvfb xauth clang llvm lld
+          sudo apt-get install -y --no-install-recommends build-essential autoconf bison flex perl pkg-config
       - name: Build and package the release executable
         run: |
           ./scripts/victory-proton.sh --build
+          bash scripts/build-proton-wineserver.sh --with-source "$RUNNER_TEMP/indexed-wineserver" "$RUNNER_TEMP/proton-downloads"
           bash scripts/package-proton.sh target/x86_64-pc-windows-gnullvm/release \
-            "$GITHUB_SHA" "$RUNNER_TEMP/distribution"
+            "$GITHUB_SHA" "$RUNNER_TEMP/distribution" "$RUNNER_TEMP/indexed-wineserver"
       - name: Exercise the archive users will download
         id: runtime
         env:
@@ -44,6 +46,8 @@ jobs:
           tar -xf victory-proton-x86_64.tar.gz -C "$RUNNER_TEMP/unpacked"
           cd "$RUNNER_TEMP/unpacked/victory"
           test "$(cat REVISION)" = "$GITHUB_SHA"
+          ./wineserver --version
+          test -s wineserver-source.tar.gz
           test -s wineserver-view-tree.patch
           test -s docs/proton-launcher.md
           ./victory-proton.sh --help

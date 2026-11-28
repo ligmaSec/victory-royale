@@ -3,8 +3,8 @@
 # Package the verified cross-build with only the files shipped by CI.
 set -euo pipefail
 
-if (( $# != 3 )); then
-    echo 'Usage: bash scripts/package-proton.sh RELEASE_DIR REVISION OUTPUT_DIR' >&2
+if (( $# != 4 )); then
+    echo 'Usage: bash scripts/package-proton.sh RELEASE_DIR REVISION OUTPUT_DIR SERVER_BUILD_DIR' >&2
     exit 2
 fi
 
@@ -13,6 +13,7 @@ release=$(realpath -e -- "$1")
 revision=$2
 output_parent=$(realpath -e -- "$(dirname -- "$3")")
 output="${output_parent%/}/$(basename -- "$3")"
+server_build=$(realpath -e -- "$4")
 if [[ ! $revision =~ ^[0-9a-f]{40}$ ]]; then
     echo 'REVISION must be a full Git commit SHA.' >&2
     exit 2
@@ -22,10 +23,11 @@ if [[ $output == "$src" || $output == "$src/"* || -e $output || -L $output ]]; t
     exit 2
 fi
 
-files=(victory.exe victory-proton.sh LICENSE victory.example.toml
-    wineserver-view-tree.patch docs/proton-launcher.md tests/proton-launcher.sh)
+files=(victory.exe victory-proton.sh LICENSE victory.example.toml proton-runner.sh wineserver
+    wineserver-source.tar.gz wineserver-view-tree.patch docs/proton-launcher.md tests/proton-launcher.sh)
 inputs=("$release/victory.exe" "$src/scripts/victory-proton.sh" "$src/LICENSE"
-    "$src/victory.example.toml" "$src/scripts/wineserver-view-tree.patch"
+    "$src/victory.example.toml" "$src/scripts/proton-runner.sh" "$server_build/wineserver"
+    "$server_build/wineserver-source.tar.gz" "$src/scripts/wineserver-view-tree.patch"
     "$src/docs/proton-launcher.md" "$src/tests/proton-launcher.sh")
 for input in "${inputs[@]}"; do
     if [[ ! -f $input || -L $input || $(realpath -e -- "$input") != "$input" ]]; then
@@ -33,6 +35,12 @@ for input in "${inputs[@]}"; do
         exit 1
     fi
 done
+# shellcheck source=scripts/proton-runner.sh
+source "$src/scripts/proton-runner.sh"
+if ! proton_has_view_index "$server_build/wineserver" || [[ ! -s $server_build/wineserver-source.tar.gz ]]; then
+    echo 'Build the indexed wineserver with --with-source before packaging.' >&2
+    exit 1
+fi
 
 python3 - "$release" <<'PYTHON'
 from pathlib import Path
@@ -62,7 +70,7 @@ trap 'rm -rf -- "$work"' EXIT
 install -d -m 755 -- "$work/victory/docs" "$work/victory/tests"
 for i in "${!files[@]}"; do
     mode=644
-    case ${files[i]} in victory.exe|victory-proton.sh) mode=755 ;; esac
+    case ${files[i]} in victory.exe|victory-proton.sh|wineserver) mode=755 ;; esac
     install -m "$mode" -- "${inputs[i]}" "$work/victory/${files[i]}"
 done
 printf '%s\n' "$revision" > "$work/victory/REVISION"

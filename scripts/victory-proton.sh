@@ -17,8 +17,8 @@ Usage: victory-proton.sh --build | --test
 
 With no mode, the launcher forwards the title and options to victory run.
 Use TITLE.exe alone to check imports, or TITLE.exe --execute to launch.
-Play requires PROTONPATH to point to Proton with the indexed wineserver.
-See docs/proton-launcher.md for the patch and setup.
+Play automatically sets up pinned GE-Proton with Royale's indexed wineserver.
+Set PROTONPATH only to use a custom indexed Proton build.
 Set VICTORY_ALLOW_STOCK_WINESERVER=1 only for stock diagnostics.
 HELP
 }
@@ -50,6 +50,9 @@ stage_pinned_runtime() {
 }
 
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck source=scripts/proton-runner.sh
+source "$script_dir/proton-runner.sh"
+
 if [[ ${1:-} == --test ]]; then
     if (( $# != 1 )); then usage >&2; exit 2; fi
     suite="$script_dir/tests/proton-launcher.sh"
@@ -146,15 +149,22 @@ if [[ -n $mode ]]; then
     execute_title=1
 fi
 
+data_home=${XDG_DATA_HOME:-$HOME/.local/share}
+cache_home=${XDG_CACHE_HOME:-$HOME/.cache}
+[[ $data_home == /* ]] || data_home=$HOME/.local/share
+[[ $cache_home == /* ]] || cache_home=$HOME/.cache
 patched_server=
 if (( execute_title )); then
+    if [[ -z ${PROTONPATH:-} && ${VICTORY_ALLOW_STOCK_WINESERVER:-0} != 1 ]]; then
+        PROTONPATH=$(proton_managed_path "$cache_home/victory/proton" "$script_dir")
+        export PROTONPATH
+    fi
     # Inspect the selected server itself, not the Proton version label. The
     # fallback diagnostic survives stripping, including in backported builds.
     proton=${PROTONPATH:-}
     if [[ -n $proton ]] && proton=$(realpath -e -- "$proton" 2>/dev/null) &&
-        [[ -f $proton/proton && -x $proton/proton &&
-           -f $proton/files/bin/wineserver && -x $proton/files/bin/wineserver ]] &&
-        LC_ALL=C grep -aFq -- 'wineserver view tree:' "$proton/files/bin/wineserver"; then
+        [[ -f $proton/proton && -x $proton/proton ]] &&
+        proton_has_view_index "$proton/files/bin/wineserver"; then
         export PROTONPATH=$proton
         unset WINESERVER
         patched_server=$proton/files/bin/wineserver
@@ -162,8 +172,8 @@ if (( execute_title )); then
     elif [[ ${VICTORY_ALLOW_STOCK_WINESERVER:-0} == 1 ]]; then
         echo 'Warning: the indexed wineserver was not verified; stock diagnostics only.' >&2
     else
-        echo 'Linux play requires the indexed wineserver. Set PROTONPATH to the patched Proton directory.' >&2
-        echo 'See docs/proton-launcher.md. For stock diagnostics only, set VICTORY_ALLOW_STOCK_WINESERVER=1.' >&2
+        echo 'The requested PROTONPATH does not have the indexed wineserver.' >&2
+        echo 'Unset PROTONPATH to install the managed runner, or set VICTORY_ALLOW_STOCK_WINESERVER=1 for diagnostics.' >&2
         exit 1
     fi
 fi
@@ -171,10 +181,6 @@ fi
 # Hand Proton Windows paths on its standard Z: drive. A Windows executable
 # path also lets UMU-Proton attach this CLI to the calling terminal.
 export GAMEID=${GAMEID:-umu-victory}
-data_home=${XDG_DATA_HOME:-$HOME/.local/share}
-cache_home=${XDG_CACHE_HOME:-$HOME/.cache}
-[[ $data_home == /* ]] || data_home=$HOME/.local/share
-[[ $cache_home == /* ]] || cache_home=$HOME/.cache
 export WINEPREFIX=${WINEPREFIX:-$data_home/victory/proton}
 # Both translation layers otherwise write derived data to the working directory.
 export VKD3D_SHADER_CACHE_PATH=${VKD3D_SHADER_CACHE_PATH:-$cache_home/victory/vkd3d}

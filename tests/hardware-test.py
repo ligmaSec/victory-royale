@@ -260,6 +260,24 @@ class HardwareRequest(unittest.TestCase):
         self.assertEqual(args[:6], ["gh", "run", "download", "12", "-R", "github.com/" + runner.REPO])
         shutil.copy(self.package, Path(args[-1]) / runner.PACKAGE)
 
+    def test_managed_runner_files_are_installed_with_the_build(self):
+        with tarfile.open(self.package, "w:gz") as bundle:
+            for name, data in (("REVISION", self.revision.encode()), ("LICENSE", b"license"),
+                               ("victory.exe", b"fixture"), ("victory-proton.sh", b"launcher"),
+                               ("proton-runner.sh", b"runner helper"), ("wineserver", b"native server")):
+                member = tarfile.TarInfo("victory/" + name)
+                member.size = len(data)
+                bundle.addfile(member, io.BytesIO(data))
+        self.build["sha256"] = hashlib.sha256(self.package.read_bytes()).hexdigest()
+        self.request["main"] = self.build.copy()
+        shutil.copy(self.package, self.packages / (self.build["sha256"] + ".tar.gz"))
+        folder = self.root / "main"
+        runner.stage_build(self.request, "main", folder, self.packages)
+        self.assertEqual((folder / "proton-runner.sh").read_bytes(), b"runner helper")
+        self.assertEqual((folder / "wineserver").read_bytes(), b"native server")
+        if os.name != "nt":
+            self.assertTrue(os.access(folder / "wineserver", os.X_OK))
+
     def test_bundled_build_offline(self):
         shutil.copy(self.package, self.packages / (self.build["sha256"] + ".tar.gz"))
         with mock.patch.object(subprocess, "run", side_effect=AssertionError), \

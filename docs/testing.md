@@ -50,8 +50,8 @@ for historical runner benchmarks and startup issues. They do not replace the
 acceptance checks for the revision under test.
 
 Download the artifact from the CI run and unzip the Actions download. On Linux,
-set `PROTONPATH` to the [patched Proton build](proton-launcher.md#patched-wineserver)
-before running the title. Run these commands in the extracted directory.
+run these commands in the extracted directory. Leave `PROTONPATH` unset for
+[automatic Proton setup](proton-launcher.md#patched-wineserver).
 
 ```sh
 sha256sum --check SHA256SUMS
@@ -81,9 +81,10 @@ You'll need Python 3.9 or newer and your own title executable outside the VIctor
 > credentials and output from the game. Review the filtered report before sharing.
 > Keeping all results local is always an option.
 
-On Linux, install Bash and UMU (`umu-run`). Export `PROTONPATH` with the same
-[patched Proton build](proton-launcher.md#patched-wineserver) for both sides.
-The Proton launcher may download its pinned vkd3d-proton libraries on first use.
+On Linux, install Bash and UMU (`umu-run`). New packages set up the indexed
+runner and the pinned vkd3d-proton libraries on first use. For A/B against an
+older package without automatic setup, export `PROTONPATH` pointing to the
+same [indexed Proton runner](proton-launcher.md#patched-wineserver) for both.
 
 | Start here | Linux/Proton | Windows (PowerShell) |
 | --- | --- | --- |
@@ -171,7 +172,7 @@ Use `--local` to run already extracted builds without selecting a hardware
 request, opening the report editor, or uploading results. Use verified packages
 with `victory.exe`, `REVISION` and, on Linux, `victory-proton.sh` in each `--build`
 directory. Run from the checkout with Python 3.9 or later. On Linux the packaged
-launcher needs Bash, UMU and the same `PROTONPATH` for all builds as above.
+launcher needs Bash and UMU as above. Use the same runner for comparisons.
 Keep the title, report destination and
 system temporary directory outside the checkout; put the results and temporary
 files outside the title, build and source-save directories as well.

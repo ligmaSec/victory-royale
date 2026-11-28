@@ -121,12 +121,17 @@ def stage_build(request, side, folder, packages):
         raise ValueError(f"{side} package checksum differs from the request.")
     # Copy known distribution members only. Never unpack arbitrary paths or links.
     with tarfile.open(archive, "r:gz") as bundle:
-        for name in ("victory.exe", "victory-proton.sh", "REVISION", "LICENSE"):
+        names = ["victory.exe", "victory-proton.sh", "REVISION", "LICENSE"]
+        if {"victory/proton-runner.sh", "victory/wineserver"}.intersection(bundle.getnames()):
+            names.extend(("proton-runner.sh", "wineserver"))
+        for name in names:
             member = bundle.getmember("victory/" + name)
             if not member.isfile():
                 raise ValueError(f"Unexpected {side} package member: {name}")
             with (folder / name).open("wb") as out:
                 shutil.copyfileobj(bundle.extractfile(member), out)
+            if name == "wineserver":
+                (folder / name).chmod(0o755)
     if (folder / "REVISION").read_text().strip() != build["revision"]:
         raise ValueError(f"{side} package contains a different revision.")
 
