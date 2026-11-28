@@ -481,6 +481,10 @@ Without a registry, no per-module role override is applied. Do not commit or
 upload the registry. Its purpose is to compare renderer variants, not to
 replace a clean run of the package without local overrides.
 
+The Proton package embeds the host-owned indirect-light helpers. Those
+helpers do not need a separately installed shader compiler when testing a
+locally configured ambient workaround.
+
 ## Tests that skip or are ignored
 
 * **Differential shader tests** (`victory-shader/src/emit/diff_tests.rs`)

@@ -32,6 +32,25 @@ pub(crate) fn compile_stage(
     compile_runtime(name, source, entry, profile, root, bundled)
 }
 
+pub(crate) fn compile_ambient(
+    define: &str,
+    entry: &CStr,
+) -> windows::core::Result<Cow<'static, [u8]>> {
+    const SOURCE: &str = include_str!("../shaders/ambient.hlsl");
+    #[cfg(victory_bundled_hlsl)]
+    let bundled = bundled_shader(SOURCE, entry.to_bytes(), b"cs_5_1", 0);
+    #[cfg(not(victory_bundled_hlsl))]
+    let bundled = None;
+    compile_runtime(
+        "indirect light stand-in",
+        &format!("#define {define}\n{SOURCE}"),
+        entry,
+        c"cs_5_1",
+        true,
+        bundled,
+    )
+}
+
 pub(crate) fn compile_clamp(
     source: &str,
     width: u32,

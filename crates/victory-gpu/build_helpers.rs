@@ -11,10 +11,32 @@ struct Helper {
     stage: &'static str,
     root: bool,
     variant: u8,
-    defines: Option<(&'static str, &'static str)>,
+    defines: &'static [&'static str],
+}
+
+const fn ambient(
+    id: &'static str,
+    entry: &'static str,
+    defines: &'static [&'static str],
+) -> Helper {
+    Helper {
+        file: "ambient",
+        id,
+        entry,
+        stage: "cs",
+        root: true,
+        variant: 0,
+        defines,
+    }
 }
 
 const HELPERS: &[Helper] = &[
+    ambient("ambient_keep", "keep", &["KEEP"]),
+    ambient("ambient_mean", "mean", &["KEEP"]),
+    ambient("ambient_place", "place", &["PLACE"]),
+    ambient("ambient_gather", "gather", &["GATHER"]),
+    ambient("ambient_raise", "raise", &["RAISE"]),
+    ambient("ambient_air", "clear_air", &["AIR"]),
     Helper {
         file: "plane_corners",
         id: "plane_corners",
@@ -22,7 +44,7 @@ const HELPERS: &[Helper] = &[
         stage: "vs",
         root: false,
         variant: 0,
-        defines: None,
+        defines: &[],
     },
     Helper {
         file: "plane_steps",
@@ -31,7 +53,7 @@ const HELPERS: &[Helper] = &[
         stage: "ps",
         root: true,
         variant: 0,
-        defines: None,
+        defines: &[],
     },
     Helper {
         file: "plane_floats",
@@ -40,7 +62,7 @@ const HELPERS: &[Helper] = &[
         stage: "ps",
         root: true,
         variant: 0,
-        defines: None,
+        defines: &[],
     },
     Helper {
         file: "card_compare",
@@ -49,7 +71,7 @@ const HELPERS: &[Helper] = &[
         stage: "cs",
         root: true,
         variant: 0,
-        defines: None,
+        defines: &[],
     },
     Helper {
         file: "compose",
@@ -58,7 +80,7 @@ const HELPERS: &[Helper] = &[
         stage: "vs",
         root: false,
         variant: 0,
-        defines: None,
+        defines: &[],
     },
     Helper {
         file: "compose",
@@ -67,7 +89,7 @@ const HELPERS: &[Helper] = &[
         stage: "ps",
         root: false,
         variant: 0,
-        defines: None,
+        defines: &[],
     },
     Helper {
         file: "inplace_probe",
@@ -76,7 +98,7 @@ const HELPERS: &[Helper] = &[
         stage: "cs",
         root: true,
         variant: 0,
-        defines: None,
+        defines: &[],
     },
     Helper {
         file: "dirty_page_count",
@@ -85,7 +107,7 @@ const HELPERS: &[Helper] = &[
         stage: "cs",
         root: true,
         variant: 0,
-        defines: None,
+        defines: &[],
     },
     Helper {
         file: "card_gather",
@@ -94,7 +116,7 @@ const HELPERS: &[Helper] = &[
         stage: "cs",
         root: true,
         variant: 0,
-        defines: None,
+        defines: &[],
     },
     Helper {
         file: "card_scatter",
@@ -103,7 +125,7 @@ const HELPERS: &[Helper] = &[
         stage: "cs",
         root: true,
         variant: 0,
-        defines: None,
+        defines: &[],
     },
     Helper {
         file: "upload_check",
@@ -112,7 +134,7 @@ const HELPERS: &[Helper] = &[
         stage: "cs",
         root: true,
         variant: 0,
-        defines: None,
+        defines: &[],
     },
     Helper {
         file: "indirect_clamp",
@@ -121,7 +143,7 @@ const HELPERS: &[Helper] = &[
         stage: "cs",
         root: false,
         variant: 1,
-        defines: Some(("WIDEST=65535u", "REST=0")),
+        defines: &["WIDEST=65535u", "REST=0"],
     },
     Helper {
         file: "indirect_clamp",
@@ -130,7 +152,7 @@ const HELPERS: &[Helper] = &[
         stage: "cs",
         root: false,
         variant: 2,
-        defines: Some(("WIDEST=65535u", "REST=1")),
+        defines: &["WIDEST=65535u", "REST=1"],
     },
     Helper {
         file: "indirect_clamp",
@@ -139,7 +161,7 @@ const HELPERS: &[Helper] = &[
         stage: "cs",
         root: false,
         variant: 3,
-        defines: Some(("WIDEST=1048576u", "REST=0")),
+        defines: &["WIDEST=1048576u", "REST=0"],
     },
     Helper {
         file: "indirect_clamp",
@@ -148,7 +170,7 @@ const HELPERS: &[Helper] = &[
         stage: "cs",
         root: false,
         variant: 4,
-        defines: Some(("WIDEST=1048576u", "REST=1")),
+        defines: &["WIDEST=1048576u", "REST=1"],
     },
     Helper {
         file: "indirect_batch",
@@ -157,7 +179,7 @@ const HELPERS: &[Helper] = &[
         stage: "cs",
         root: false,
         variant: 1,
-        defines: Some(("WIDEST=65535u", "REST=0")),
+        defines: &["WIDEST=65535u", "REST=0"],
     },
     Helper {
         file: "indirect_batch",
@@ -166,7 +188,7 @@ const HELPERS: &[Helper] = &[
         stage: "cs",
         root: false,
         variant: 2,
-        defines: Some(("WIDEST=65535u", "REST=1")),
+        defines: &["WIDEST=65535u", "REST=1"],
     },
     Helper {
         file: "indirect_batch",
@@ -175,7 +197,7 @@ const HELPERS: &[Helper] = &[
         stage: "cs",
         root: false,
         variant: 3,
-        defines: Some(("WIDEST=1048576u", "REST=0")),
+        defines: &["WIDEST=1048576u", "REST=0"],
     },
     Helper {
         file: "indirect_batch",
@@ -184,7 +206,7 @@ const HELPERS: &[Helper] = &[
         stage: "cs",
         root: false,
         variant: 4,
-        defines: Some(("WIDEST=1048576u", "REST=1")),
+        defines: &["WIDEST=1048576u", "REST=1"],
     },
 ];
 
@@ -223,8 +245,8 @@ pub fn bundle() {
         println!("cargo:rerun-if-changed={source}");
         let mut command = Command::new(&compiler);
         command.args(["-T", &format!("{stage}_6_0"), "-E", entry, "-O3"]);
-        if let Some((width, rest)) = defines {
-            command.args(["-D", width, "-D", rest]);
+        for &define in defines {
+            command.args(["-D", define]);
         }
         let status = command
             .arg("-Fo")
