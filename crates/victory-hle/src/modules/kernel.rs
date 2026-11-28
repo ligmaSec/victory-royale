@@ -415,6 +415,7 @@ pub extern "C" fn __p___argv() -> *mut *mut *mut c_char {
 /// host's scheduler took pity, and the loading that waits for it with it
 /// (run stream-3: loads seen to be done 1.1 s late on average, 4.8 s at
 /// worst). `VICTORY_TITLE_PRIORITIES=0`: as the title sets them.
+#[cfg(any(windows, test))]
 fn title_priority(asked: i32) -> i32 {
     const IDLE: i32 = -15;
     const LOWEST: i32 = -2;
@@ -426,6 +427,7 @@ fn title_priority(asked: i32) -> i32 {
 }
 
 /// [`title_priority`].
+#[cfg(windows)]
 pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
     static AS_SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let as_set = *AS_SET
@@ -473,6 +475,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            #[cfg(windows)]
             hle_export!(SetThreadPriority),
         ],
     }
@@ -697,16 +700,19 @@ mod tests {
             .map(title_priority)
             .collect();
         assert_eq!(given, [-1, -1, -1, 0, 1, 2, 15]);
-        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
-        std::thread::spawn(|| {
-            // SAFETY: plain calls on this thread.
-            let thread = unsafe { GetCurrentThread() };
-            assert_eq!(SetThreadPriority(thread, -15), 1);
-            // SAFETY: as above.
-            assert_eq!(unsafe { GetThreadPriority(thread) }, -1);
-        })
-        .join()
-        .unwrap();
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+            std::thread::spawn(|| {
+                // SAFETY: plain calls on this thread.
+                let thread = unsafe { GetCurrentThread() };
+                assert_eq!(SetThreadPriority(thread, -15), 1);
+                // SAFETY: as above.
+                assert_eq!(unsafe { GetThreadPriority(thread) }, -1);
+            })
+            .join()
+            .unwrap();
+        }
     }
 
     #[test]

@@ -20,7 +20,9 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::mem::offset_of;
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(windows)]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 #[cfg(any(feature = "diagnostics", test))]
 use crate::object::E_NOTIMPL;

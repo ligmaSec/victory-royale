@@ -6088,9 +6088,11 @@ mod shared_table_tests {
             heap.start,
         );
         let plan = TablePlan::new(&[cbv(0, 0)], &[]);
-        let mut state = State::default();
-        state.heaps = [title.0 as usize, 0];
-        state.graphics = vec![Root::Table(heap.start)];
+        let mut state = State {
+            heaps: [title.0 as usize, 0],
+            graphics: vec![Root::Table(heap.start)],
+            ..Default::default()
+        };
 
         let before_cut = host.new_list().unwrap();
         let a = state.tables(&before_cut, &plan, false)[0].1;
@@ -6147,15 +6149,19 @@ mod shared_table_tests {
         }
         let vs = TablePlan::new(&[cbv(0, 5)], &[]);
         let ps = TablePlan::new(&[cbv(0, 127)], &[]);
-        let mut state = State::default();
-        state.heaps = [title.0 as usize, 0];
-        state.graphics = vec![Root::Table(heap.start + 128 * 32)];
+        let mut state = State {
+            heaps: [title.0 as usize, 0],
+            graphics: vec![Root::Table(heap.start + 128 * 32)],
+            ..Default::default()
+        };
         // Establish the old separate-allocation failure without dispatching it.
         {
             let list = host.new_list().unwrap();
-            let mut separate = State::default();
-            separate.heaps = state.heaps;
-            separate.graphics = state.graphics.clone();
+            let mut separate = State {
+                heaps: state.heaps,
+                graphics: state.graphics.clone(),
+                ..Default::default()
+            };
             assert_ne!(separate.tables(&list, &vs, false)[0].1, u32::MAX);
             assert_eq!(separate.tables(&list, &ps, false)[0].1, u32::MAX);
         }

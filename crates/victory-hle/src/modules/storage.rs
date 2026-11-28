@@ -194,25 +194,33 @@ mod tests {
             ..Default::default()
         });
 
-        // The path is a drive root, never the host folder.
+        let path_size = method::<Size>(&OBJECT, 0x18);
         let mut size = 0;
-        assert_eq!(method::<Size>(&OBJECT, 0x18)(this, &mut size), S_OK);
-        assert_eq!(size, 4, "X:\\ and its NUL");
         let (mut buffer, mut used) = ([0u8; 4], 0);
         let get = method::<Get>(&OBJECT, 0x20);
-        assert_eq!(get(this, 4, buffer.as_mut_ptr(), &mut used), S_OK);
-        assert_eq!(get(this, 3, buffer.as_mut_ptr(), &mut used), E_FAIL);
-        let drive = std::str::from_utf8(&buffer[..3]).unwrap();
-        assert!(drive.ends_with(":\\"), "{drive}");
-        // Title file calls on it reach the folder.
-        let path = format!("{drive}save.dat\0");
-        let mut attributes = [0u8; 36];
-        let get_attributes = super::super::files::GetFileAttributesExW;
-        let wide: Vec<u16> = path.encode_utf16().collect();
-        assert_ne!(
-            get_attributes(wide.as_ptr(), 0, attributes.as_mut_ptr().cast()),
-            0
-        );
+        #[cfg(not(windows))]
+        {
+            assert_eq!(path_size(this, &mut size), NOT_SUPPORTED);
+            assert_eq!(get(this, 4, buffer.as_mut_ptr(), &mut used), NOT_SUPPORTED);
+        }
+        // On Windows the title's file calls reach a drive root over the folder.
+        #[cfg(windows)]
+        {
+            assert_eq!(path_size(this, &mut size), S_OK);
+            assert_eq!(size, 4, "X:\\ and its NUL");
+            assert_eq!(get(this, 4, buffer.as_mut_ptr(), &mut used), S_OK);
+            assert_eq!(get(this, 3, buffer.as_mut_ptr(), &mut used), E_FAIL);
+            let drive = std::str::from_utf8(&buffer[..3]).unwrap();
+            assert!(drive.ends_with(":\\"), "{drive}");
+            let path = format!("{drive}save.dat\0");
+            let mut attributes = [0u8; 36];
+            let get_attributes = super::super::files::GetFileAttributesExW;
+            let wide: Vec<u16> = path.encode_utf16().collect();
+            assert_ne!(
+                get_attributes(wide.as_ptr(), 0, attributes.as_mut_ptr().cast()),
+                0
+            );
+        }
 
         let mut info = SpaceInfo {
             available_free: 0,

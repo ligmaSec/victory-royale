@@ -1264,7 +1264,6 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
-    use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
 
@@ -1436,7 +1435,6 @@ mod tests {
         }
     }
     use super::container::SigElement;
-    use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
 
@@ -1863,6 +1861,9 @@ mod tests {
     /// A pixel shader writing a constant colour.
     #[cfg(windows)]
     fn constant_color() -> Vec<u8> {
+        use super::bitcode::Attr;
+        use super::shader::Shader;
+
         let mut s = Shader::new(true);
         s.outputs.push(SigElement {
             name: "SV_Target".into(),
@@ -1948,6 +1949,7 @@ mod tests {
     }
 
     /// A pixel program of `words` with no user data.
+    #[cfg(windows)]
     fn emit_native(words: &[u32], input_addr: u32) -> NativeProgram {
         NativeProgram {
             stage: HwStage::Ps,
@@ -2194,9 +2196,12 @@ mod tests {
             TRIANGLE | EDGE_FLAGS | CULL,
         ] {
             let ms = triangle_mesh(prim).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            let module = Container::parse(&ms.dxil).unwrap();
+            assert!(module.part(FourCC::DXIL).is_some());
             #[cfg(windows)]
             if let Some(v) = validator.as_mut() {
-                v.validate(&mut ms.dxil.clone())
+                let mut dxil = ms.dxil;
+                v.validate(&mut dxil)
                     .unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
             }
         }
@@ -2842,6 +2847,9 @@ mod tests {
             mesh_stride: 0,
         })
         .unwrap();
+        let module = Container::parse(&l.dxil).unwrap();
+        assert!(module.part(FourCC::DXIL).is_some());
+        #[cfg(windows)]
         let mut dxil = l.dxil;
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
