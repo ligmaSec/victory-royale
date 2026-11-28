@@ -481,6 +481,11 @@ last stable staged pixels and retry rather than block the submitting thread.
 First fills and exact refreshes still wait for a stable mapping. For a
 matched blocking-path diagnostic, set `VICTORY_TEXTURE_NO_WAIT=0`.
 
+Small transient descriptor tables share a chunk within one command-list
+recording, so finishing that list frees a contiguous range. Closing it
+returns only the unused tail; submitted descriptors remain live until GPU
+completion. Near capacity, new allocations request only the needed slots.
+
 For donor parity diagnostics, `VICTORY_SHADER_ROLES` can point to a private
 text file outside the checkout. Each nonempty line maps a full BLAKE3 shader
 container ID to one role, with whitespace between them and an optional `#`

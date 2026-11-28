@@ -758,9 +758,10 @@ extern "system" fn list_type(this: This) -> u32 {
 extern "system" fn close(this: This) -> HRESULT {
     let _called = crate::timeline::span("the title's Close");
     #[cfg(windows)]
-    if let Some(host) = host_list(this) {
+    with_state(this, |host, state| {
         host.close();
-    }
+        state.seal_tables();
+    });
     S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {

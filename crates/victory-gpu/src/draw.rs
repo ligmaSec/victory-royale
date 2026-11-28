@@ -604,6 +604,8 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// Unassigned slots at the end of the last dynamic reservation.
+    dynamic_spare: u32,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -626,7 +628,52 @@ impl Drop for State {
     }
 }
 
+const TABLE_CHUNK: u32 = 64;
+
 impl State {
+    /// Packs small tables of the same recording together, so interleaved
+    /// recordings don't leave isolated slots when one list finishes first.
+    fn take_dynamic(
+        &mut self,
+        heap: usize,
+        host: &crate::descriptor::host::HostHeap,
+        n: u32,
+    ) -> Option<u32> {
+        if self.dynamic_spare >= n
+            && let Some(&(owner, first, count)) = self.dynamic.last()
+            && owner == heap
+        {
+            let start = first + count - self.dynamic_spare;
+            self.dynamic_spare -= n;
+            return Some(start);
+        }
+        self.seal_tables();
+        if n <= TABLE_CHUNK / 2
+            && let Some(first) = host.reserve_dynamic(TABLE_CHUNK)
+        {
+            self.dynamic.push((heap, first, TABLE_CHUNK));
+            self.dynamic_spare = TABLE_CHUNK - n;
+            return Some(first);
+        }
+        let first = host.dynamic(n).or_else(|| {
+            crate::host::settle_for_fence();
+            host.dynamic(n)
+        })?;
+        self.dynamic.push((heap, first, n));
+        Some(first)
+    }
+
+    /// Releases only the unused tail. Recorded descriptors remain reserved
+    /// until all the parts of this recording have run or been discarded.
+    pub(crate) fn seal_tables(&mut self) {
+        let spare = std::mem::take(&mut self.dynamic_spare);
+        if spare != 0 {
+            let (heap, first, count) = self.dynamic.last_mut().expect("reserved descriptor tail");
+            *count -= spare;
+            crate::descriptor::release_dynamic(*heap, *first + *count, spare);
+        }
+    }
+
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
@@ -647,6 +694,7 @@ impl State {
         for (heap, first, n) in self.dynamic.drain(..) {
             crate::descriptor::release_dynamic(heap, first, n);
         }
+        self.dynamic_spare = 0;
         self.fresh_tables.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
@@ -2252,12 +2300,14 @@ impl State {
             }
             Some(s)
         };
+        #[cfg(feature = "diagnostics")]
+        let pipeline = self.pipeline;
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
                 #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(a, len, self.pipeline);
+                crate::host::wide_write(a, len, pipeline);
                 s.gpu_writes(list, a, len);
             }
         };
@@ -2294,13 +2344,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
+                let Some(index) = self.take_dynamic(key.0, host, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -2373,13 +2419,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
+                let Some(index) = self.take_dynamic(key.0, host, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -4412,10 +4454,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n).or_else(|| {
-                crate::host::settle_for_fence();
-                host.dynamic(n)
-            }) else {
+            let Some(first) = self.take_dynamic(std::ptr::from_ref(heap) as usize, host, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
@@ -4429,8 +4468,6 @@ impl State {
                     ready: Vec::new(),
                 },
             );
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap
@@ -5823,6 +5860,84 @@ mod record_hash_tests {
 mod shared_table_tests {
     use super::*;
 
+    struct TitleHeap(This);
+
+    impl Drop for TitleHeap {
+        fn drop(&mut self) {
+            crate::object::release(self.0);
+        }
+    }
+
+    fn title_heap(count: u32) -> TitleHeap {
+        let mut title: This = std::ptr::null_mut();
+        let desc = [0u32, count, 1, 0, 0, 0, 0, 0];
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null_mut(),
+                desc.as_ptr().cast(),
+                &iid,
+                &mut title,
+            ),
+            0
+        );
+        TitleHeap(title)
+    }
+
+    #[test]
+    fn retiring_an_interleaved_recording_leaves_a_contiguous_table() {
+        let title = title_heap(4);
+        let heap = crate::descriptor::heap(title.0).host().unwrap();
+        let ballast = heap.dynamic_capacity() - 2 * TABLE_CHUNK;
+        let mut first = State::default();
+        let mut second = State::default();
+        let owner = title.0 as usize;
+        let mut second_views = [0; TABLE_CHUNK as usize / 2];
+        for index in &mut second_views {
+            first.take_dynamic(owner, heap, 2).unwrap();
+            *index = second.take_dynamic(owner, heap, 2).unwrap();
+        }
+        let held = heap.dynamic(ballast).unwrap();
+        first.tables_done();
+        let n = 29;
+        let table = heap
+            .dynamic(n)
+            .expect("the completed list left a usable range");
+        assert!(
+            second_views
+                .iter()
+                .all(|&index| index + 2 <= table || table + n <= index),
+            "reusing the freed range must not overwrite a live list"
+        );
+        heap.release(table, n);
+        second.tables_done();
+        heap.release(held, ballast);
+        assert!(heap.dynamic(heap.dynamic_capacity()).is_some());
+    }
+
+    #[test]
+    fn closing_a_recording_returns_only_unassigned_slots() {
+        let title = title_heap(4);
+        let heap = crate::descriptor::heap(title.0).host().unwrap();
+        let mut state = State::default();
+        let n = 4;
+        let live = state.take_dynamic(title.0 as usize, heap, n).unwrap();
+        let rest = heap.dynamic_capacity() - n;
+        assert_eq!(heap.dynamic(rest), None);
+        state.seal_tables();
+        let borrowed = heap.dynamic(rest).expect("close returned the unused tail");
+        assert!(borrowed >= live + n || borrowed + rest <= live);
+        assert_eq!(heap.dynamic(1), None);
+        heap.release(borrowed, rest);
+        state.tables_done();
+        assert!(heap.dynamic(heap.dynamic_capacity()).is_some());
+    }
+
     fn cbv(slot: u8, descriptor: u32) -> UsedResource {
         UsedResource {
             kind: ResourceType::Cbv,
@@ -5842,31 +5957,8 @@ mod shared_table_tests {
     #[test]
     fn stages_share_a_snapshot_under_descriptor_pressure() {
         let host = crate::host::host().expect("D3D12 device required for this regression");
-        let mut title: This = std::ptr::null_mut();
-        let desc = [0u32, 128, 1, 0, 0, 0, 0, 0];
-        let iid = crate::object::guid(
-            0x8efb471d,
-            0x616c,
-            0x4f49,
-            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
-        );
-        assert_eq!(
-            crate::descriptor::create_heap(
-                std::ptr::null_mut(),
-                desc.as_ptr().cast(),
-                &iid,
-                &mut title
-            ),
-            0
-        );
-        struct Title(This);
-        impl Drop for Title {
-            fn drop(&mut self) {
-                crate::object::release(self.0);
-            }
-        }
-        let _title = Title(title);
-        let heap = crate::descriptor::heap(title);
+        let title = title_heap(128);
+        let heap = crate::descriptor::heap(title.0);
         let h = heap.host().unwrap();
         let reserved = h.dynamic_capacity() - 130;
         let first = h.dynamic(reserved).unwrap();
@@ -5892,7 +5984,7 @@ mod shared_table_tests {
         let vs = TablePlan::new(&[cbv(0, 5)], &[]);
         let ps = TablePlan::new(&[cbv(0, 127)], &[]);
         let mut state = State::default();
-        state.heaps = [title as usize, 0];
+        state.heaps = [title.0 as usize, 0];
         state.graphics = vec![Root::Table(heap.start)];
         // Establish the old separate-allocation failure without dispatching it.
         {

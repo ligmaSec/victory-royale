@@ -1904,6 +1904,24 @@ impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
+        self.take_dynamic(n, false)
+    }
+
+    /// Reserves a recording-local chunk only while the heap has headroom.
+    /// An unsuccessful reservation is not a failed table allocation.
+    pub(crate) fn reserve_dynamic(&self, n: u32) -> Option<u32> {
+        if self
+            .free
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(n)
+            < self.dynamic / 8
+        {
+            return None;
+        }
+        self.take_dynamic(n, true)
+    }
+
+    fn take_dynamic(&self, n: u32, reserve: bool) -> Option<u32> {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
@@ -1913,8 +1931,11 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
-        let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
-            && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
+        let free = self.free.load(std::sync::atomic::Ordering::Relaxed);
+        if reserve && free.saturating_sub(n) < self.dynamic / 8 {
+            return None;
+        }
+        let enough = free >= n && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
         // Search from `next` on, then from the start (extending past cursor by
         // n - 1 so contiguous runs crossing the cursor are not missed).
@@ -1941,6 +1962,9 @@ impl HostHeap {
             if enough {
                 self.too_long
                     .fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
+            }
+            if reserve {
+                return None;
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
