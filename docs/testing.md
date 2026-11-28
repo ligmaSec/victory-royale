@@ -45,6 +45,9 @@ days. The latter contains the revision GitHub tested with the base branch.
 For a requested comparison, use the [interactive hardware test](#run-a-hardware-test)
 to get both matched builds. For a single run, Windows testers can launch the extracted
 `victory.exe` with the [usual Windows launch command](../README.md#getting-started).
+See the [Wine and Proton measurements](proton-launcher.md#wine-and-proton-performance)
+for historical runner benchmarks and startup issues. They do not replace the
+acceptance checks for the revision under test.
 
 Download the artifact from the CI run and unzip the Actions download. On Linux,
 set `PROTONPATH` to the [patched Proton build](proton-launcher.md#patched-wineserver)

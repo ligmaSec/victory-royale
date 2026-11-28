@@ -122,9 +122,8 @@ to the standard directories under `$HOME`.
 Normal play (`--run`, `--report` and `TITLE.exe --execute`) requires a
 Proton build with an indexed `wineserver`. The title streams tens of thousands
 of memory views; the patch indexes addresses instead of scanning the view list
-on each map and unmap. The [7900 XT fork's GE-Proton11-14 comparison](https://github.com/kroeeee-eeee/VIctory-Linux-Proton-Wine-7900XT-XTX/tree/a14cfcbfce092444488112262fb222c16fe87ea9/linux/wineserver)
-reported about 8.3 → 17.7 FPS from the server swap. That is not a Royale
-benchmark.
+on each map and unmap. See the [runner benchmarks](#wine-and-proton-performance)
+for the measured effect and its limits.
 
 Build the server from the **exact prepared Wine sources of your Proton
 build** in its Steam Linux Runtime SDK (or a compatible build environment).
@@ -173,6 +172,64 @@ Import checks do not require the patch. For a stock playback diagnostic, set
 `VICTORY_ALLOW_STOCK_WINESERVER=1` and select a stock `PROTONPATH` (or leave it
 unset for the diagnostic auto-selection). There is no automatic fallback
 from a normal play launch to stock.
+
+## Wine and Proton performance
+
+These are short, controlled walks on one RTX 5090 at native 3840×2160,
+Series X, with the tuned renderer profile and pinned `ec20719` graphics DLLs.
+The Windows package was `REVISION` `77c9125f92f621a97aa87f5c5e4360e47b244e4e`.
+Loading frames are excluded. Neither the tuned profile nor its local
+shader-role map is a package default.
+
+### Direct Wine, matched Royale build
+
+The executable, DLLs, starting scene, renderer options, and cache seed were
+held fixed. Both runs used a direct loader/server pair, not UMU.
+
+| Wine runner | Walk FPS | p95 frame time | Worst frame |
+| --- | ---: | ---: | ---: |
+| Wine 11.22 with indexed views | 21.24 | 60 ms | 80 ms |
+| GE-Proton11-14 Wine pair | 11.21 | 220 ms | 430 ms |
+
+The GE run had higher median worker times for write-watch/guard queries
+(52.05 vs 4.7 ms/frame) and remap waits (16.65 vs 0.2 ms/frame). These worker
+totals are not additive elapsed times. [Comparison details in #92](https://github.com/ligmaSec/victory-royale/issues/92#issuecomment-7239498585).
+The whole Wine build changed, so this does not isolate the server patch.
+
+### Packaged launcher through UMU
+
+A separate run matrix used the same package, tuned 4K profile, starting scene,
+cache seed, and graphics DLLs through UMU and Steam Linux Runtime 4. Each
+runner used its release server, without a view-tree replacement. Successful
+walks were roughly eight seconds.
+
+| Proton runner | Walk FPS | p95 frame time | Worst frame | Result |
+| --- | ---: | ---: | ---: | --- |
+| GE-Proton11-14 | 10.71 | 250 ms | 280 ms | World and movement verified |
+| Proton-CachyOS `cachyos-11.0-20261015-slr` | 11.40 | 200 ms | 300 ms | World and movement verified |
+| Proton-Wineland `wineland-11.0-20261127` | 10.82 | 230 ms | 330 ms | World and movement verified |
+| UMU-Proton 11.0-2e | — | — | — | Reached the Player prompt; load failed before control |
+
+UMU-Proton's single load failure was not diagnosed. These runs do not establish
+save compatibility, sustained play, or 30 FPS. Track the performance gap in
+[#92](https://github.com/ligmaSec/victory-royale/issues/92) and other Proton
+builds in [#99](https://github.com/ligmaSec/victory-royale/issues/99) and
+[#100](https://github.com/ligmaSec/victory-royale/issues/100).
+
+### Patch evidence and startup failures
+
+- The [7900 XT fork's server-only GE-Proton11-14 comparison](https://github.com/kroeeee-eeee/VIctory-Linux-Proton-Wine-7900XT-XTX/tree/a14cfcbfce092444488112262fb222c16fe87ea9/linux/wineserver)
+  reported about **8.3 → 17.7 FPS**. The [NVIDIA fork v0.1.2](https://github.com/dfmbrollins/victory-linux-nvidia/blob/v0.1.2/README.md#where-it-stands)
+  reported **about 24 FPS at 1080p** on an RTX 5070 with patched Wine-staging
+  11.22; that was not a server-only A/B. These are other forks' results, not
+  Royale's.
+- An upgrade to Wine 11.23 broke pairing with the server built for 11.22.
+  A client/server protocol mismatch fails before the title runs; changing
+  vkd3d-proton DLLs will not fix it. Use a matched client and server in a
+  private runner rather than downgrading system Wine.
+- Royale has not measured a server-only A/B under Proton. The shipped source
+  patch applies to the pinned GE-Proton11-14 Wine source in a dry run. Other
+  releases may need a rebase and a fresh-prefix, game-free launch check.
 
 ## Capture a workstation run
 
