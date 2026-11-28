@@ -8,6 +8,9 @@ mkdir -p "$work/tools" "$work/build with spaces"
 export HOME="$work" XDG_CACHE_HOME="$work/cache" XDG_DATA_HOME="$work/data"
 export VICTORY_EXE="$work/build with spaces/victory.exe"
 touch "$VICTORY_EXE" "$work/title.exe"
+# This fixture checks vkd3d download and staging without a Wine installation.
+unset PROTONPATH
+export VICTORY_ALLOW_STOCK_WINESERVER=1
 export PATH="$work/tools:$PATH"
 cat > "$work/tools/umu-run" <<'UMU'
 #!/usr/bin/env bash

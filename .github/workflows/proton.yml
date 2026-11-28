@@ -44,6 +44,8 @@ jobs:
           tar -xf victory-proton-x86_64.tar.gz -C "$RUNNER_TEMP/unpacked"
           cd "$RUNNER_TEMP/unpacked/victory"
           test "$(cat REVISION)" = "$GITHUB_SHA"
+          test -s wineserver-view-tree.patch
+          test -s docs/proton-launcher.md
           ./victory-proton.sh --help
           ./victory-proton.sh --test
           bash "$GITHUB_WORKSPACE/tests/proton-pinned-runtime.sh" "$PWD/victory-proton.sh"

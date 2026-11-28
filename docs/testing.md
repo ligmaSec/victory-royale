@@ -47,7 +47,8 @@ to get both matched builds. For a single run, Windows testers can launch the ext
 `victory.exe` with the [usual Windows launch command](../README.md#getting-started).
 
 Download the artifact from the CI run and unzip the Actions download. On Linux,
-run these commands in the extracted directory.
+set `PROTONPATH` to the [patched Proton build](proton-launcher.md#patched-wineserver)
+before running the title. Run these commands in the extracted directory.
 
 ```sh
 sha256sum --check SHA256SUMS
@@ -77,8 +78,9 @@ You'll need Python 3.9 or newer and your own title executable outside the VIctor
 > credentials and output from the game. Review the filtered report before sharing.
 > Keeping all results local is always an option.
 
-On Linux, install Bash and UMU (`umu-run`). The Proton launcher may download its pinned
-runtime on first use.
+On Linux, install Bash and UMU (`umu-run`). Export `PROTONPATH` with the same
+[patched Proton build](proton-launcher.md#patched-wineserver) for both sides.
+The Proton launcher may download its pinned vkd3d-proton libraries on first use.
 
 | Start here | Linux/Proton | Windows (PowerShell) |
 | --- | --- | --- |
@@ -166,7 +168,8 @@ Use `--local` to run already extracted builds without selecting a hardware
 request, opening the report editor, or uploading results. Use verified packages
 with `victory.exe`, `REVISION` and, on Linux, `victory-proton.sh` in each `--build`
 directory. Run from the checkout with Python 3.9 or later. On Linux the packaged
-launcher needs Bash and UMU as above. Keep the title, report destination and
+launcher needs Bash, UMU and the same `PROTONPATH` for all builds as above.
+Keep the title, report destination and
 system temporary directory outside the checkout; put the results and temporary
 files outside the title, build and source-save directories as well.
 If `--output-dir` is omitted, the runner uses the system temporary directory.

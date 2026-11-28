@@ -22,9 +22,11 @@ if [[ $output == "$src" || $output == "$src/"* || -e $output || -L $output ]]; t
     exit 2
 fi
 
-files=(victory.exe victory-proton.sh LICENSE victory.example.toml tests/proton-launcher.sh)
+files=(victory.exe victory-proton.sh LICENSE victory.example.toml
+    wineserver-view-tree.patch docs/proton-launcher.md tests/proton-launcher.sh)
 inputs=("$release/victory.exe" "$src/scripts/victory-proton.sh" "$src/LICENSE"
-    "$src/victory.example.toml" "$src/tests/proton-launcher.sh")
+    "$src/victory.example.toml" "$src/scripts/wineserver-view-tree.patch"
+    "$src/docs/proton-launcher.md" "$src/tests/proton-launcher.sh")
 for input in "${inputs[@]}"; do
     if [[ ! -f $input || -L $input || $(realpath -e -- "$input") != "$input" ]]; then
         printf 'Not a regular, non-symlink package input: %s\n' "$input" >&2
@@ -57,7 +59,7 @@ PYTHON
 
 work=$(mktemp -d -- "$output_parent/.victory-proton.XXXXXXXX")
 trap 'rm -rf -- "$work"' EXIT
-install -d -m 755 -- "$work/victory" "$work/victory/tests"
+install -d -m 755 -- "$work/victory/docs" "$work/victory/tests"
 for i in "${!files[@]}"; do
     mode=644
     case ${files[i]} in victory.exe|victory-proton.sh) mode=755 ;; esac

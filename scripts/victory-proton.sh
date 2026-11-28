@@ -17,6 +17,9 @@ Usage: victory-proton.sh --build | --test
 
 With no mode, the launcher forwards the title and options to victory run.
 Use TITLE.exe alone to check imports, or TITLE.exe --execute to launch.
+Play requires PROTONPATH to point to Proton with the indexed wineserver.
+See docs/proton-launcher.md for the patch and setup.
+Set VICTORY_ALLOW_STOCK_WINESERVER=1 only for stock diagnostics.
 HELP
 }
 
@@ -132,15 +135,37 @@ fi
 binary=$(realpath -- "$binary")
 title=$(realpath -- "$1")
 shift
+execute_title=0
+for arg in "$@"; do
+    [[ $arg != -- ]] || break
+    if [[ $arg == --execute ]]; then execute_title=1; break; fi
+done
 if [[ -n $mode ]]; then
     runtime=${runtime:-pinned}
-    # Accept an existing --execute, including invocations migrated from the old syntax.
-    execute=(--execute)
-    for arg in "$@"; do
-        [[ $arg != -- ]] || break
-        if [[ $arg == --execute ]]; then execute=(); break; fi
-    done
-    set -- "${execute[@]}" "$@"
+    if (( ! execute_title )); then set -- --execute "$@"; fi
+    execute_title=1
+fi
+
+patched_server=
+if (( execute_title )); then
+    # Inspect the selected server itself, not the Proton version label. The
+    # fallback diagnostic survives stripping, including in backported builds.
+    proton=${PROTONPATH:-}
+    if [[ -n $proton ]] && proton=$(realpath -e -- "$proton" 2>/dev/null) &&
+        [[ -f $proton/proton && -x $proton/proton &&
+           -f $proton/files/bin/wineserver && -x $proton/files/bin/wineserver ]] &&
+        LC_ALL=C grep -aFq -- 'wineserver view tree:' "$proton/files/bin/wineserver"; then
+        export PROTONPATH=$proton
+        unset WINESERVER
+        patched_server=$proton/files/bin/wineserver
+        echo 'Using Proton with the indexed wineserver.' >&2
+    elif [[ ${VICTORY_ALLOW_STOCK_WINESERVER:-0} == 1 ]]; then
+        echo 'Warning: the indexed wineserver was not verified; stock diagnostics only.' >&2
+    else
+        echo 'Linux play requires the indexed wineserver. Set PROTONPATH to the patched Proton directory.' >&2
+        echo 'See docs/proton-launcher.md. For stock diagnostics only, set VICTORY_ALLOW_STOCK_WINESERVER=1.' >&2
+        exit 1
+    fi
 fi
 
 # Hand Proton Windows paths on its standard Z: drive. A Windows executable
@@ -283,6 +308,12 @@ export WINEDEBUG=${WINEDEBUG:--all,+timestamp,+pid,+tid,+seh}
     sha256sum -- "${binary##*/}"
     printf 'runtime=%s\n' "${runtime:-proton}"
     if [[ $runtime == pinned ]]; then printf 'runtime_asset=%s\n' "$pinned_asset"; fi
+    if [[ -n $patched_server ]]; then
+        server_digest=$(sha256sum < "$patched_server")
+        printf 'wineserver_sha256=%s\n' "${server_digest%% *}"
+    else
+        printf 'wineserver=unverified\n'
+    fi
     if [[ -f REVISION ]]; then
         printf 'package_revision=%s\n' "$(<REVISION)"
     elif [[ -d $script_dir/../.git || -f $script_dir/../.git ]]; then

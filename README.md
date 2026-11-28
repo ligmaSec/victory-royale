@@ -28,8 +28,10 @@ Both keep raw logs and game files local.
 
 ## Run on Linux
 
-Install UMU (`umu-run`) and extract the verified Proton build from a packaging
-run on `main`. From the extracted `victory` directory, choose one command.
+Install UMU (`umu-run`) and set `PROTONPATH` to a Proton build with the
+[patched wineserver](docs/proton-launcher.md#patched-wineserver) for gameplay.
+Extract the verified Proton package from a packaging run on `main`, then
+choose one command from its `victory` directory.
 
 ```sh
 ./victory-proton.sh --test                                # check the launcher offline
